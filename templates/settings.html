@@ -1,0 +1,864 @@
+{% extends "base.html" %}
+{% block title %}BOT-RL · Settings{% endblock %}
+{% block body_class %}page-settings{% endblock %}
+
+{% block content %}
+<div class="shell">
+  <aside class="sidebar">
+    <div class="sb-section">Account</div>
+    <div class="sb-item active" onclick="nav('profile',this)"><span class="sb-icon">👤</span>Profile</div>
+    <div class="sb-item" onclick="nav('password',this)"><span class="sb-icon">🔑</span>Password</div>
+    <div class="sb-section">Preferences</div>
+    <div class="sb-item" onclick="nav('notifications',this)"><span class="sb-icon">🔔</span>Notifications</div>
+    <div class="sb-section">Trading</div>
+    <div class="sb-item" onclick="nav('open-trades',this)"><span class="sb-icon">📂</span>Open Trades</div>
+    <div class="sb-item" onclick="nav('trade-history',this)"><span class="sb-icon">📜</span>Trade History</div>
+    <div class="sb-section">System</div>
+    <div class="sb-item" onclick="nav('danger',this)"><span class="sb-icon">⚠️</span>Danger Zone</div>
+  </aside>
+
+  <main class="main">
+
+    <!-- PROFILE -->
+    <div class="panel active" id="panel-profile">
+      <div class="ph"><div><h1>Profile</h1><p class="ph-sub">Manage your admin account details</p></div></div>
+
+      <div class="card">
+        <div class="avatar-row">
+          <div class="avatar" id="av-initials">A</div>
+          <div class="avatar-info">
+            <h2 id="av-name">Loading...</h2>
+            <p id="av-email">—</p>
+            <div class="avatar-badge">🛡️ Administrator</div>
+          </div>
+        </div>
+        <div class="card-title">Edit Profile</div>
+        <div class="fgrid">
+          <div class="fg">
+            <label>Display Name</label>
+            <input type="text" id="p-name" placeholder="Your name">
+          </div>
+          <div class="fg">
+            <label>Username</label>
+            <input type="text" id="p-username" placeholder="Username" disabled
+              style="opacity:.5;cursor:not-allowed">
+            <span class="hint">Username cannot be changed</span>
+          </div>
+          <div class="fg full">
+            <label>Email Address</label>
+            <input type="email" id="p-email" placeholder="admin@example.com">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-green" onclick="saveProfile()">💾 Save Profile</button>
+        </div>
+        <div class="alert alert-ok" id="profile-ok">✅ Profile updated successfully</div>
+        <div class="alert alert-err" id="profile-err">❌ <span id="profile-err-msg"></span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🔗 Live Trading Account</div>
+
+        <!-- ── CONNECTED EXCHANGE HERO CARD (shown when connected) ── -->
+        <div id="exchange-hero" style="display:none;margin-bottom:20px">
+          <div style="background:linear-gradient(135deg,#0a1520 0%,#0d1f1a 100%);
+            border:1px solid var(--aw);border-radius:14px;padding:20px 22px;position:relative;overflow:hidden">
+            <div style="position:absolute;top:-40px;right:-40px;width:160px;height:160px;border-radius:50%;
+              background:radial-gradient(circle,rgba(0,255,136,.07) 0%,transparent 70%)"></div>
+            <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px">
+              <div style="display:flex;align-items:center;gap:14px">
+                <div id="ex-hero-logo" style="width:48px;height:48px;border-radius:12px;
+                  background:#f7a600;display:flex;align-items:center;justify-content:center;
+                  font-size:20px;font-weight:700;color:#000;flex-shrink:0">B</div>
+                <div>
+                  <div id="ex-hero-name" style="font-size:16px;font-weight:700;margin-bottom:3px">Bybit</div>
+                  <div style="display:flex;align-items:center;gap:8px">
+                    <span style="width:7px;height:7px;border-radius:50%;background:var(--a);display:inline-block;animation:p 1.5s infinite"></span>
+                    <span style="font-size:12px;color:var(--a);font-weight:600">Connected · Live</span>
+                  </div>
+                  <div id="ex-hero-market" style="font-size:11px;color:var(--m);margin-top:2px">CRYPTO market</div>
+                </div>
+              </div>
+              <div style="text-align:right">
+                <div style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--m);margin-bottom:4px">Live Balance</div>
+                <div id="ex-hero-balance" style="font-size:28px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--a)">$0.00</div>
+                <div id="ex-hero-sync" style="font-size:11px;color:var(--m);margin-top:2px">Last sync: —</div>
+              </div>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:16px">
+              <div style="background:rgba(0,0,0,.3);border-radius:9px;padding:10px 12px">
+                <div style="font-size:10px;color:var(--m);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Open Trades</div>
+                <div id="ex-hero-open" style="font-size:18px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--blue)">0</div>
+              </div>
+              <div style="background:rgba(0,0,0,.3);border-radius:9px;padding:10px 12px">
+                <div style="font-size:10px;color:var(--m);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Realised PnL</div>
+                <div id="ex-hero-pnl" style="font-size:18px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--a)">$0.00</div>
+              </div>
+              <div style="background:rgba(0,0,0,.3);border-radius:9px;padding:10px 12px">
+                <div style="font-size:10px;color:var(--m);text-transform:uppercase;letter-spacing:1px;margin-bottom:3px">Win Rate</div>
+                <div id="ex-hero-wr" style="font-size:18px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--yellow)">—</div>
+              </div>
+            </div>
+            <div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">
+              <button class="btn btn-outline btn-sm" onclick="syncExchangeBalance()">↺ Sync balance</button>
+              <button class="btn btn-sm" style="background:var(--rd);color:var(--red);border:1px solid rgba(255,71,87,.3)" onclick="disconnectExchange()">⊗ Disconnect</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── CONNECT FORM (shown when not connected) ── -->
+        <div id="connect-form">
+          <div class="fgrid">
+            <div class="fg full">
+              <label>Live Trading Mode</label>
+              <div class="toggle-row">
+                <div>
+                  <div style="font-weight:600">Enable live orders with your linked exchange account</div>
+                  <div style="font-size:11px;color:var(--m);margin-top:2px">Turn this off to stay in paper trading mode</div>
+                </div>
+                <label class="tgl"><input type="checkbox" id="lt-enabled">
+                  <span class="tgl-track"></span></label>
+              </div>
+            </div>
+            <div class="fg full">
+              <label>Market &amp; Exchange</label>
+              <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:8px">
+                <div style="display:flex;gap:8px;align-items:center">
+                  <div style="font-weight:600;font-size:12px">Market:</div>
+                  <div id="lt-market-toggle" style="display:flex;gap:6px;margin-left:4px">
+                    <button type="button" class="exchange-option active" data-market="CRYPTO">Crypto</button>
+                    <button type="button" class="exchange-option" data-market="STOCK">Stock</button>
+                    <button type="button" class="exchange-option" data-market="FOREX">Forex</button>
+                  </div>
+                </div>
+              </div>
+              <!-- Exchange toggle grid -->
+              <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px" id="exchange-pick-grid">
+                <button type="button" class="exchange-pick active" data-exchange="bybit"
+                  style="background:var(--s2);border:1.5px solid var(--aw);border-radius:10px;padding:10px 8px;cursor:pointer;transition:all .15s">
+                  <div style="font-size:18px;font-weight:700;width:28px;height:28px;border-radius:7px;background:#f7a600;color:#000;display:flex;align-items:center;justify-content:center;margin:0 auto 5px">B</div>
+                  <div style="font-size:12px;font-weight:600;color:var(--a)">Bybit</div>
+                  <div style="font-size:10px;color:var(--m)">Spot · Futures</div>
+                </button>
+                <button type="button" class="exchange-pick" data-exchange="binance"
+                  style="background:var(--s2);border:1.5px solid var(--b2);border-radius:10px;padding:10px 8px;cursor:pointer;transition:all .15s">
+                  <div style="font-size:18px;font-weight:700;width:28px;height:28px;border-radius:7px;background:#f3ba2f;color:#000;display:flex;align-items:center;justify-content:center;margin:0 auto 5px">B</div>
+                  <div style="font-size:12px;font-weight:600;color:var(--t)">Binance</div>
+                  <div style="font-size:10px;color:var(--m)">Spot · Futures</div>
+                </button>
+                <button type="button" class="exchange-pick" data-exchange="coinbase"
+                  style="background:var(--s2);border:1.5px solid var(--b2);border-radius:10px;padding:10px 8px;cursor:pointer;transition:all .15s">
+                  <div style="font-size:18px;font-weight:700;width:28px;height:28px;border-radius:7px;background:#0052ff;color:#fff;display:flex;align-items:center;justify-content:center;margin:0 auto 5px">C</div>
+                  <div style="font-size:12px;font-weight:600;color:var(--t)">Coinbase</div>
+                  <div style="font-size:10px;color:var(--m)">Spot</div>
+                </button>
+                <button type="button" class="exchange-pick" data-exchange="kucoin"
+                  style="background:var(--s2);border:1.5px solid var(--b2);border-radius:10px;padding:10px 8px;cursor:pointer;transition:all .15s">
+                  <div style="font-size:18px;font-weight:700;width:28px;height:28px;border-radius:7px;background:#00b251;color:#fff;display:flex;align-items:center;justify-content:center;margin:0 auto 5px">K</div>
+                  <div style="font-size:12px;font-weight:600;color:var(--t)">KuCoin</div>
+                  <div style="font-size:10px;color:var(--m)">Spot · Futures</div>
+                </button>
+                <button type="button" class="exchange-pick" data-exchange="kraken"
+                  style="background:var(--s2);border:1.5px solid var(--b2);border-radius:10px;padding:10px 8px;cursor:pointer;transition:all .15s">
+                  <div style="font-size:18px;font-weight:700;width:28px;height:28px;border-radius:7px;background:#5741d9;color:#fff;display:flex;align-items:center;justify-content:center;margin:0 auto 5px">K</div>
+                  <div style="font-size:12px;font-weight:600;color:var(--t)">Kraken</div>
+                  <div style="font-size:10px;color:var(--m)">Spot</div>
+                </button>
+                <button type="button" class="exchange-pick" data-exchange="okx"
+                  style="background:var(--s2);border:1.5px solid var(--b2);border-radius:10px;padding:10px 8px;cursor:pointer;transition:all .15s">
+                  <div style="font-size:18px;font-weight:700;width:28px;height:28px;border-radius:7px;background:#121212;color:#fff;display:flex;align-items:center;justify-content:center;margin:0 auto 5px">O</div>
+                  <div style="font-size:12px;font-weight:600;color:var(--t)">OKX</div>
+                  <div style="font-size:10px;color:var(--m)">Spot · Futures</div>
+                </button>
+              </div>
+              <div id="ex-api-hint" style="background:var(--ad);border:1px solid var(--aw);border-radius:8px;padding:10px 13px;font-size:11px;color:var(--m);line-height:1.7;margin-bottom:14px">
+                Generate a <strong>Spot Trading</strong> API key on your exchange. Do not grant withdrawal permissions to bot API keys.
+              </div>
+            </div>
+            <div class="fg">
+              <label>API Key</label>
+              <input type="password" id="lt-api-key" placeholder="Enter API key">
+            </div>
+            <div class="fg">
+              <label>API Secret</label>
+              <input type="password" id="lt-api-secret" placeholder="Enter API secret">
+            </div>
+            <div class="fg full" id="passphrase-row" style="display:none">
+              <label>Passphrase (KuCoin / OKX)</label>
+              <input type="password" id="lt-passphrase" placeholder="Required for KuCoin and OKX">
+            </div>
+          </div>
+          <div class="btn-row">
+            <button class="btn btn-green" id="lt-connect-btn" onclick="saveLiveTrading()">🔗 Connect &amp; Validate</button>
+            <button class="btn btn-outline" onclick="clearLiveFields()">Clear</button>
+          </div>
+        </div>
+
+        <div class="alert alert-ok" id="lt-ok">✅ Exchange connected and validated</div>
+        <div class="alert alert-err" id="lt-err">❌ <span id="lt-err-msg"></span></div>
+      </div>
+    </div>
+
+    <!-- PASSWORD -->
+    <div class="panel" id="panel-password">
+      <div class="ph"><div><h1>Change Password</h1><p class="ph-sub">Keep your account secure</p></div></div>
+
+      <div class="card">
+        <div class="card-title">Update Password</div>
+        <div class="fgrid">
+          <div class="fg full">
+            <label>Current Password</label>
+            <input type="password" id="pw-current" placeholder="Enter current password" autocomplete="current-password">
+          </div>
+          <div class="fg">
+            <label>New Password</label>
+            <input type="password" id="pw-new" placeholder="Min. 8 characters"
+              autocomplete="new-password" oninput="checkStrength()">
+            <div class="strength"><div class="strength-bar" id="str-bar" style="width:0%"></div></div>
+            <span class="hint" id="str-label">Enter a new password</span>
+          </div>
+          <div class="fg">
+            <label>Confirm New Password</label>
+            <input type="password" id="pw-confirm" placeholder="Repeat new password"
+              autocomplete="new-password" oninput="checkMatch()">
+            <span class="hint" id="match-label"></span>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-green" onclick="changePassword()">🔑 Update Password</button>
+          <button class="btn btn-outline" onclick="clearPwFields()">Clear</button>
+        </div>
+        <div class="alert alert-ok" id="pw-ok">✅ Password changed successfully. You will need to use the new password next login.</div>
+        <div class="alert alert-err" id="pw-err">❌ <span id="pw-err-msg"></span></div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">Password Requirements</div>
+        <ul style="font-size:13px;color:var(--m);padding-left:20px;line-height:2">
+          <li id="req-len">At least 8 characters</li>
+          <li id="req-upper">At least one uppercase letter</li>
+          <li id="req-num">At least one number</li>
+          <li id="req-special">At least one special character (!@#$...)</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- NOTIFICATIONS -->
+    <div class="panel" id="panel-notifications">
+      <div class="ph"><div><h1>Notifications</h1><p class="ph-sub">Choose which events to be alerted about</p></div></div>
+
+      <div class="card">
+        <div class="card-title">Trading Alerts</div>
+        <div class="tgl-list">
+          <div class="tgl-row">
+            <div class="tgl-info">
+              <div class="tgl-label">Trade Opened</div>
+              <div class="tgl-desc">Alert when the bot opens a new trade position</div>
+            </div>
+            <label class="tgl"><input type="checkbox" id="n-trade_open">
+              <span class="tgl-track"></span></label>
+          </div>
+          <div class="tgl-row">
+            <div class="tgl-info">
+              <div class="tgl-label">Trade Closed</div>
+              <div class="tgl-desc">Alert when a trade is closed for any reason</div>
+            </div>
+            <label class="tgl"><input type="checkbox" id="n-trade_close">
+              <span class="tgl-track"></span></label>
+          </div>
+          <div class="tgl-row">
+            <div class="tgl-info">
+              <div class="tgl-label">Take Profit Hit ✅</div>
+              <div class="tgl-desc">Alert when a trade reaches its take profit target</div>
+            </div>
+            <label class="tgl"><input type="checkbox" id="n-tp_hit">
+              <span class="tgl-track"></span></label>
+          </div>
+          <div class="tgl-row">
+            <div class="tgl-info">
+              <div class="tgl-label">Stop Loss Triggered 🛑</div>
+              <div class="tgl-desc">Alert when a trade hits its stop loss level</div>
+            </div>
+            <label class="tgl"><input type="checkbox" id="n-sl_hit">
+              <span class="tgl-track"></span></label>
+          </div>
+          <div class="tgl-row">
+            <div class="tgl-info">
+              <div class="tgl-label">AI Rejected Signal 🤖</div>
+              <div class="tgl-desc">Alert when Claude AI rejects a trade signal</div>
+            </div>
+            <label class="tgl"><input type="checkbox" id="n-ai_reject">
+              <span class="tgl-track"></span></label>
+          </div>
+          <div class="tgl-row">
+            <div class="tgl-info">
+              <div class="tgl-label">Scan Cycle Complete</div>
+              <div class="tgl-desc">Alert on every market scan — can be noisy</div>
+            </div>
+            <label class="tgl"><input type="checkbox" id="n-scan_cycle">
+              <span class="tgl-track"></span></label>
+          </div>
+        </div>
+        <div class="btn-row">
+          <button class="btn btn-green" onclick="saveNotifications()">💾 Save Preferences</button>
+          <button class="btn btn-outline" onclick="toggleAll(true)">Enable All</button>
+          <button class="btn btn-outline" onclick="toggleAll(false)">Disable All</button>
+        </div>
+        <div class="alert alert-ok" id="notif-ok">✅ Notification preferences saved</div>
+        <div class="alert alert-err" id="notif-err">❌ <span id="notif-err-msg"></span></div>
+      </div>
+    </div>
+
+    <!-- OPEN TRADES -->
+    <div class="panel" id="panel-open-trades">
+      <div class="ph">
+        <div><h1>Open Trades</h1><p class="ph-sub">View and manage active positions</p></div>
+        <button class="btn btn-outline btn-sm" onclick="fetchAll()">↺ Refresh</button>
+      </div>
+
+      <!-- Summary cards -->
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:20px" id="ot-summary"></div>
+
+      <div class="card" style="padding:0;overflow:hidden">
+        <div class="tw" style="border:none;border-radius:0">
+          <table>
+            <thead><tr>
+              <th>Symbol</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th>
+              <th>Unrealised</th><th>Opened</th><th>Confidence</th><th>Action</th>
+            </tr></thead>
+            <tbody id="ot-body"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="alert alert-ok" id="ot-ok">✅ Trade closed successfully</div>
+      <div class="alert alert-err" id="ot-err">❌ <span id="ot-err-msg"></span></div>
+    </div>
+
+    <!-- TRADE HISTORY -->
+    <div class="panel" id="panel-trade-history">
+      <div class="ph">
+        <div><h1>Trade History</h1><p class="ph-sub">All closed positions</p></div>
+        <div class="tab-row">
+          <button class="tab active" onclick="filterTrades('all',this)">All</button>
+          <button class="tab" onclick="filterTrades('TP',this)">Win (TP)</button>
+          <button class="tab" onclick="filterTrades('SL',this)">Loss (SL)</button>
+          <button class="tab" onclick="filterTrades('MANUAL',this)">Manual</button>
+        </div>
+      </div>
+
+      <!-- Performance summary -->
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px" id="th-perf"></div>
+
+      <div class="card" style="padding:0;overflow:hidden">
+        <div class="tw" style="border:none;border-radius:0">
+          <table>
+            <thead><tr>
+              <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit Price</th>
+              <th>Result</th><th>PnL</th><th>Conf</th><th>AI</th>
+              <th>Risk</th><th>Opened</th><th>Duration</th>
+            </tr></thead>
+            <tbody id="th-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- DANGER ZONE -->
+    <div class="panel" id="panel-danger">
+      <div class="ph"><div><h1>Danger Zone</h1><p class="ph-sub">Irreversible actions — proceed with caution</p></div></div>
+
+      <div class="danger-card">
+        <div class="danger-title">⚠️ CLOSE ALL OPEN TRADES</div>
+        <p style="font-size:13px;color:var(--m);margin-bottom:16px;line-height:1.7">
+          Force-closes every open position at the current market price.
+          This action is immediate and cannot be undone.
+        </p>
+        <button class="btn btn-red" onclick="closeAllTrades()">🛑 Close All Trades</button>
+      </div>
+
+      <div class="danger-card">
+        <div class="danger-title">🔄 RESET TRADE HISTORY</div>
+        <p style="font-size:13px;color:var(--m);margin-bottom:16px;line-height:1.7">
+          Clears all closed trade records from this session.
+          Open positions and balance are not affected.
+        </p>
+        <button class="btn btn-red" onclick="resetHistory()">🗑️ Clear Trade History</button>
+      </div>
+
+      <div class="card">
+        <div class="card-title">🔴 LIVE TRADING DISCLAIMER</div>
+        <p style="font-size:13px;color:var(--m);line-height:1.9">
+          This bot is designed for <strong style="color:var(--t)">educational and simulation</strong> purposes only.
+          Trading in live markets involves <strong style="color:var(--red)">substantial risk of capital loss</strong>.
+          No bot or strategy guarantees profitability. Past performance does not indicate future results.
+          Always backtest thoroughly before deploying real capital.
+          The developers accept no liability for financial losses arising from the use of this software.
+        </p>
+      </div>
+
+      <div class="alert alert-ok" id="dz-ok">✅ Action completed</div>
+      <div class="alert alert-err" id="dz-err">❌ <span id="dz-err-msg"></span></div>
+    </div>
+
+  </main>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let STATE={};
+let _tradeFilter='all';
+let _selectedExchange='binance';
+let _lt_market='CRYPTO';
+let _ltDirty=false; // true while the user has an unsaved live-trading form edit
+
+// wire up market selector and exchange buttons (single listener — was
+// previously registered twice, which double-fired every click)
+document.addEventListener('click', (e)=>{
+  const btn = e.target.closest && e.target.closest('.exchange-option');
+  if(!btn) return;
+  _ltDirty = true;
+  if(btn.dataset.market){
+    _lt_market = btn.dataset.market;
+    document.querySelectorAll('#lt-market-toggle .exchange-option').forEach(x=>x.classList.remove('active'));
+    btn.classList.add('active');
+  }
+  if(btn.dataset.exchange){
+    _selectedExchange = btn.dataset.exchange;
+    document.querySelectorAll('.exchange-toggle .exchange-option').forEach(x=>x.classList.remove('active'));
+    document.querySelectorAll('.exchange-toggle .exchange-option').forEach(x=>{
+      x.classList.toggle('active', x.dataset.exchange===_selectedExchange);
+    });
+  }
+});
+document.querySelectorAll('.exchange-pick').forEach(btn=>btn.addEventListener('click',()=>{
+  _ltDirty = true;
+  selectExchangePick(btn.dataset.exchange);
+}));
+
+/* ── nav ── */
+function nav(id,el){
+  document.querySelectorAll('.sb-item').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
+  if(el) el.classList.add('active');
+  const p=$('panel-'+id); if(p) p.classList.add('active');
+  if(id==='open-trades'||id==='trade-history') fetchAll();
+}
+
+/* ── fetch all ── */
+async function fetchAll(){
+  try{
+    const r=await fetch('/api/state');
+    STATE=await r.json();
+    updateNavStatus(STATE.bot_running);
+    renderOpenTrades();
+    renderTradeHistory();
+  }catch(e){console.error(e)}
+}
+
+async function fetchProfile(){
+  try{
+    const r=await fetch('/api/settings/profile');
+    const d=await r.json();
+    if(d.ok){
+      safeSet('p-name', d.name||'');
+      safeSet('p-email', d.email||'');
+      safeSet('p-username', d.username||'');
+      $('av-name').textContent=d.name||d.username||'Admin';
+      $('av-email').textContent=d.email||'—';
+      $('av-initials').textContent=(d.name||d.username||'A')[0].toUpperCase();
+    }
+  }catch(e){console.error(e)}
+}
+
+async function fetchNotifications(){
+  try{
+    const r=await fetch('/api/settings/notifications');
+    const d=await r.json();
+    if(d.ok){
+      const n=d.notifications||{};
+      Object.entries(n).forEach(([k,v])=>{
+        safeSetChecked('n-'+k, !!v);
+      });
+    }
+  }catch(e){console.error(e)}
+}
+
+/* Live-trading fields are guarded by _ltDirty (see click listeners above
+   and the input listener below) — a poll here can no longer wipe out an
+   in-progress exchange pick, API key entry, or the enable toggle before
+   Save is clicked. */
+async function fetchLiveTrading(){
+  try{
+    const r=await fetch('/api/exchange/status');
+    const d=await r.json();
+    renderExchangeHero(d);
+    const lt=await fetch('/api/settings/live-trading').then(r=>r.json());
+    if(lt.ok && !_ltDirty){
+      safeSetChecked('lt-enabled', !!lt.enabled);
+      selectExchangePick(lt.exchange||'bybit');
+    }
+  }catch(e){console.error(e)}
+}
+['lt-enabled','lt-api-key','lt-api-secret','lt-passphrase'].forEach(id=>{
+  document.addEventListener('input', e=>{ if(e.target && e.target.id===id) _ltDirty=true; });
+  document.addEventListener('change', e=>{ if(e.target && e.target.id===id) _ltDirty=true; });
+});
+
+const EX_COLORS={bybit:'#f7a600',binance:'#f3ba2f',coinbase:'#0052ff',
+  kucoin:'#00b251',kraken:'#5741d9',okx:'#121212'};
+const EX_NEED_PASS=['kucoin','okx'];
+
+function renderExchangeHero(d){
+  const connected = d&&d.connected;
+  const hero=$('exchange-hero');
+  const form=$('connect-form');
+  if(!hero||!form) return;
+  if(connected){
+    hero.style.display='block';
+    form.style.display='none';
+    const ex=(d.exchange||'').toLowerCase();
+    $('ex-hero-logo').textContent=(d.exchange||'?')[0].toUpperCase();
+    $('ex-hero-logo').style.background=EX_COLORS[ex]||'#888';
+    $('ex-hero-name').textContent=(d.exchange||'Exchange').charAt(0).toUpperCase()+(d.exchange||'').slice(1);
+    $('ex-hero-market').textContent=(d.market||'CRYPTO')+' market';
+    $('ex-hero-balance').textContent='$'+fmt(d.balance||0);
+    $('ex-hero-sync').textContent='Last sync: '+(d.last_sync?new Date(d.last_sync).toLocaleTimeString():'—');
+    const open=(d.open_positions||[]).length;
+    const fills=d.recent_fills||[];
+    const wins=fills.filter(f=>f.pnl>0);
+    const pnl=fills.reduce((s,f)=>s+(f.pnl||0),0);
+    const wr=fills.length?Math.round(wins.length/fills.length*100):0;
+    $('ex-hero-open').textContent=open;
+    $('ex-hero-pnl').textContent=(pnl>=0?'+':'')+'$'+fmt(pnl);
+    $('ex-hero-pnl').style.color=pnl>=0?'var(--a)':'var(--red)';
+    $('ex-hero-wr').textContent=fills.length?wr+'%':'—';
+  }else{
+    hero.style.display='none';
+    form.style.display='block';
+  }
+}
+
+function selectExchangePick(ex){
+  _selectedExchange=ex||'bybit';
+  document.querySelectorAll('.exchange-pick').forEach(btn=>{
+    const sel=btn.dataset.exchange===_selectedExchange;
+    btn.style.borderColor=sel?'var(--aw)':'var(--b2)';
+    btn.querySelector('div:nth-child(2)').style.color=sel?'var(--a)':'var(--t)';
+  });
+  const prow=$('passphrase-row');
+  if(prow) prow.style.display=EX_NEED_PASS.includes(_selectedExchange)?'':'none';
+  const hints={
+    bybit:'Create API key on Bybit → Account & Security → API. Enable Spot Trading.',
+    binance:'Create API key on Binance → Account → API Management. Enable Spot & Margin Trading.',
+    coinbase:'Create API key on Coinbase → Settings → API. Enable View + Trade.',
+    kucoin:'Create API key on KuCoin → Account → API Management. Note: passphrase required.',
+    kraken:'Create API key on Kraken → Settings → API. Enable Query Funds + Create & Modify Orders.',
+    okx:'Create API key on OKX → Account → API. Note: passphrase required.',
+  };
+  const hint=$('ex-api-hint');
+  if(hint) hint.textContent=(hints[_selectedExchange]||'Generate an API key with Spot Trading permissions.')+' Never grant withdrawal permissions to bot API keys.';
+}
+
+async function syncExchangeBalance(){
+  try{
+    const r=await fetch('/api/wallet/sync',{method:'POST'});
+    const d=await r.json();
+    if(d.ok) await fetchLiveTrading();
+    else alert('Sync failed: '+(d.error||'unknown'));
+  }catch(e){alert('Error: '+e)}
+}
+
+async function disconnectExchange(){
+  if(!confirm('Disconnect exchange account? This will switch the bot back to paper mode.')) return;
+  try{
+    const r=await fetch('/api/settings/live-trading/disconnect',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({market:_lt_market})
+    });
+    const d=await r.json();
+    if(d.ok){
+      _ltDirty=false;
+      clearLiveFields();
+      renderExchangeHero({connected:false});
+      showOk('lt');
+      await fetchAll();
+    } else { $('lt-err-msg').textContent=d.error||'Failed'; showErr('lt',''); }
+  }catch(e){ $('lt-err-msg').textContent='Error: '+e; showErr('lt',''); }
+}
+
+/* ── Profile ── */
+async function saveProfile(){
+  hideAlerts('profile');
+  const name=$('p-name').value.trim();
+  const email=$('p-email').value.trim();
+  if(!name){showErr('profile','Name cannot be empty');return;}
+  if(!email||!email.includes('@')){showErr('profile','Enter a valid email address');return;}
+  try{
+    const r=await fetch('/api/settings/profile',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({name,email})});
+    const d=await r.json();
+    if(d.ok){
+      clearDirty('p-name','p-email');
+      $('av-name').textContent=d.name;
+      $('av-email').textContent=d.email;
+      $('av-initials').textContent=d.name[0].toUpperCase();
+      showOk('profile');
+    }else showErr('profile',d.error||'Failed to save');
+  }catch(e){showErr('profile','Network error: '+e)}
+}
+
+/* ── Password ── */
+function checkStrength(){
+  const pw=$('pw-new').value;
+  const checks=[pw.length>=8,/[A-Z]/.test(pw),/[0-9]/.test(pw),/[^A-Za-z0-9]/.test(pw)];
+  const score=checks.filter(Boolean).length;
+  const bar=$('str-bar');
+  const colors=['','#ff4757','#ffd32a','#00c8ff','#00ff88'];
+  const labels=['','Weak','Fair','Good','Strong'];
+  bar.style.width=(score*25)+'%';
+  bar.style.background=colors[score]||'transparent';
+  $('str-label').textContent=score?labels[score]+' password':'Enter a new password';
+  $('str-label').style.color=colors[score]||'var(--m)';
+  const ids=['req-len','req-upper','req-num','req-special'];
+  checks.forEach((ok,i)=>{
+    const el=$(ids[i]);
+    if(el){el.style.color=ok?'var(--a)':'var(--m)';el.style.fontWeight=ok?'600':'400';}
+  });
+  checkMatch();
+}
+
+function checkMatch(){
+  const a=$('pw-new').value; const b=$('pw-confirm').value;
+  const lbl=$('match-label');
+  if(!b){lbl.textContent='';return;}
+  if(a===b){lbl.textContent='✓ Passwords match';lbl.style.color='var(--a)';}
+  else{lbl.textContent='✗ Passwords do not match';lbl.style.color='var(--red)';}
+}
+
+function clearPwFields(){
+  ['pw-current','pw-new','pw-confirm'].forEach(id=>{const e=$(id);if(e)e.value='';});
+  clearDirty('pw-current','pw-new','pw-confirm');
+  $('str-bar').style.width='0%';
+  $('str-label').textContent='Enter a new password';
+  $('match-label').textContent='';
+  hideAlerts('pw');
+}
+
+async function changePassword(){
+  hideAlerts('pw');
+  const cur=$('pw-current').value;
+  const nw=$('pw-new').value;
+  const con=$('pw-confirm').value;
+  if(!cur){showErr('pw','Enter your current password');return;}
+  if(nw.length<8){showErr('pw','New password must be at least 8 characters');return;}
+  if(nw!==con){showErr('pw','Passwords do not match');return;}
+  try{
+    const r=await fetch('/api/settings/password',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({current_password:cur,new_password:nw,confirm_password:con})});
+    const d=await r.json();
+    if(d.ok){clearPwFields();showOk('pw');}
+    else showErr('pw',d.error||'Failed to change password');
+  }catch(e){showErr('pw','Network error: '+e)}
+}
+
+async function saveLiveTrading(){
+  hideAlerts('lt');
+  const btn=$('lt-connect-btn');
+  if(btn){btn.disabled=true;btn.textContent='Connecting…';}
+  try{
+    const payload={
+      enable_live_trading:$('lt-enabled').checked,
+      market:_lt_market,
+      exchange:_selectedExchange,
+      api_key:$('lt-api-key').value.trim(),
+      api_secret:$('lt-api-secret').value.trim(),
+      passphrase:($('lt-passphrase')&&$('lt-passphrase').value.trim())||'',
+    };
+    const r=await fetch('/api/settings/live-trading',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(d.ok){
+      _ltDirty=false;
+      clearDirty('lt-enabled','lt-api-key','lt-api-secret','lt-passphrase');
+      showOk('lt');
+      const exr=await fetch('/api/exchange/status');
+      const exd=await exr.json();
+      renderExchangeHero(exd);
+      await fetchAll();
+    }else{
+      $('lt-err-msg').textContent=d.error||'Connection failed — check API key and secret';
+      showErr('lt','');
+    }
+  }catch(e){$('lt-err-msg').textContent='Network error: '+e;showErr('lt','');}
+  if(btn){btn.disabled=false;btn.textContent='🔗 Connect & Validate';}
+}
+
+function clearLiveFields(){
+  ['lt-api-key','lt-api-secret','lt-passphrase'].forEach(id=>{const e=$(id); if(e)e.value='';});
+  $('lt-enabled').checked=false;
+  _ltDirty=false;
+  clearDirty('lt-enabled','lt-api-key','lt-api-secret','lt-passphrase');
+  selectExchangePick('bybit');
+  hideAlerts('lt');
+}
+
+async function saveNotifications(){
+  hideAlerts('notif');
+  const keys=['trade_open','trade_close','tp_hit','sl_hit','ai_reject','scan_cycle'];
+  const payload={};
+  keys.forEach(k=>{const e=$('n-'+k);if(e)payload[k]=e.checked;});
+  try{
+    const r=await fetch('/api/settings/notifications',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(d.ok){ clearDirty(...keys.map(k=>'n-'+k)); showOk('notif'); }
+    else showErr('notif',d.error||'Save failed');
+  }catch(e){showErr('notif','Network error: '+e)}
+}
+
+function toggleAll(val){
+  ['trade_open','trade_close','tp_hit','sl_hit','ai_reject','scan_cycle']
+    .forEach(k=>{const e=$('n-'+k);if(e){e.checked=val;markDirty('n-'+k);}});
+}
+
+/* ── Open Trades ── */
+function renderOpenTrades(){
+  const trades=STATE.open_trades||[];
+  const stats=STATE.stats||{};
+
+  const unr=stats.unrealised||0;
+  $('ot-summary').innerHTML=[
+    {l:'Open Positions',v:trades.length,c:''},
+    {l:'Unrealised PnL',v:(unr>=0?'+':'')+'$'+unr.toFixed(2),c:unr>=0?'green':'red'},
+    {l:'Max Allowed',v:(STATE.config||{}).max_open_trades||3,c:'blue'},
+  ].map(x=>`<div style="background:var(--s);border:1px solid var(--b);border-radius:12px;padding:16px 18px">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--m);font-weight:600;margin-bottom:6px">${x.l}</div>
+    <div style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace;color:${x.c==='green'?'var(--a)':x.c==='red'?'var(--red)':x.c==='blue'?'var(--blue)':'var(--t)'}">${x.v}</div>
+  </div>`).join('');
+
+  if(!trades.length){
+    $('ot-body').innerHTML='<tr><td colspan="9" class="no-data">No open positions</td></tr>';
+    return;
+  }
+  $('ot-body').innerHTML=trades.map(t=>{
+    const u=t.unrealised_pnl||0;
+    const opened=t.open_time?t.open_time.substring(11,16):'—';
+    const c=t.confidence||0;
+    return `<tr>
+      <td><strong>${t.symbol}</strong></td>
+      <td><span class="badge ${t.side}">${t.side}</span></td>
+      <td class="mono" style="font-size:12px">$${Number(t.entry).toFixed(4)}</td>
+      <td class="mono" style="color:var(--red);font-size:12px">$${t.sl||'—'}</td>
+      <td class="mono" style="color:var(--a);font-size:12px">$${t.tp||'—'}</td>
+      <td><span class="${u>=0?'pos':'neg'}">${u>=0?'+':''}$${u.toFixed(2)}</span></td>
+      <td style="color:var(--m);font-size:12px">${opened}</td>
+      <td style="font-size:12px">${c.toFixed(0)}%</td>
+      <td><button class="btn btn-red btn-sm" onclick="closeSingleTrade('${t.id}')">✕ Close</button></td>
+    </tr>`;
+  }).join('');
+}
+
+async function closeSingleTrade(id){
+  if(!confirm('Force-close trade '+id+' at market price?')) return;
+  hideAlerts('ot');
+  try{
+    const r=await fetch('/api/trade/close/'+id,{method:'POST'});
+    const d=await r.json();
+    if(d.ok){showOk('ot');await fetchAll();}
+    else{$('ot-err-msg').textContent=d.error||'Failed';showErr('ot','');}
+  }catch(e){$('ot-err-msg').textContent='Network error: '+e;showErr('ot','');}
+}
+
+/* ── Trade History ── */
+function filterTrades(f,el){
+  _tradeFilter=f;
+  document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));
+  if(el) el.classList.add('active');
+  renderTradeHistory();
+}
+
+function renderTradeHistory(){
+  const all=(STATE.closed_trades||[]);
+  const trades=_tradeFilter==='all'?all:all.filter(t=>t.status===_tradeFilter);
+  const wins=all.filter(t=>t.pnl&&t.pnl>0);
+  const losses=all.filter(t=>t.pnl&&t.pnl<=0);
+  const totalPnl=all.reduce((s,t)=>s+(t.pnl||0),0);
+  const wr=all.length?((wins.length/all.length)*100):0;
+
+  $('th-perf').innerHTML=[
+    {l:'Total Trades',v:all.length,c:''},
+    {l:'Win Rate',v:wr.toFixed(1)+'%',c:wr>=55?'green':''},
+    {l:'Total PnL',v:(totalPnl>=0?'+':'')+'$'+totalPnl.toFixed(2),c:totalPnl>=0?'green':'red'},
+    {l:'Avg Win / Loss',v:'$'+(wins.length?wins.reduce((s,t)=>s+t.pnl,0)/wins.length:0).toFixed(2)+
+      ' / -$'+Math.abs(losses.length?losses.reduce((s,t)=>s+t.pnl,0)/losses.length:0).toFixed(2),c:''},
+  ].map(x=>`<div style="background:var(--s);border:1px solid var(--b);border-radius:12px;padding:14px 16px">
+    <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--m);font-weight:600;margin-bottom:5px">${x.l}</div>
+    <div style="font-size:18px;font-weight:700;font-family:'JetBrains Mono',monospace;color:${x.c==='green'?'var(--a)':x.c==='red'?'var(--red)':'var(--t)'}">${x.v}</div>
+  </div>`).join('');
+
+  if(!trades.length){
+    $('th-body').innerHTML='<tr><td colspan="11" class="no-data">No trades match this filter</td></tr>';
+    return;
+  }
+  $('th-body').innerHTML=trades.map(t=>{
+    const pnl=t.pnl||0;
+    const opened=t.open_time?t.open_time.substring(0,16).replace('T',' '):'—';
+    const dur=t.open_time&&t.close_time
+      ?formatDur(new Date(t.close_time)-new Date(t.open_time)):'—';
+    return `<tr>
+      <td><strong>${t.symbol}</strong></td>
+      <td><span class="badge ${t.side}">${t.side}</span></td>
+      <td class="mono" style="font-size:11px">$${Number(t.entry).toFixed(4)}</td>
+      <td class="mono" style="font-size:11px">$${t.close_price?Number(t.close_price).toFixed(4):'—'}</td>
+      <td><span class="badge ${t.status}">${t.status}</span></td>
+      <td><span class="${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</span></td>
+      <td style="font-size:11px">${(t.confidence||0).toFixed(0)}%</td>
+      <td><span class="badge ${t.ai_action||'HOLD'}">${t.ai_action||'—'}</span></td>
+      <td><span class="badge ${t.risk_level||'MEDIUM'}">${t.risk_level||'—'}</span></td>
+      <td style="color:var(--m);font-size:11px">${opened}</td>
+      <td style="color:var(--m);font-size:11px">${dur}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* ── Danger zone ── */
+async function closeAllTrades(){
+  if(!confirm('⚠️ Close ALL open trades at market price? This cannot be undone.')) return;
+  const trades=(STATE.open_trades||[]);
+  if(!trades.length){alert('No open trades to close.');return;}
+  hideAlerts('dz');
+  let failed=0;
+  for(const t of trades){
+    try{
+      const r=await fetch('/api/trade/close/'+t.id,{method:'POST'});
+      const d=await r.json();
+      if(!d.ok) failed++;
+    }catch{failed++;}
+  }
+  if(failed===0) showOk('dz');
+  else{$('dz-err-msg').textContent=failed+' trade(s) failed to close';showErr('dz','');}
+  await fetchAll();
+}
+
+async function resetHistory(){
+  if(!confirm('Clear all closed trade history from this session?')) return;
+  hideAlerts('dz');
+  if(STATE&&STATE.closed_trades) STATE.closed_trades=[];
+  renderTradeHistory();
+  showOk('dz');
+}
+
+/* ── Init ── */
+fetchProfile();
+fetchNotifications();
+fetchLiveTrading();
+fetchAll();
+setInterval(fetchAll,10000);
+setInterval(fetchLiveTrading,30000);
+</script>
+{% endblock %}

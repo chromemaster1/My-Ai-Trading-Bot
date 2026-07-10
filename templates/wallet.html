@@ -1,0 +1,513 @@
+{% extends "base.html" %}
+{% block title %}BOT-RL · Wallet{% endblock %}
+{% block body_class %}page-wallet{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="page-head">
+    <div><h1>💰 Wallet</h1><p class="page-sub" id="wallet-sub">Loading…</p></div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-outline btn-sm" onclick="syncBalance()">↺ Sync balance</button>
+      <button class="btn btn-outline btn-sm" onclick="loadAll()">↺ Refresh</button>
+    </div>
+  </div>
+
+  <!-- LINKED ACCOUNT STRIP -->
+  <div class="account-strip" id="account-strip" style="display:none">
+    <div class="as-left">
+      <div class="as-logo" id="strip-logo">B</div>
+      <div>
+        <div class="as-name" id="strip-name">Bybit</div>
+        <div class="as-sub" id="strip-sub">Live account connected</div>
+      </div>
+    </div>
+    <div class="as-right">
+      <span class="badge b-submitted" id="strip-status">● Connected</span>
+      <a href="/settings" class="btn btn-outline btn-sm">Manage</a>
+    </div>
+  </div>
+
+  <!-- BALANCE HERO -->
+  <div class="balance-hero">
+    <div class="bh-label">Total Available Balance</div>
+    <div class="bh-amount" id="hero-balance">$0.00</div>
+    <div class="bh-sub" id="hero-sub">Syncing…</div>
+    <div class="bh-row">
+      <span class="bh-badge bh-paper" id="hero-mode-badge">📝 Paper</span>
+      <span class="bh-badge bh-exchange" id="hero-exchange-badge" style="display:none"></span>
+      <span class="mono" style="font-size:12px;color:var(--m)" id="hero-sync">Last sync: —</span>
+    </div>
+  </div>
+
+  <!-- STAT CARDS -->
+  <div class="stat-grid" id="stat-grid"></div>
+
+  <div class="card" id="exchange-dashboard-card" style="display:none">
+    <div class="card-title">📈 Live exchange dashboard</div>
+    <div class="exchange-dash-head">
+      <div class="exchange-dash-brand">
+        <div class="exchange-logo" id="dash-logo">B</div>
+        <div>
+          <div class="exchange-name" id="dash-name">Exchange</div>
+          <div class="exchange-sub" id="dash-sub">Syncing account state…</div>
+        </div>
+      </div>
+      <div class="exchange-dash-pill" id="dash-pill">● Syncing</div>
+    </div>
+    <div class="dash-metrics" id="dash-metrics"></div>
+    <div class="dash-grid">
+      <div class="dash-card">
+        <div class="card-title">Open positions</div>
+        <div class="tw" style="border:none;border-radius:0">
+          <table>
+            <thead><tr><th>Symbol</th><th>Side</th><th>Entry</th><th>Size</th><th>PnL</th></tr></thead>
+            <tbody id="positions-body"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="dash-card">
+        <div class="card-title">Recent activity</div>
+        <div class="tw" style="border:none;border-radius:0">
+          <table>
+            <thead><tr><th>Symbol</th><th>Side</th><th>PnL</th><th>Fee</th></tr></thead>
+            <tbody id="trades-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:1fr 1fr 360px;gap:18px;align-items:start" id="wallet-grid">
+    <!-- LEFT: ledger -->
+    <div>
+      <div class="card">
+        <div class="card-title">Transaction history</div>
+        <div class="tw" style="border:none;border-radius:0">
+          <table>
+            <thead><tr>
+              <th>ID</th><th>Date</th><th>Amount</th><th>Network</th>
+              <th>Address</th><th>Status</th><th>Type</th>
+            </tr></thead>
+            <tbody id="ledger-body"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- MIDDLE: live exchange activity terminal -->
+    <div>
+      <div class="card" id="exchange-activity-card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+          <div class="card-title" style="margin-bottom:0">Exchange Activity</div>
+          <button class="btn btn-outline btn-sm" onclick="syncExActivity()">↺</button>
+        </div>
+        <!-- not connected placeholder -->
+        <div id="ex-act-disconnected" style="text-align:center;padding:32px 16px;color:var(--m)">
+          <div style="font-size:28px;margin-bottom:10px">🔌</div>
+          <div style="font-size:13px;font-weight:600;margin-bottom:4px">No exchange linked</div>
+          <div style="font-size:11px;line-height:1.6">Connect an exchange in
+            <a href="/settings" style="color:var(--blue)">Settings → Live Trading</a>
+            to see live positions and fills here.</div>
+        </div>
+        <!-- connected state -->
+        <div id="ex-act-connected" style="display:none">
+          <!-- balance strip -->
+          <div style="background:var(--ad);border:1px solid var(--aw);border-radius:10px;
+            padding:12px 16px;margin-bottom:14px;display:flex;align-items:center;justify-content:space-between">
+            <div>
+              <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--a);font-weight:600;margin-bottom:3px">Live Balance</div>
+              <div id="ex-act-balance" style="font-size:22px;font-weight:700;font-family:'JetBrains Mono',monospace;color:var(--a)">$0.00</div>
+            </div>
+            <div style="text-align:right">
+              <div id="ex-act-name" style="font-size:13px;font-weight:600;color:var(--t)">—</div>
+              <div id="ex-act-sync" style="font-size:11px;color:var(--m);margin-top:2px">—</div>
+            </div>
+          </div>
+          <!-- open positions -->
+          <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--m);font-weight:600;margin-bottom:8px">Open Positions</div>
+          <div id="ex-act-positions" style="margin-bottom:14px"></div>
+          <!-- activity log mini-terminal -->
+          <div style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--m);font-weight:600;margin-bottom:8px">Live Activity Log</div>
+          <div id="ex-act-log" style="background:#020507;border:1px solid var(--b);border-radius:10px;
+            padding:12px 14px;font-family:'JetBrains Mono',monospace;font-size:11px;
+            height:260px;overflow-y:auto;line-height:1.8"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- RIGHT: withdrawal form -->
+    <div>
+      <div class="card">
+        <div class="card-title">Withdraw USDT</div>
+
+        <div class="max-row">
+          <label>Amount (USDT)</label>
+          <button class="max-btn" onclick="setMax()">MAX</button>
+        </div>
+        <div class="fg" style="margin-bottom:8px">
+          <input type="number" id="w-amount" placeholder="0.00" min="1" step="0.01">
+        </div>
+        <div style="font-size:11px;color:var(--m);margin-bottom:16px"
+             id="avail-lbl">Available: $0.00</div>
+
+        <div class="fg">
+          <label>Select network</label>
+        </div>
+        <div class="network-grid">
+          <button class="net-btn active" data-net="USDT-TRC20" onclick="pickNet(this)">
+            <span class="net-name">TRC-20</span>
+            <span class="net-tag">Tron · ~$1 fee</span>
+          </button>
+          <button class="net-btn" data-net="USDT-ERC20" onclick="pickNet(this)">
+            <span class="net-name">ERC-20</span>
+            <span class="net-tag">Ethereum · gas fee</span>
+          </button>
+          <button class="net-btn" data-net="USDT-BEP20" onclick="pickNet(this)">
+            <span class="net-name">BEP-20</span>
+            <span class="net-tag">BSC · low fee</span>
+          </button>
+          <button class="net-btn" data-net="USDT-SOL" onclick="pickNet(this)">
+            <span class="net-name">SOL</span>
+            <span class="net-tag">Solana · very low fee</span>
+          </button>
+        </div>
+
+        <div class="fg">
+          <label>Wallet address</label>
+          <input type="text" id="w-address" placeholder="Paste destination wallet address">
+        </div>
+
+        <div class="fg">
+          <label>Note (optional)</label>
+          <input type="text" id="w-note" placeholder="e.g. Monthly profits withdrawal" maxlength="200">
+        </div>
+
+        <button class="btn btn-green" onclick="showConfirm()">
+          Withdraw →
+        </button>
+
+        <div class="alert alert-ok" id="w-ok"></div>
+        <div class="alert alert-err" id="w-err"></div>
+
+        <p style="font-size:11px;color:var(--m2);margin-top:16px;line-height:1.7">
+          Paper-mode withdrawals are recorded as ledger entries only.
+          Live withdrawals are submitted directly to your linked exchange account.
+          Always verify the wallet address before confirming.
+        </p>
+      </div><!-- /withdrawal card -->
+    </div><!-- /withdrawal col -->
+  </div><!-- /wallet-grid -->
+</div><!-- /wrap -->
+
+<!-- CONFIRM MODAL -->
+<div class="overlay" id="confirm-overlay" onclick="hideConfirm(event)">
+  <div class="modal" onclick="event.stopPropagation()">
+    <h3>Confirm withdrawal</h3>
+    <div class="modal-row"><span>Amount</span><span id="cf-amount"></span></div>
+    <div class="modal-row"><span>Network</span><span id="cf-network"></span></div>
+    <div class="modal-row"><span>Address</span><span id="cf-address"></span></div>
+    <div class="modal-row"><span>Type</span><span id="cf-type"></span></div>
+    <div class="modal-warn" id="cf-warn">
+      ⚠️ This action cannot be undone. Verify the address carefully before confirming.
+      Sending to a wrong address results in permanent loss of funds.
+    </div>
+    <div class="modal-btns">
+      <button class="btn btn-outline" onclick="hideConfirm()">Cancel</button>
+      <button class="btn btn-green" id="cf-confirm-btn" onclick="submitWithdrawal()">Confirm withdrawal</button>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let W={};
+let _selectedNet='USDT-TRC20';
+let _EX={};
+
+const EX_COLORS={bybit:'#f7a600',binance:'#f3ba2f',coinbase:'#0052ff',
+  kucoin:'#00b251',kraken:'#5741d9',okx:'#121212'};
+
+/* responsive grid */
+(function(){
+  const style=document.createElement('style');
+  style.textContent='@media(max-width:1100px){wallet-grid{grid-template-columns:1fr 1fr!important}}@media(max-width:700px){wallet-grid{grid-template-columns:1fr!important}}';
+  document.head.appendChild(style);
+})();
+
+async function loadAll(){
+  try{
+    const [ws, ss, exs] = await Promise.all([
+      fetch('/api/wallet').then(r=>r.json()),
+      fetch('/api/state').then(r=>r.json()),
+      fetch('/api/exchange/status').then(r=>r.json()),
+    ]);
+    W=ws; _EX=exs;
+    renderNav(ss);
+    renderHero();
+    renderStats();
+    renderLedger();
+    renderAccountStrip();
+    renderExchangeActivity();
+    $('wallet-sub').textContent=`Updated ${new Date().toLocaleTimeString()}`;
+  }catch(e){console.error(e)}
+}
+
+async function syncExActivity(){
+  try{
+    const r=await fetch('/api/exchange/status');
+    _EX=await r.json();
+    renderExchangeActivity();
+    // also sync balance if live
+    if(_EX.connected){
+      await fetch('/api/wallet/sync',{method:'POST'});
+      const wr=await fetch('/api/wallet').then(r=>r.json());
+      W=wr; renderHero(); renderStats(); renderLedger();
+    }
+  }catch(e){console.error(e)}
+}
+
+function renderExchangeActivity(){
+  const d=_EX;
+  const dis=$('ex-act-disconnected');
+  const con=$('ex-act-connected');
+  if(!d||!d.connected){
+    if(dis) dis.style.display='';
+    if(con) con.style.display='none';
+    return;
+  }
+  if(dis) dis.style.display='none';
+  if(con) con.style.display='';
+  if($('ex-act-balance')) $('ex-act-balance').textContent='$'+fmt(d.balance||0);
+  if($('ex-act-name')){
+    const ex=(d.exchange||'exchange');
+    $('ex-act-name').textContent=ex.charAt(0).toUpperCase()+ex.slice(1)+' · '+( d.market||'CRYPTO');
+  }
+  if($('ex-act-sync')) $('ex-act-sync').textContent='Sync: '+(d.last_sync?new Date(d.last_sync).toLocaleTimeString():'—');
+
+  // open positions mini cards
+  const posEl=$('ex-act-positions');
+  if(posEl){
+    const pos=d.open_positions||[];
+    if(!pos.length){
+      posEl.innerHTML='<div style="font-size:12px;color:var(--m2);padding:6px 0">No open positions</div>';
+    }else{
+      posEl.innerHTML=pos.map(p=>{
+        const u=p.unrealised||0;
+        const uc=u>=0?'var(--a)':'var(--red)';
+        return `<div style="background:var(--s2);border:1px solid var(--b2);border-radius:9px;
+          padding:9px 12px;margin-bottom:7px;display:flex;align-items:center;justify-content:space-between">
+          <div>
+            <span style="font-weight:700;font-size:13px">${esc(p.symbol)}</span>
+            <span style="font-size:11px;margin-left:8px;padding:2px 8px;border-radius:20px;
+              background:${p.side==='BUY'?'var(--ad)':'var(--rd)'};
+              color:${p.side==='BUY'?'var(--a)':'var(--red)'}">${p.side}</span>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:12px;font-family:'JetBrains Mono',monospace;color:${uc};font-weight:700">
+              ${u>=0?'+':''}$${fmt(u)}</div>
+            <div style="font-size:10px;color:var(--m)">@ $${fmtPx(p.entry)}</div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+  }
+
+  // activity log terminal
+  const logEl=$('ex-act-log');
+  if(logEl){
+    const logs=d.activity_log||[];
+    if(!logs.length){
+      logEl.innerHTML='<div style="color:var(--m2)">No activity yet — waiting for bot scans...</div>';
+    }else{
+      logEl.innerHTML=logs.map(l=>{
+        const lc=l.level==='ERROR'?'var(--red)':l.level==='WARN'?'var(--yellow)':'#7ee787';
+        return `<div style="display:flex;gap:10px;line-height:1.6">
+          <span style="color:var(--m2);flex-shrink:0;min-width:54px">${l.time}</span>
+          <span style="color:${lc}">${esc(l.msg)}</span></div>`;
+      }).join('');
+      logEl.scrollTop=0;
+    }
+  }
+}
+
+function fmtPx(n){
+  const v=Number(n||0);
+  return v>999?v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
+        :v>1?v.toFixed(4):v.toFixed(6);
+}
+function renderNav(s){
+  updateNavStatus(s&&s.bot_running);
+}
+
+function renderHero(){
+  const avail=W.available_balance||0;
+  $('hero-balance').textContent='$'+fmt(avail);
+  $('avail-lbl').textContent=`Available: $${fmt(avail)}`;
+
+  if(W.is_live&&W.live_connected){
+    $('hero-sub').textContent=`Live balance on ${(W.live_exchange||'').toUpperCase()} · USDT`;
+    $('hero-mode-badge').textContent='🔴 LIVE';
+    $('hero-mode-badge').style.background='rgba(255,71,87,.15)';
+    $('hero-mode-badge').style.color='var(--red)';
+    $('hero-exchange-badge').style.display='';
+    $('hero-exchange-badge').textContent=`${(W.live_exchange||'').toUpperCase()} · $${fmt(W.live_balance)}`;
+  } else {
+    $('hero-sub').textContent='Paper trading balance · simulated USDT';
+    $('hero-mode-badge').textContent='📝 Paper';
+    $('hero-mode-badge').style.background='';
+    $('hero-mode-badge').style.color='';
+    $('hero-exchange-badge').style.display='none';
+  }
+  $('hero-sync').textContent='Last sync: '+(W.live_last_sync
+    ?new Date(W.live_last_sync).toLocaleTimeString():'—');
+}
+
+function renderAccountStrip(){
+  // Only ever show a green "Connected" badge for a GENUINELY validated
+  // connection (is_live && live_connected). Credentials merely being
+  // saved (live_linked) is not the same thing — showing "Connected" for
+  // that was the actual bug: an unvalidated or invalid key looked
+  // identical to a working one.
+  if(W.is_live && W.live_connected){
+    const ex=W.live_exchange||'bybit';
+    $('strip-logo').textContent=ex[0].toUpperCase();
+    $('strip-logo').style.background=EX_COLORS[ex]||'#888';
+    $('strip-name').textContent=ex.charAt(0).toUpperCase()+ex.slice(1);
+    $('strip-sub').textContent=`Live balance: $${fmt(W.live_balance)} USDT`;
+    $('strip-status').className='badge b-submitted';
+    $('strip-status').textContent='● Connected';
+    $('account-strip').style.display='flex';
+  } else if(W.live_linked){
+    // Credentials saved but not (yet) validated — distinct amber state,
+    // never claims "Connected".
+    const ex=W.live_exchange||'bybit';
+    $('strip-logo').textContent=ex[0].toUpperCase();
+    $('strip-logo').style.background=EX_COLORS[ex]||'#888';
+    $('strip-name').textContent=ex.charAt(0).toUpperCase()+ex.slice(1);
+    $('strip-sub').textContent='Credentials saved but not validated — click Manage to connect';
+    $('strip-status').className='badge b-pending';
+    $('strip-status').textContent='● Not connected';
+    $('account-strip').style.display='flex';
+  } else {
+    $('account-strip').style.display='none';
+  }
+}
+
+function renderStats(){
+  const realized=W.realized_pnl||0;
+  const unrealized=W.unrealized_pnl||0;
+  $('stat-grid').innerHTML=[
+    {l:'Realized PnL',v:(realized>=0?'+':'')+'$'+fmt(realized),s:'Closed trades',c:realized>=0?'green':'red'},
+    {l:'Unrealized PnL',v:(unrealized>=0?'+':'')+'$'+fmt(unrealized),s:'Open positions',c:unrealized>=0?'green':'red'},
+    {l:'Total Profits',v:'$'+fmt(W.total_profits||0),s:'Gross gains',c:'green'},
+    {l:'Total Losses',v:'-$'+fmt(W.total_losses||0),s:'Gross losses',c:'red'},
+    {l:'Starting Capital',v:'$'+fmt(W.total_deposited||0),s:'Initial balance',c:''},
+    {l:'Pending Withdrawals',v:'$'+fmt(W.pending_withdrawals||0),s:'Awaiting processing',c:'purple'},
+  ].map(x=>`<div class="stat ${x.c}">
+    <div class="sl">${x.l}</div>
+    <div class="sv">${x.v}</div>
+    <div class="ss">${x.s}</div>
+  </div>`).join('');
+}
+
+function renderLedger(){
+  const rows=W.ledger||[];
+  if(!rows.length){
+    $('ledger-body').innerHTML='<tr><td colspan="7" class="no-data">No withdrawal history yet</td></tr>';
+    return;
+  }
+  $('ledger-body').innerHTML=rows.map(r=>`<tr>
+    <td class="mono" style="font-size:11px">${r.id}</td>
+    <td style="color:var(--m);font-size:11px">${r.ts}</td>
+    <td class="mono" style="color:var(--a);font-weight:700">$${fmt(r.amount)}</td>
+    <td style="font-size:11px">${esc(r.network)}</td>
+    <td class="mono" style="font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis">
+      ${esc(r.address.substring(0,14))}…</td>
+    <td><span class="badge ${statusBadge(r.status)}">${r.status}</span></td>
+    <td><span class="badge ${r.type==='LIVE'?'b-submitted':'b-paper'}">${r.type}</span></td>
+  </tr>`).join('');
+}
+
+function statusBadge(s){
+  return s==='SUBMITTED'?'b-submitted':s==='PENDING'?'b-pending':'b-failed';
+}
+
+function pickNet(btn){
+  document.querySelectorAll('.net-btn').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  _selectedNet=btn.dataset.net;
+}
+
+function setMax(){
+  $('w-amount').value=(W.available_balance||0).toFixed(2);
+}
+
+function showConfirm(){
+  const amount=parseFloat($('w-amount').value||0);
+  const address=($('w-address').value||'').trim();
+  if(!amount||amount<=0){showWErr('Enter a withdrawal amount');return;}
+  if(!address){showWErr('Enter a wallet address');return;}
+  if(amount>(W.available_balance||0)){
+    showWErr(`Insufficient balance. Available: $${fmt(W.available_balance||0)}`);return;}
+  $('cf-amount').textContent='$'+fmt(amount)+' USDT';
+  $('cf-network').textContent=_selectedNet;
+  $('cf-address').textContent=address.substring(0,20)+'…';
+  $('cf-type').textContent=W.is_live&&W.live_connected?'LIVE (exchange)':'PAPER (ledger only)';
+  $('confirm-overlay').classList.add('show');
+}
+
+function hideConfirm(e){
+  if(!e||e.target===$('confirm-overlay'))
+    $('confirm-overlay').classList.remove('show');
+}
+
+async function submitWithdrawal(){
+  const btn=$('cf-confirm-btn');
+  btn.disabled=true; btn.textContent='Processing…';
+  hideAlerts('w');
+  try{
+    const r=await fetch('/api/wallet/withdraw',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({
+        amount:parseFloat($('w-amount').value||0),
+        address:$('w-address').value.trim(),
+        network:_selectedNet,
+        note:$('w-note').value.trim(),
+      })
+    });
+    const d=await r.json();
+    $('confirm-overlay').classList.remove('show');
+    if(d.ok){
+      const msg=d.type==='LIVE'
+        ?`✅ Submitted to ${W.live_exchange} — Ref: ${d.id}`
+        :`✅ Recorded in ledger — ID: ${d.id} (paper mode)`;
+      showWOk(msg);
+      $('w-amount').value='';$('w-address').value='';$('w-note').value='';
+      setTimeout(loadAll,800);
+    }else{
+      showWErr(d.error||'Withdrawal failed');
+    }
+  }catch(e){showWErr('Network error: '+e);}
+  btn.disabled=false; btn.textContent='Confirm withdrawal';
+}
+
+async function syncBalance(){
+  try{
+    const r=await fetch('/api/wallet/sync',{method:'POST'});
+    const d=await r.json();
+    if(d.ok){await loadAll();}
+    else alert('Sync failed: '+(d.error||'unknown'));
+  }catch(e){alert('Error: '+e)}
+}
+
+function showWOk(msg){const e=$('w-ok');e.textContent=msg;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),5000)}
+function showWErr(msg){const e=$('w-err');e.textContent='❌ '+msg;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),5000)}
+function hideAlerts(p){[$(`${p}-ok`),$(`${p}-err`)].forEach(e=>{if(e)e.classList.remove('show')})}
+const esc = escHtml; // alias to shared helper
+
+loadAll();
+setInterval(loadAll, 30000);
+setInterval(syncExActivity, 15000);
+</script>
+{% endblock %}

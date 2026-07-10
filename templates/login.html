@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BOT-RL · Login</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap');
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#060a0f;--s:#0d1117;--b:#1c2333;--a:#00ff88;--red:#ff4757;--t:#e6edf3;--m:#8b949e}
+body{background:var(--bg);color:var(--t);font-family:'Space Grotesk',sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center}
+.grid{position:fixed;inset:0;z-index:0;
+  background-image:linear-gradient(rgba(0,255,136,.025) 1px,transparent 1px),
+  linear-gradient(90deg,rgba(0,255,136,.025) 1px,transparent 1px);
+  background-size:40px 40px}
+.card{position:relative;z-index:1;background:var(--s);border:1px solid var(--b);
+  border-radius:16px;padding:48px 40px;width:380px;
+  box-shadow:0 0 60px rgba(0,255,136,.05)}
+.logo{font-family:'JetBrains Mono',monospace;font-size:11px;letter-spacing:4px;
+  color:var(--a);text-transform:uppercase;margin-bottom:10px}
+h1{font-size:22px;font-weight:700;margin-bottom:4px}
+.sub{font-size:13px;color:var(--m);margin-bottom:32px}
+label{display:block;font-size:11px;font-weight:600;letter-spacing:1px;
+  text-transform:uppercase;color:var(--m);margin-bottom:6px}
+input{width:100%;background:#0a0f16;border:1px solid var(--b);border-radius:8px;
+  padding:12px 14px;color:var(--t);font-family:'Space Grotesk',sans-serif;
+  font-size:14px;outline:none;transition:border-color .2s}
+input:focus{border-color:var(--a)}
+.field{margin-bottom:18px}
+.btn{width:100%;background:var(--a);color:#000;font-family:'Space Grotesk',sans-serif;
+  font-weight:700;font-size:14px;border:none;border-radius:8px;padding:13px;
+  cursor:pointer;margin-top:8px;transition:opacity .2s}
+.btn:hover{opacity:.85}
+.err{background:rgba(255,71,87,.1);border:1px solid rgba(255,71,87,.3);
+  border-radius:8px;padding:10px 14px;font-size:13px;color:var(--red);margin-bottom:18px}
+</style>
+</head>
+<body>
+<div class="grid"></div>
+<div class="card">
+  <div class="logo">⚡ BOT-RL</div>
+  <h1>Admin Login</h1>
+  <p class="sub">AI Trading Bot Control Panel</p>
+  {% if error %}<div class="err">{{ error }}</div>{% endif %}
+  <form method="POST">
+    <div class="field"><label>Username</label>
+      <input type="text" name="username" autocomplete="username" required autofocus></div>
+    <div class="field"><label>Password</label>
+      <input type="password" name="password" autocomplete="current-password" required></div>
+    <button class="btn" type="submit">Access Dashboard →</button>
+  </form>
+</div>
+</body>
+</html>

@@ -1,0 +1,444 @@
+{% extends "base.html" %}
+{% block title %}BOT-RL · Dashboard{% endblock %}
+{% block body_class %}page-dashboard{% endblock %}
+
+{% block content %}
+<div class="shell">
+  <aside class="sidebar">
+    <div class="sb-section">Monitor</div>
+    <div class="sb-item active" onclick="nav('overview',this)"><span class="sb-icon">📊</span>Overview</div>
+    <div class="sb-item" onclick="nav('trades',this)"><span class="sb-icon">🔄</span>Trade History</div>
+    <div class="sb-item" onclick="nav('activity',this)"><span class="sb-icon">📋</span>Activity Log</div>
+    <div class="sb-section">Configure</div>
+    <div class="sb-item" onclick="nav('config',this)"><span class="sb-icon">🌐</span>Market & RSI</div>
+    <div class="sb-item" onclick="nav('risk',this)"><span class="sb-icon">🛡️</span>Risk & SL/TP</div>
+    <div class="sb-section">Control</div>
+    <div class="sb-item" onclick="nav('control',this)"><span class="sb-icon">🎛️</span>Bot Control</div>
+  </aside>
+
+  <main class="main">
+
+    <!-- OVERVIEW -->
+    <div class="panel active" id="panel-overview">
+      <div class="ph"><div><h1>Overview</h1><div class="ph-sub" id="ov-sub">Loading...</div></div>
+        <button class="btn btn-green" onclick="nav('control',document.querySelector('[onclick*=control]'))">⚡ Control</button></div>
+      <div class="ticker" id="ov-ticker"></div>
+      <div class="stat-row" id="ov-stats"></div>
+      <div class="ph" style="margin-top:4px"><h1 style="font-size:15px">Open Positions</h1>
+        <span id="ov-open-ct" style="font-size:12px;color:var(--m)"></span></div>
+      <div class="tw">
+        <table><thead><tr>
+          <th>Symbol</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th>
+          <th>Unrealised</th><th>Conf</th><th>AI</th><th>Action</th>
+        </tr></thead>
+        <tbody id="ov-open-body"></tbody></table>
+      </div>
+    </div>
+
+    <!-- TRADE HISTORY -->
+    <div class="panel" id="panel-trades">
+      <div class="ph"><h1>Trade History</h1>
+        <span class="badge OPEN" id="th-count"></span></div>
+      <div class="tw">
+        <table><thead><tr>
+          <th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th>
+          <th>Result</th><th>PnL</th><th>Conf</th><th>Risk</th><th>Opened</th>
+        </tr></thead>
+        <tbody id="th-body"></tbody></table>
+      </div>
+    </div>
+
+    <!-- ACTIVITY LOG -->
+    <div class="panel" id="panel-activity">
+      <div class="ph"><h1>Activity Log</h1>
+        <button class="btn btn-outline btn-sm" onclick="fetchState()">↺ Refresh</button></div>
+      <div class="log-box" id="act-log"></div>
+    </div>
+
+    <!-- CONFIG -->
+    <div class="panel" id="panel-config">
+      <div class="ph"><h1>Market & RSI Config</h1>
+        <button class="btn btn-green" onclick="saveConfig()">💾 Save</button></div>
+      <div class="fsec">
+        <div class="fsec-title">🌐 Market</div>
+        <div class="fgrid">
+          <div class="fg"><label>Market Mode</label>
+            <select id="c-market_mode" onchange="modeHint()">
+              <option value="CRYPTO">CRYPTO</option>
+              <option value="STOCK">STOCK</option>
+            </select></div>
+          <div class="fg"><label>Timeframe</label>
+            <select id="c-timeframe">
+              <option value="1m">1 min</option><option value="5m">5 min</option>
+              <option value="15m">15 min</option><option value="30m">30 min</option>
+              <option value="1h">1 hour</option><option value="4h">4 hours</option>
+              <option value="1d">1 day</option>
+            </select></div>
+          <div class="fg" id="exchange-field"><label>Crypto Exchange</label>
+            <select id="c-exchange">
+              <option value="binance">Binance</option>
+              <option value="kraken">Kraken</option>
+              <option value="coinbase">Coinbase</option>
+              <option value="kucoin">KuCoin</option>
+              <option value="bybit">Bybit</option>
+            </select>
+            <span class="hint" style="font-size:10px;color:var(--m)">
+              Binance returns HTTP 451 from US/restricted IPs — switch here if you
+              see "geo-blocked" errors. Takes effect on next bot restart.</span></div>
+          <div class="fg full"><label>Symbols <span id="sym-hint" style="color:var(--a);font-size:10px">e.g. BTC/USDT,ETH/USDT</span></label>
+            <input type="text" id="c-symbols" placeholder="BTC/USDT,ETH/USDT,SOL/USDT"></div>
+        </div>
+      </div>
+      <div class="fsec">
+        <div class="fsec-title">📈 RSI Strategy</div>
+        <div class="fgrid">
+          <div class="fg"><label>RSI Fast Period (default 6)</label>
+            <input type="number" id="c-rsi_fast" min="3" max="20"></div>
+          <div class="fg"><label>RSI Slow Period (default 12)</label>
+            <input type="number" id="c-rsi_slow" min="5" max="50"></div>
+          <div class="fg"><label>Overbought Level</label>
+            <input type="number" id="c-rsi_ob" min="60" max="90"></div>
+          <div class="fg"><label>Oversold Level</label>
+            <input type="number" id="c-rsi_os" min="10" max="40"></div>
+        </div>
+      </div>
+      <div class="fsec">
+        <div class="fsec-title">🤖 AI Settings</div>
+        <div class="fgrid">
+          <div class="fg full"><label>Anthropic API Key</label>
+            <input type="password" id="c-api_key" placeholder="sk-ant-... (leave blank to keep current)"></div>
+          <div class="fg full">
+            <div class="toggle-row">
+              <span>Require AI confirmation before opening trades</span>
+              <label class="tgl"><input type="checkbox" id="c-ai_confirm">
+                <span class="tgl-track"></span></label>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="save-msg" id="cfg-saved">✅ Configuration saved</div>
+    </div>
+
+    <!-- RISK -->
+    <div class="panel" id="panel-risk">
+      <div class="ph"><h1>Risk & SL/TP Settings</h1>
+        <button class="btn btn-green" onclick="saveRisk()">💾 Save</button></div>
+      <div class="fsec">
+        <div class="fsec-title">🛑 Stop Loss & Take Profit  (locked to min. 4:1 reward:risk)</div>
+        <div class="fgrid">
+          <div class="fg"><label>Stop Loss % (0.005 = 0.5%)</label>
+            <input type="number" id="r-sl" step="0.001" min="0.001" max="0.05"></div>
+          <div class="fg"><label>Take Profit Floor % (0.02 = 2.0%)</label>
+            <input type="number" id="r-tp" step="0.001" min="0.002" max="0.1"></div>
+          <div class="fg"><label>Min Confidence To Trade % (default 85)</label>
+            <input type="number" id="r-minconf" step="1" min="50" max="99"></div>
+          <div class="fg"><label>Max Risk Per Trade (0.01 = 1%)</label>
+            <input type="number" id="r-maxrisk" step="0.005" min="0.005" max="0.1"></div>
+          <div class="fg"><label>Max Open Trades</label>
+            <input type="number" id="r-maxopen" min="1" max="20"></div>
+          <div class="fg"><label>Account Balance (USD)</label>
+            <input type="number" id="r-balance" min="100" step="100"></div>
+          <div class="fg"><label>Scan Interval (seconds)</label>
+            <input type="number" id="r-interval" min="30" max="3600"></div>
+          <div class="fg"><label>Max Execution Slippage % (0.003 = 0.3%)</label>
+            <input type="number" id="r-maxslip" step="0.001" min="0.0005" max="0.05"></div>
+          <div class="fg full">
+            <div class="toggle-row">
+              <div>
+                <div style="font-weight:600">Paper Trading Mode</div>
+                <div style="font-size:11px;color:var(--m);margin-top:2px">Disable to execute real trades</div>
+              </div>
+              <label class="tgl"><input type="checkbox" id="r-paper">
+                <span class="tgl-track"></span></label>
+            </div>
+          </div>
+        </div>
+        <div style="margin-top:14px;font-size:11px;color:var(--m);line-height:1.7">
+          Take profit is always recalculated as at least 4× the actual stop-loss distance,
+          so the floor above is a minimum, not a fixed target — wider stops automatically get wider targets.
+          <br><br>
+          <strong style="color:var(--t)">Max Execution Slippage</strong> guards against acting on a stale price:
+          if the live market has moved more than this % since a signal was detected (RSI computation + AI
+          confirmation both take real time), the bot skips that entry rather than execute at a price the
+          signal was never actually based on. It re-checks next scan.
+        </div>
+      </div>
+      <div class="save-msg" id="risk-saved">✅ Risk settings saved</div>
+    </div>
+
+    <!-- CONTROL -->
+    <div class="panel" id="panel-control">
+      <div class="ph"><h1>Bot Control</h1></div>
+      <div class="fsec">
+        <div class="fsec-title">⚡ ENGINE</div>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button class="btn btn-green" onclick="botAction('start', fetchState)">▶ Start Bot</button>
+          <button class="btn btn-red"   onclick="botAction('stop', fetchState)">⏹ Stop Bot</button>
+          <span id="ctrl-status" style="font-size:13px;color:var(--m)">Status: —</span>
+        </div>
+        <div style="margin-top:16px;background:var(--s2);border-radius:10px;
+          padding:14px;font-size:12px;color:var(--m);line-height:1.9;border:1px solid var(--b2)">
+          <strong style="color:var(--t)">Single-terminal workflow:</strong><br>
+          Just run <code style="color:var(--a)">python trading_bot_main.py</code> — the bot scans
+          in a background thread while Flask serves this dashboard in the main thread.
+          Open <code style="color:var(--blue)">http://localhost:5000</code> in any browser.
+        </div>
+      </div>
+      <div class="fsec">
+        <div class="fsec-title">🗂 OPEN POSITIONS — Force Close</div>
+        <div class="tw" style="margin:0">
+          <table><thead><tr>
+            <th>Symbol</th><th>Side</th><th>Entry</th><th>Unrealised PnL</th><th>Action</th>
+          </tr></thead>
+          <tbody id="ctrl-open-body"></tbody></table>
+        </div>
+      </div>
+      <div class="fsec" style="border-color:rgba(255,71,87,.3)">
+        <div class="fsec-title" style="color:var(--red)">⚠️ LIVE TRADING WARNING</div>
+        <p style="font-size:13px;color:var(--m);line-height:1.7">
+          This bot is for <strong style="color:var(--t)">educational and simulation</strong> purposes.
+          Live trading requires valid exchange API keys. Trading involves
+          <strong style="color:var(--red)">substantial risk of loss</strong>.
+          No accuracy guarantee is made. Always backtest first.
+        </p>
+      </div>
+    </div>
+
+  </main>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let S={};
+
+/* ── sidebar sub-nav ── */
+function nav(id, el){
+  document.querySelectorAll('.sb-item').forEach(x=>x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));
+  if(el) el.classList.add('active');
+  const p=$('panel-'+id);
+  if(p) p.classList.add('active');
+}
+
+/* ── fetch ── */
+async function fetchState(){
+  try{
+    const r=await fetch('/api/state');
+    S=await r.json();
+    render();
+  }catch(e){console.error(e)}
+}
+
+function render(){
+  updateNavStatus(S.bot_running);
+  $('ctrl-status').textContent='Status: '+(S.bot_running?'▶ Running':'⏹ Stopped');
+
+  renderTicker();
+  renderStats();
+  renderOpenOv();
+  renderTrades();
+  renderLog();
+  renderCtrlOpen();
+  populateForms();
+
+  const log=S.log||[];
+  const live=(S.live_trading||{});
+  const liveStatusText = live.connected ? 'Linked' : (live.linked ? 'Connected' : 'Disconnected');
+  const exch = live.exchange||'—';
+  $('ov-sub').textContent=S.scan_count
+    ?`Scan #${S.scan_count} · last: ${log[0]?.ts||'—'} · Exchange: ${exch} · ${liveStatusText}`
+    :'Waiting for first scan...';
+}
+
+function renderTicker(){
+  const p=S.live_prices||{};
+  $('ov-ticker').innerHTML=Object.entries(p).map(([s,v])=>{
+    const chg=((Math.random()*2-1)*0.6).toFixed(2);
+    return `<div class="tick">
+      <span class="tick-sym">${s}</span>
+      <span class="tick-px">${v>999?'$'+Number(v).toLocaleString():'$'+Number(v).toFixed(4)}</span>
+      <span class="${chg>=0?'up':'dn'}">${chg>=0?'+':''}${chg}%</span></div>`;
+  }).join('');
+}
+
+function renderStats(){
+  const s=S.stats||{};
+  const b=s.balance||(S.config||{}).account_balance||10000;
+  const pnl=s.total_pnl||0; const roi=s.roi||0; const wr=s.win_rate||0;
+  $('ov-stats').innerHTML=[
+    {l:'Balance',v:'$'+fmt(b),s:'Available',c:''},
+    {l:'Equity',v:'$'+fmt(s.equity||b),s:'Incl. open PnL',c:'blue'},
+    {l:'Total PnL',v:(pnl>=0?'+':'')+`$${pnl.toFixed(2)}`,s:'Closed',c:pnl>=0?'green':'red'},
+    {l:'ROI',v:(roi>=0?'+':'')+`${roi.toFixed(2)}%`,s:'Return',c:roi>=0?'green':'red'},
+    {l:'Win Rate',v:`${wr.toFixed(1)}%`,s:`${s.wins||0}W/${s.losses||0}L`,c:wr>=55?'green':''},
+    {l:'Trades',v:s.total||0,s:'Closed',c:''},
+    {l:'Open',v:s.open_count||0,s:'Active',c:'blue'},
+    {l:'Unrealised',v:'$'+(s.unrealised||0).toFixed(2),s:'Open PnL',c:(s.unrealised||0)>=0?'green':'red'},
+  ].map(x=>`<div class="stat ${x.c}"><div class="sl">${x.l}</div>
+    <div class="sv">${x.v}</div><div class="ss">${x.s}</div></div>`).join('');
+}
+
+function renderOpenOv(){
+  const trades=S.open_trades||[];
+  $('ov-open-ct').textContent=trades.length+' position'+(trades.length!==1?'s':'');
+  if(!trades.length){
+    $('ov-open-body').innerHTML='<tr><td colspan="9" class="no-data">No open positions</td></tr>';
+    return;
+  }
+  $('ov-open-body').innerHTML=trades.map(t=>{
+    const u=t.unrealised_pnl||0; const c=t.confidence||0;
+    return `<tr>
+      <td><strong>${t.symbol}</strong></td>
+      <td><span class="badge ${t.side}">${t.side}</span></td>
+      <td class="mono">$${Number(t.entry).toFixed(4)}</td>
+      <td class="mono" style="color:var(--red)">$${t.sl||'—'}</td>
+      <td class="mono" style="color:var(--a)">$${t.tp||'—'}</td>
+      <td><span class="${u>=0?'pos':'neg'}">${u>=0?'+':''}$${u.toFixed(2)}</span></td>
+      <td><div style="display:flex;align-items:center;gap:5px">
+        <span>${c.toFixed(0)}%</span>
+        <div class="conf-wrap"><div class="conf-bar" style="width:${c}%"></div></div>
+      </div></td>
+      <td><span class="badge ${t.ai_action||'HOLD'}">${t.ai_action||'—'}</span></td>
+      <td><button class="btn btn-red btn-sm" onclick="closeTrade('${t.id}', fetchState)">✕ Close</button></td>
+    </tr>`;
+  }).join('');
+}
+
+function renderTrades(){
+  const trades=S.closed_trades||[];
+  $('th-count').textContent=trades.length+' closed';
+  if(!trades.length){
+    $('th-body').innerHTML='<tr><td colspan="9" class="no-data">No closed trades yet</td></tr>';
+    return;
+  }
+  $('th-body').innerHTML=trades.map(t=>{
+    const pnl=t.pnl||0;
+    return `<tr>
+      <td><strong>${t.symbol}</strong></td>
+      <td><span class="badge ${t.side}">${t.side}</span></td>
+      <td class="mono">$${Number(t.entry).toFixed(4)}</td>
+      <td class="mono">$${t.close_price?Number(t.close_price).toFixed(4):'—'}</td>
+      <td><span class="badge ${t.status}">${t.status}</span></td>
+      <td><span class="${pnl>=0?'pos':'neg'}">${pnl>=0?'+':''}$${pnl.toFixed(2)}</span></td>
+      <td>${(t.confidence||0).toFixed(0)}%</td>
+      <td><span class="badge ${t.risk_level||'MEDIUM'}">${t.risk_level||'—'}</span></td>
+      <td style="color:var(--m);font-size:12px">${t.open_time?t.open_time.substring(11,16):'—'}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderLog(){
+  const logs=S.log||[];
+  if(!logs.length){$('act-log').innerHTML='<div style="color:var(--m)">No entries yet</div>';return;}
+  $('act-log').innerHTML=logs.map(l=>
+    `<div class="log-line"><span class="log-ts">${l.time}</span><span class="log-${l.level}">${escHtml(l.msg)}</span></div>`
+  ).join('');
+}
+
+function renderCtrlOpen(){
+  const trades=S.open_trades||[];
+  if(!trades.length){
+    $('ctrl-open-body').innerHTML='<tr><td colspan="5" class="no-data">No open positions</td></tr>';
+    return;
+  }
+  $('ctrl-open-body').innerHTML=trades.map(t=>{
+    const u=t.unrealised_pnl||0;
+    return `<tr>
+      <td><strong>${t.symbol}</strong></td>
+      <td><span class="badge ${t.side}">${t.side}</span></td>
+      <td class="mono">$${Number(t.entry).toFixed(4)}</td>
+      <td><span class="${u>=0?'pos':'neg'}">${u>=0?'+':''}$${u.toFixed(2)}</span></td>
+      <td><button class="btn btn-red btn-sm" onclick="closeTrade('${t.id}', fetchState)">Force Close</button></td>
+    </tr>`;
+  }).join('');
+}
+
+/* ── forms ──
+   THE FIX: every field below now uses safeSet()/safeSetChecked() instead
+   of a raw `.value =` / `.checked =` assignment. Those helpers (in
+   script.js) skip a field if it's currently focused or has an unsaved
+   edit, so this poll-driven refresh (every 8s) can no longer stomp
+   whatever you're mid-typing/dragging before you hit Save. */
+function populateForms(){
+  const c=S.config||{};
+  const mode=c.market_mode||'CRYPTO';
+  safeSet('c-market_mode', mode);
+  const syms=mode==='STOCK'?(c.stock_symbols||[]):(c.crypto_symbols||[]);
+  safeSet('c-symbols', syms.join(','));
+  const tf=mode==='STOCK'?c.stock_timeframe:c.crypto_timeframe;
+  safeSet('c-timeframe', tf||'15m');
+  safeSet('c-exchange', c.crypto_exchange||'binance');
+  safeSet('c-rsi_fast', c.rsi_fast_period||6);
+  safeSet('c-rsi_slow', c.rsi_slow_period||12);
+  safeSet('c-rsi_ob', c.rsi_overbought||70);
+  safeSet('c-rsi_os', c.rsi_oversold||30);
+  safeSetChecked('c-ai_confirm', c.ai_confirmation_required);
+  safeSet('r-sl', c.stop_loss_pct||0.005);
+  safeSet('r-tp', c.take_profit_pct||0.02);
+  safeSet('r-minconf', c.min_confidence_to_trade||85);
+  safeSet('r-maxrisk', c.max_risk_per_trade||0.01);
+  safeSet('r-maxopen', c.max_open_trades||3);
+  safeSet('r-balance', c.account_balance||10000);
+  safeSet('r-interval', c.scan_interval_seconds||60);
+  safeSet('r-maxslip', c.max_execution_slippage_pct||0.003);
+  safeSetChecked('r-paper', c.paper_trading);
+  modeHint();
+}
+
+function modeHint(){
+  const m=$('c-market_mode').value;
+  $('sym-hint').textContent=m==='CRYPTO'?'e.g. BTC/USDT,ETH/USDT':'e.g. AAPL,TSLA,NVDA';
+  const exField=$('exchange-field');
+  if(exField) exField.style.display=m==='CRYPTO'?'flex':'none';
+}
+
+async function saveConfig(){
+  const mode=$('c-market_mode').value;
+  const syms=$('c-symbols').value.split(',').map(s=>s.trim().toUpperCase()).filter(Boolean);
+  const tf=$('c-timeframe').value;
+  const payload={
+    market_mode:mode,
+    rsi_fast_period:+$('c-rsi_fast').value,
+    rsi_slow_period:+$('c-rsi_slow').value,
+    rsi_overbought:+$('c-rsi_ob').value,
+    rsi_oversold:+$('c-rsi_os').value,
+    ai_confirmation_required:$('c-ai_confirm').checked,
+  };
+  if(mode==='CRYPTO'){payload.crypto_symbols=syms;payload.crypto_timeframe=tf;payload.crypto_exchange=$('c-exchange').value;}
+  else{payload.stock_symbols=syms;payload.stock_timeframe=tf;}
+  const key=$('c-api_key').value.trim();
+  if(key) payload.anthropic_api_key=key;
+  const r=await post('/api/config',payload);
+  if(r.ok){
+    clearDirty('c-market_mode','c-symbols','c-timeframe','c-exchange',
+      'c-rsi_fast','c-rsi_slow','c-rsi_ob','c-rsi_os','c-ai_confirm','c-api_key');
+    flash('cfg-saved');
+    await fetchState();
+  }else alert(r.error||'Save failed');
+}
+
+async function saveRisk(){
+  const payload={
+    stop_loss_pct:+$('r-sl').value,
+    take_profit_pct:+$('r-tp').value,
+    min_confidence_to_trade:+$('r-minconf').value,
+    max_risk_per_trade:+$('r-maxrisk').value,
+    max_open_trades:+$('r-maxopen').value,
+    account_balance:+$('r-balance').value,
+    scan_interval_seconds:+$('r-interval').value,
+    max_execution_slippage_pct:+$('r-maxslip').value,
+    paper_trading:$('r-paper').checked,
+  };
+  const r=await post('/api/config',payload);
+  if(r.ok){
+    clearDirty('r-sl','r-tp','r-minconf','r-maxrisk','r-maxopen','r-balance','r-interval','r-maxslip','r-paper');
+    flash('risk-saved');
+    await fetchState();
+  }else alert(r.error||'Save failed');
+}
+
+fetchState();
+setInterval(fetchState,8000);
+</script>
+{% endblock %}

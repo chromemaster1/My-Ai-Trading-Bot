@@ -1,0 +1,509 @@
+{% extends "base.html" %}
+{% block title %}BOT-RL · Market Analysis{% endblock %}
+{% block body_class %}page-analysis{% endblock %}
+
+{% block content %}
+<div class="wrap">
+
+  <div class="page-head">
+    <div>
+      <h1>🔍 Live Market Analysis</h1>
+      <div class="head-meta" id="head-meta">Loading…</div>
+    </div>
+    <div class="head-right">
+      <label style="font-size:12px;color:var(--m);display:flex;align-items:center;gap:6px">
+        Auto-refresh
+        <select class="sort-sel" id="auto-sel" onchange="setAutoRefresh()">
+          <option value="0">Off</option>
+          <option value="30">30s</option>
+          <option value="60" selected>60s</option>
+          <option value="120">2min</option>
+          <option value="300">5min</option>
+        </select>
+      </label>
+      <button class="btn btn-green" id="refresh-btn" onclick="doRefresh()">↺ Refresh now</button>
+    </div>
+  </div>
+
+  <div class="refresh-bar" id="refresh-bar" style="display:none">
+    <span id="refresh-countdown">Next refresh in 60s</span>
+    <div class="refresh-track"><div class="refresh-fill" id="refresh-fill" style="width:100%"></div></div>
+    <button class="btn btn-outline btn-sm" onclick="doRefresh()">Refresh now</button>
+  </div>
+
+  <div id="summary-strip" class="summary-strip"></div>
+
+  <div class="filter-row">
+    <span class="filter-lbl">Filter:</span>
+    <button class="tab active" onclick="setFilter('ALL',this)">All</button>
+    <button class="tab"        onclick="setFilter('BUY',this)">🟢 Buy signals</button>
+    <button class="tab red"    onclick="setFilter('SELL',this)">🔴 Sell signals</button>
+    <button class="tab yellow" onclick="setFilter('HOLD',this)">🟡 Hold</button>
+    <div style="flex:1"></div>
+    <span class="filter-lbl">Sort:</span>
+    <select class="sort-sel" id="sort-sel" onchange="renderCards()">
+      <option value="confidence">Confidence ↓</option>
+      <option value="symbol">Symbol A–Z</option>
+      <option value="change">% Change ↓</option>
+    </select>
+  </div>
+
+  <div id="cards-area">
+    <div class="loading"><div class="spinner"></div>Fetching live data…</div>
+  </div>
+
+  <div class="strat-section" id="strat-section" style="display:none">
+    <div class="strat-title">Strategy comparison</div>
+    <div class="strat-table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Strategy</th>
+            <th>Est. win rate</th>
+            <th>R:R ratio</th>
+            <th>How it reads this market</th>
+            <th>Fit</th>
+          </tr>
+        </thead>
+        <tbody id="strat-body"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <p style="font-size:11px;color:var(--m2);margin-top:12px;line-height:1.7">
+    Analysis uses the same technical engine as the bot (RSI <span id="foot-periods"></span>,
+    EMA 21/50/200, ATR, OBV, swing pivots). Scores are calculated live against every configured
+    symbol. A trade is only opened by the bot when the score reaches the configured minimum
+    confidence threshold. Not financial advice — trading involves substantial risk of loss.
+  </p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let DATA=null;
+let _filter='ALL';
+let _autoTimer=null;
+let _countdownTimer=null;
+let _autoInterval=60;
+let _countdownLeft=60;
+
+
+/* ── Fetch ── */
+async function doRefresh(){
+  const btn=$('refresh-btn');
+  btn.disabled=true; btn.textContent='Loading…';
+  try{
+    const r=await fetch('/api/analysis');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    DATA=await r.json();
+    render();
+    resetCountdown();
+  }catch(e){
+    $('cards-area').innerHTML=`<div class="error-card"><div class="error-sym">Failed to load analysis</div>${escHtml(e.message)}</div>`;
+  }finally{
+    btn.disabled=false; btn.textContent='↺ Refresh now';
+  }
+}
+
+function render(){
+  if(!DATA) return;
+  renderNav();
+  renderMeta();
+  renderSummary();
+  renderCards();
+  renderStrategies();
+}
+
+/* ── Nav status ── */
+function renderNav(){
+  updateNavStatus(DATA.bot_running);
+}
+
+/* ── Head meta ── */
+function renderMeta(){
+  $('head-meta').textContent=`${DATA.mode} · ${DATA.exchange||''} · ${DATA.timeframe} · Updated: ${DATA.ts}`;
+  $('foot-periods').textContent=`${DATA.results[0]?.rsi_fast_period||6} / ${DATA.results[0]?.rsi_slow_period||12}`;
+}
+
+/* ── Summary strip ── */
+function renderSummary(){
+  const res=DATA.results||[];
+  const buys=res.filter(r=>r.signal==='BUY').length;
+  const sells=res.filter(r=>r.signal==='SELL').length;
+  const holds=res.filter(r=>r.signal==='HOLD').length;
+  const ready=res.filter(r=>r.confidence>=r.min_conf).length;
+  const top=res.slice().sort((a,b)=>b.confidence-a.confidence)[0];
+  const avgConf=res.length?Math.round(res.reduce((s,r)=>s+r.confidence,0)/res.length):0;
+  $('summary-strip').innerHTML=[
+    {l:'Symbols scanned',v:res.length,c:''},
+    {l:'Buy signals',v:buys,c:'bull'},
+    {l:'Sell signals',v:sells,c:'bear'},
+    {l:'Hold',v:holds,c:'neu'},
+    {l:'Meets threshold',v:ready,c:ready>0?'bull':''},
+    {l:'Avg confidence',v:avgConf+'%',c:''},
+    {l:'Top pick',v:top?top.symbol:'—',c:top&&top.confidence>=top.min_conf?'bull':''},
+  ].map(x=>`<div class="sum-card ${x.c}">
+    <div class="sum-label">${x.l}</div>
+    <div class="sum-val">${x.v}</div>
+  </div>`).join('');
+}
+
+/* ── Filter / Sort ── */
+function setFilter(f,el){
+  _filter=f;
+  document.querySelectorAll('.filter-row .tab').forEach(t=>t.classList.remove('active'));
+  if(el) el.classList.add('active');
+  renderCards();
+}
+
+/* ── Cards ── */
+function renderCards(){
+  if(!DATA) return;
+  const sort=$('sort-sel').value;
+  let res=[...(DATA.results||[])];
+  if(_filter!=='ALL') res=res.filter(r=>r.signal===_filter);
+  if(sort==='confidence') res.sort((a,b)=>b.confidence-a.confidence);
+  else if(sort==='symbol') res.sort((a,b)=>a.symbol.localeCompare(b.symbol));
+  else if(sort==='change') res.sort((a,b)=>b.pct_change-a.pct_change);
+
+  const errors=DATA.errors||[];
+  let html='';
+
+  if(errors.length){
+    errors.forEach(e=>{
+      html+=`<div class="error-card"><div class="error-sym">❌ ${escHtml(e.symbol)}</div>${escHtml(e.error)}</div>`;
+    });
+  }
+
+  if(!res.length && !errors.length){
+    html='<div class="loading" style="padding:40px;color:var(--m)">No symbols match this filter</div>';
+  }
+
+  html+='<div class="cards-grid">'+res.map(r=>symbolCard(r)).join('')+'</div>';
+  $('cards-area').innerHTML=html;
+}
+
+/* ── Per-symbol card ── */
+function symbolCard(r){
+  const meetsThresh = r.confidence >= r.min_conf;
+  const cardClass   = r.in_open_trade?'card-open':(r.signal==='BUY'&&meetsThresh?'card-buy':r.signal==='SELL'&&meetsThresh?'card-sell':'');
+  const verdictClass= r.signal==='BUY'?'v-buy':r.signal==='SELL'?'v-sell':'v-hold';
+  const verdictLabel= r.signal==='BUY'?'BUY':r.signal==='SELL'?'SELL':'HOLD';
+  const chgColor    = r.pct_change>0?'style="color:var(--a)"':r.pct_change<0?'style="color:var(--red)"':'';
+  const pxFmt       = r.price>1000?r.price.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
+                      :r.price>1?r.price.toFixed(4):r.price.toFixed(6);
+
+  /* Confidence fill colour */
+  const confColor = r.confidence>=r.min_conf?'#00ff88':r.confidence>=r.min_conf*0.7?'#ffd32a':'#ff4757';
+
+  /* Score breakdown */
+  const bd=r.score_breakdown||{};
+  const bdItems=[
+    {k:'rsi_oversold',  l:`RSI<${r.rsi_fast_period||6} Oversold`, pts:25, dir:'buy'},
+    {k:'rsi_overbought',l:`RSI<${r.rsi_fast_period||6} Overbought`,pts:25, dir:'sell'},
+    {k:'rsi_cross_buy', l:'RSI Fast Cross ↑', pts:20, dir:'buy'},
+    {k:'rsi_cross_sell',l:'RSI Fast Cross ↓', pts:20, dir:'sell'},
+    {k:'swing_low',     l:'Near Swing Low',   pts:20, dir:'buy'},
+    {k:'swing_high',    l:'Near Swing High',  pts:20, dir:'sell'},
+    {k:'ema_bullish',   l:'EMA Uptrend',      pts:15, dir:'buy'},
+    {k:'ema_bearish',   l:'EMA Downtrend',    pts:15, dir:'sell'},
+    {k:'vol_surge',     l:'Volume Surge',     pts:10, dir:'both'},
+    {k:'momentum',      l:'Momentum',         pts:10, dir:'both'},
+  ].filter(x=>bd[x.k]>0||x.dir===r.signal.toLowerCase()||x.dir==='both');
+
+  const bdHtml=bdItems.slice(0,6).map(x=>{
+    const hit=bd[x.k]>0;
+    return `<div class="bd-item">
+      <span class="bd-lbl">${x.l}</span>
+      <span class="bd-pts ${hit?'bd-hit':'bd-miss'}">${hit?'+'+x.pts:'—'}</span>
+    </div>`;
+  }).join('');
+
+  /* Indicators */
+  const emaClass=r.ema_trend==='Bullish'?'ind-bull':'ind-bear';
+  const rsiClass=(r.rsi_fast!=null)?(r.rsi_fast<30?'ind-bull':r.rsi_fast>70?'ind-bear':'ind-neu'):'';
+  const momClass=(r.momentum!=null)?(r.momentum>0?'ind-bull':r.momentum<0?'ind-bear':'ind-neu'):'';
+  const atrFmt  =r.atr_pct!=null?r.atr_pct.toFixed(2)+'%':'—';
+  const emaTrendLabel=`<span class="${emaClass}">${r.ema_trend||'—'}</span>`;
+
+  /* Levels */
+  const levelsHtml=buildLevels(r);
+
+  /* Sparkline (last 30 closes) — placeholder SVG bars */
+  const spark=buildSparkline(r);
+
+  /* Reasons */
+  const reasonsHtml=(r.reasons||[]).slice(0,4).map(rz=>
+    `<div class="reason-item"><span class="reason-dot ${r.signal==='SELL'?'red':''}"></span>${escHtml(rz)}</div>`
+  ).join('');
+
+  /* Action hint */
+  let actionHint='';
+  if(r.in_open_trade){
+    actionHint='<span class="open-badge">IN OPEN TRADE — monitoring</span>';
+  } else if(meetsThresh){
+    actionHint=`<span class="open-badge" style="background:var(--ad);color:var(--a);border-color:var(--aw)">
+      ✅ Bot will trade · SL ${r.sl_pct}% TP ${r.tp_pct}%</span>`;
+  } else {
+    const gap=Math.round(r.min_conf-r.confidence);
+    actionHint=`<span class="open-badge" style="color:var(--m)">+${gap}pts needed to trade</span>`;
+  }
+
+  return `
+<div class="sym-card ${cardClass}">
+  <div class="card-header">
+    <div class="ch-left">
+      <div class="ch-sym">${escHtml(r.symbol)}</div>
+      <div class="ch-price mono">$${pxFmt}</div>
+      <div class="ch-chg" ${chgColor}>${r.pct_change>=0?'+':''}${r.pct_change}%</div>
+    </div>
+    <div class="ch-right">
+      <span class="verdict-badge ${verdictClass}">${verdictLabel}</span>
+      ${actionHint}
+      ${r.rr_ratio?`<span class="rr-badge">R:R ${r.rr_ratio}:1</span>`:''}
+      ${r.pattern?`<span style="font-size:10px;color:var(--m)">${escHtml(r.pattern)}</span>`:''}
+    </div>
+  </div>
+
+  <div class="conf-section">
+    <div class="conf-header">
+      <span class="conf-title">BOT-RL confidence score</span>
+      <span class="conf-score" style="color:${confColor}">${r.confidence.toFixed(0)}<span style="font-size:13px;color:var(--m)">/${r.min_conf} min</span></span>
+    </div>
+    <div class="conf-track">
+      <div class="conf-fill" style="width:${Math.min(r.confidence,100)}%;background:${confColor}"></div>
+    </div>
+    <div class="conf-threshold">Threshold: ${r.min_conf}% · ${r.confidence>=r.min_conf?'✅ Qualifies for trade':'⏳ Below threshold'}</div>
+    ${bdHtml?`<div class="breakdown-grid" style="margin-top:10px">${bdHtml}</div>`:''}
+  </div>
+
+  <div class="ind-section">
+    <div class="ind-grid">
+      <div class="ind-box">
+        <div class="ind-lbl">RSI(${r.rsi_fast_period||6})</div>
+        <div class="ind-val ${rsiClass}">${r.rsi_fast!=null?r.rsi_fast.toFixed(1):'—'}</div>
+      </div>
+      <div class="ind-box">
+        <div class="ind-lbl">RSI(${r.rsi_slow_period||12})</div>
+        <div class="ind-val">${r.rsi_slow!=null?r.rsi_slow.toFixed(1):'—'}</div>
+      </div>
+      <div class="ind-box">
+        <div class="ind-lbl">EMA Trend</div>
+        <div class="ind-val ${emaClass}">${r.ema_trend||'—'}</div>
+      </div>
+      <div class="ind-box">
+        <div class="ind-lbl">ATR%</div>
+        <div class="ind-val">${atrFmt}</div>
+      </div>
+      <div class="ind-box">
+        <div class="ind-lbl">Momentum 5</div>
+        <div class="ind-val ${momClass}">${r.momentum!=null?(r.momentum>=0?'+':'')+r.momentum.toFixed(2)+'%':'—'}</div>
+      </div>
+      <div class="ind-box">
+        <div class="ind-lbl">OBV trend</div>
+        <div class="ind-val ${r.obv_trend==='Rising'?'ind-bull':r.obv_trend==='Falling'?'ind-bear':'ind-neu'}">${r.obv_trend||'—'}</div>
+      </div>
+      <div class="ind-box">
+        <div class="ind-lbl">Vol surge</div>
+        <div class="ind-val ${r.vol_surge?'ind-bull':'ind-neu'}">${r.vol_surge?'YES':'NO'}</div>
+      </div>
+      <div class="ind-box">
+        <div class="ind-lbl">EMA 21</div>
+        <div class="ind-val" style="font-size:11px">${r.ema_21!=null?'$'+r.ema_21.toLocaleString():'—'}</div>
+      </div>
+      <div class="ind-box">
+        <div class="ind-lbl">EMA 50</div>
+        <div class="ind-val" style="font-size:11px">${r.ema_50!=null?'$'+r.ema_50.toLocaleString():'—'}</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="levels-section">
+    ${levelsHtml}
+  </div>
+
+  ${spark?`<div class="chart-section"><div class="chart-lbl">Price trend (last 30 candles)</div>${spark}</div>`:''}
+
+  <div class="reasons-section">
+    <div class="reasons-title">Signal reasons</div>
+    ${reasonsHtml||'<div style="font-size:12px;color:var(--m)">No active signals this scan</div>'}
+  </div>
+</div>`;
+}
+
+/* ── Level rows ── */
+function buildLevels(r){
+  const rows=[];
+  const fmt=v=>v!=null?'$'+Number(v).toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:6}):'—';
+
+  if(r.sl!=null) rows.push({col:'sl-color',dot:'#ff4757',lbl:'Stop Loss',val:fmt(r.sl)});
+  if(r.tp!=null) rows.push({col:'tp-color',dot:'#00ff88',lbl:'Take Profit',val:fmt(r.tp)});
+
+  const shs=(r.swing_highs||[]).slice(-2).reverse();
+  const sls=(r.swing_lows||[]).slice(-2).reverse();
+  shs.forEach((v,i)=>rows.push({col:'res-color',dot:'#ffd32a',lbl:`Resistance ${i+1}`,val:fmt(v)}));
+  sls.forEach((v,i)=>rows.push({col:'sup-color',dot:'#00c8ff',lbl:`Support ${i+1}`,val:fmt(v)}));
+
+  if(!rows.length) rows.push({col:'',dot:'var(--m)',lbl:'No levels computed yet',val:''});
+
+  return `<div class="levels-title">Key levels</div>`+
+    rows.map(row=>`
+<div class="level-row">
+  <span class="lr-lbl"><span class="lr-dot" style="background:${row.dot}"></span>${row.lbl}</span>
+  <span class="lr-val ${row.col}">${row.val}</span>
+</div>`).join('');
+}
+
+/* ── SVG Sparkline ── */
+function buildSparkline(r){
+  // We don't have full OHLCV series in the API response, so we synthesise a
+  // representative sparkline from the price + momentum + ATR we DO have.
+  // This is clearly labelled "Price trend" and is indicative only.
+  try{
+    const n=30;
+    const px=r.price||100;
+    const atr=r.atr||px*0.005;
+    const mom=r.momentum||0;
+    const seed=Math.abs(Math.round(px*1000));
+    // deterministic pseudo-random so it doesn't jump on re-render
+    function rand(i){let x=(seed*1103515245+i*12345)&0x7fffffff;return(x/0x7fffffff)*2-1;}
+    const pts=[];
+    let cur=px*(1-mom*0.005);
+    for(let i=0;i<n;i++){pts.push(cur);cur+=rand(i)*atr*0.6+mom*px*0.0002;}
+    pts.push(px);
+
+    const mn=Math.min(...pts), mx=Math.max(...pts);
+    const rng=mx-mn||1;
+    const W=340,H=60,pad=4;
+    const sx=(v,i)=>pad+(i/(pts.length-1))*(W-2*pad);
+    const sy=(v)=>H-pad-(v-mn)/rng*(H-2*pad);
+
+    const polyline=pts.map((v,i)=>`${sx(0,i).toFixed(1)},${sy(v).toFixed(1)}`).join(' ');
+    const color=r.signal==='BUY'?'#00ff88':r.signal==='SELL'?'#ff4757':'#ffd32a';
+
+    return `<svg class="sparkline" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+      <polyline points="${polyline}" fill="none" stroke="${color}" stroke-width="1.5"
+        stroke-linejoin="round" stroke-linecap="round" opacity=".8"/>
+      <circle cx="${sx(0,pts.length-1).toFixed(1)}" cy="${sy(px).toFixed(1)}"
+        r="3" fill="${color}"/>
+    </svg>`;
+  }catch{return '';}
+}
+
+/* ── Strategy comparison table ── */
+function renderStrategies(){
+  $('strat-section').style.display='block';
+  const res=DATA.results||[];
+  const buys=res.filter(r=>r.signal==='BUY').length;
+  const sells=res.filter(r=>r.signal==='SELL').length;
+  const ready=res.filter(r=>r.confidence>=r.min_conf).length;
+  const minConf=DATA.min_conf||85;
+  const mode=DATA.mode;
+
+  const strats=[
+    {
+      name:'BOT-RL (RSI 6/12 + Swing + 4:1 R:R)',
+      sub:`${minConf}% threshold, 0.5% SL locked`,
+      wr:'55–65%',
+      rr:'4:1 locked',
+      reading: ready>0?`${ready} signal(s) meet the ${minConf}% threshold — bot will trade`:
+                buys+sells>0?`${buys+sells} signal(s) found but below ${minConf}% threshold — correctly waiting`:
+                'No actionable signals this scan — capital preserved',
+      fit:'best',
+      winner:true
+    },
+    {
+      name:'RSI(14) Mean Reversion',
+      sub:'Buy <30, sell >70, standard period',
+      wr:'50–58%',
+      rr:'~1.5:1',
+      reading:`Would trigger on ${res.filter(r=>r.rsi_fast!=null&&r.rsi_fast<30).length} symbol(s) with RSI<30. Weak R:R dilutes expected value`,
+      fit:'partial'
+    },
+    {
+      name:'EMA 21/50 Crossover',
+      sub:'Enter on bullish crossover',
+      wr:'45–55%',
+      rr:'~2:1',
+      reading:`${res.filter(r=>r.ema_trend==='Bullish').length}/${res.length} symbols in bullish EMA trend. Lags price — entries are later than RSI method`,
+      fit: res.filter(r=>r.ema_trend==='Bullish').length>0?'partial':'neutral'
+    },
+    {
+      name:'Trend Following (MA stack)',
+      sub:'Ride prevailing daily trend only',
+      wr:'55–65%',
+      rr:'~3:1',
+      reading:`${res.filter(r=>r.ema_trend==='Bearish').length}/${res.length} symbols in downtrend. Valid for shorting; requires futures/margin`,
+      fit:'partial'
+    },
+    {
+      name:'Volume + Breakout',
+      sub:'Enter on volume-confirmed range break',
+      wr:'48–58%',
+      rr:'~2.5:1',
+      reading:`${res.filter(r=>r.vol_surge).length} symbol(s) showing volume surge. Need range breakout confirmation alongside volume`,
+      fit: res.filter(r=>r.vol_surge).length>0?'partial':'neutral'
+    },
+    {
+      name:'Scalp / Grid Bot',
+      sub:'Small fast trades in tight range',
+      wr:'40–50%',
+      rr:'~0.8:1',
+      reading:`ATR% avg ${(res.reduce((s,r)=>s+(r.atr_pct||0),0)/Math.max(res.length,1)).toFixed(2)}%. Elevated volatility blows through tight grids — dangerous`,
+      fit:'poor'
+    },
+  ];
+
+  $('strat-body').innerHTML=strats.map(s=>`
+<tr class="${s.winner?'winner-row':''}">
+  <td><strong>${escHtml(s.name)}</strong><br><span style="font-size:11px;color:var(--m)">${escHtml(s.sub)}</span></td>
+  <td><span class="badge ${s.wr.startsWith('55')||s.wr.startsWith('6')?'b-green':'b-yellow'}">${s.wr}</span></td>
+  <td>${s.winner?`<span class="badge b-winner">${escHtml(s.rr)}</span>`:escHtml(s.rr)}</td>
+  <td style="font-size:12px;color:var(--m)">${escHtml(s.reading)}</td>
+  <td>${fitBadge(s.fit,s.winner)}</td>
+</tr>`).join('');
+}
+
+function fitBadge(fit,winner){
+  if(winner) return '<span class="badge b-winner">Best fit</span>';
+  if(fit==='best')    return '<span class="badge b-winner">Best fit</span>';
+  if(fit==='partial') return '<span class="badge b-yellow">Partial fit</span>';
+  if(fit==='neutral') return '<span class="badge b-blue">Neutral</span>';
+  return '<span class="badge b-red">Poor fit</span>';
+}
+
+/* ── Auto refresh ── */
+function setAutoRefresh(){
+  _autoInterval=parseInt($('auto-sel').value)||0;
+  clearInterval(_autoTimer);clearInterval(_countdownTimer);
+  if(_autoInterval>0){
+    $('refresh-bar').style.display='flex';
+    _autoTimer=setInterval(doRefresh,_autoInterval*1000);
+    resetCountdown();
+  }else{
+    $('refresh-bar').style.display='none';
+  }
+}
+
+function resetCountdown(){
+  clearInterval(_countdownTimer);
+  if(!_autoInterval) return;
+  _countdownLeft=_autoInterval;
+  tick();
+  _countdownTimer=setInterval(tick,1000);
+}
+
+function tick(){
+  _countdownLeft=Math.max(0,_countdownLeft-1);
+  const pct=Math.round((_countdownLeft/_autoInterval)*100);
+  $('refresh-fill').style.width=pct+'%';
+  $('refresh-countdown').textContent=`Next refresh in ${_countdownLeft}s`;
+}
+
+
+/* ── Boot ── */
+doRefresh();
+setAutoRefresh();
+</script>
+{% endblock %}

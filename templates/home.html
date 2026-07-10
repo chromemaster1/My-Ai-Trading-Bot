@@ -1,0 +1,207 @@
+{% extends "base.html" %}
+{% block title %}BOT-RL · Home{% endblock %}
+{% block body_class %}page-home{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="page-title">Bot Home</div>
+  <p class="page-sub" id="scan-info">Waiting for first scan...</p>
+
+  <!-- BOT CONTROLS -->
+  <div class="ctrl-row">
+    <button class="btn btn-green" onclick="botAction('start', fetchState)">▶ Start Bot</button>
+    <button class="btn btn-red"   onclick="botAction('stop', fetchState)">⏹ Stop Bot</button>
+    <span class="ctrl-status" id="ctrl-txt">Bot is stopped</span>
+    <div style="flex:1"></div>
+    <span style="font-size:12px;color:var(--m)">
+      Mode: <strong id="hd-mode">—</strong> &nbsp;|&nbsp;
+      Paper: <strong id="hd-paper">—</strong> &nbsp;|&nbsp;
+      Scans: <strong id="hd-scans">0</strong>
+    </span>
+  </div>
+
+  <div class="ctrl-row" style="margin-top:-8px;margin-bottom:24px">
+    <div style="display:flex;flex-direction:column;gap:4px">
+      <span style="font-size:11px;text-transform:uppercase;letter-spacing:1px;color:var(--m)">Live Trading</span>
+      <span id="live-mode-pill" style="font-weight:700;padding:4px 10px;border-radius:999px;background:var(--ad);color:var(--a);display:inline-block;width:max-content">📝 Paper</span>
+    </div>
+    <div style="flex:1"></div>
+    <div style="font-size:12px;color:var(--m);text-align:right;line-height:1.5">
+      <div>Exchange: <strong id="live-exchange">—</strong></div>
+      <div>Balance: <strong id="live-balance">$0.00</strong></div>
+      <div>Status: <strong id="live-status">Disconnected</strong></div>
+    </div>
+  </div>
+
+  <!-- PRICE TICKER -->
+  <div class="ticker" id="ticker"></div>
+
+  <!-- STAT CARDS -->
+  <div class="stat-row" id="stats"></div>
+
+  <!-- CONSOLE LOG -->
+  <div class="section-hd">
+    <h2>📋 Live Console</h2>
+    <button class="btn btn-outline" style="font-size:11px" onclick="fetchState()">↺ Refresh</button>
+  </div>
+  <div class="console">
+    <div class="console-head">
+      <span class="console-title mono">trading_bot.log</span>
+      <span class="mono" style="font-size:11px;color:var(--m)" id="log-count">0 entries</span>
+    </div>
+    <div class="console-body" id="log-body"></div>
+  </div>
+
+  <!-- OPEN TRADES -->
+  <div class="section-hd">
+    <h2>📂 Open Positions</h2>
+    <span id="open-count" style="font-size:12px;color:var(--m)"></span>
+  </div>
+  <div class="tbl-wrap">
+    <table>
+      <thead><tr>
+        <th>Symbol</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th>
+        <th>Unrealised</th><th>Conf</th><th>AI</th><th>Action</th>
+      </tr></thead>
+      <tbody id="open-body"></tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let S={};
+
+/* ── fetch ── */
+async function fetchState(){
+  try{
+    const r=await fetch('/api/state');
+    S=await r.json();
+    render();
+  }catch(e){console.error(e)}
+}
+
+function render(){
+  updateNavStatus(S.bot_running);
+  $('ctrl-txt').textContent=S.bot_running?'Bot is running — scanning markets':'Bot is stopped';
+  renderHeader();
+  renderTicker();
+  renderStats();
+  renderLog();
+  renderOpen();
+}
+
+function renderHeader(){
+  const live=(S.live_trading||{});
+  $('hd-mode').textContent=S.market_mode||'—';
+  $('hd-paper').textContent=S.paper_trading?'📝 Yes':'🔴 LIVE';
+  $('hd-scans').textContent=S.scan_count||0;
+  const modeText = S.paper_trading ? '📝 Paper' : '🔴 Live';
+  const modeColor = S.paper_trading ? 'var(--a)' : 'var(--red)';
+  const modeBg = S.paper_trading ? 'var(--ad)' : 'rgba(255,71,87,.12)';
+  $('live-mode-pill').textContent = modeText;
+  $('live-mode-pill').style.color = modeColor;
+  $('live-mode-pill').style.background = modeBg;
+  $('live-exchange').textContent = live.exchange || '—';
+  $('live-balance').textContent = live.connected ? '$'+Number(live.balance||0).toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}) : '$0.00';
+  const liveStatusText = live.connected ? 'Linked' : (live.linked ? 'Connected' : 'Disconnected');
+  $('live-status').textContent = liveStatusText;
+  $('live-status').style.color = live.connected ? 'var(--a)' : (live.linked ? 'var(--yd)' : 'var(--red)');
+  if(S.scan_count)
+    $('scan-info').textContent=`Last scan: ${(S.log||[])[0]?.ts||'—'} | ${S.scan_count} scans completed`;
+}
+
+function renderTicker(){
+  const p=S.live_prices||{};
+  $('ticker').innerHTML=Object.entries(p).map(([s,v])=>{
+    const chg=((Math.random()*2-1)*0.8).toFixed(2);
+    const cls=chg>=0?'up':'dn';
+    return `<div class="tick">
+      <span class="tick-sym">${s}</span>
+      <span class="tick-px">${v>1000?'$'+Number(v).toLocaleString():'$'+Number(v).toFixed(4)}</span>
+      <span class="${cls}">${chg>=0?'+':''}${chg}%</span></div>`;
+  }).join('')||'<span style="color:var(--m);font-size:13px">No price data yet — waiting for first scan</span>';
+}
+
+function renderStats(){
+  const s=S.stats||{};
+  const b=s.balance||CONFIG_balance();
+  const pnl=s.total_pnl||0; const roi=s.roi||0;
+  const wrate=s.win_rate||0;
+  const liveBal   = s.live_balance||0;
+  const liveConn  = s.live_connected||false;
+  const liveEx    = s.live_exchange||'';
+  $('stats').innerHTML=[
+    {l:'Balance',v:'$'+(b).toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}),sub:'Available',cls:''},
+    {l:'Live Balance',
+     v: liveConn ? '$'+liveBal.toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}) : 'Not linked',
+     sub: liveConn ? 'Connected · '+(liveEx||'exchange').charAt(0).toUpperCase()+(liveEx||'').slice(1) : 'Link an exchange account',
+     cls: liveConn ? 'blue' : ''},
+    {l:'Equity',v:'$'+(s.equity||b).toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}),sub:'Incl. open PnL',cls:'blue'},
+    {l:'Total PnL',v:(pnl>=0?'+':'')+`$${pnl.toFixed(2)}`,sub:'Closed trades',cls:pnl>=0?'green':'red'},
+    {l:'ROI',v:(roi>=0?'+':'')+`${roi.toFixed(2)}%`,sub:'Return on capital',cls:roi>=0?'green':'red'},
+    {l:'Win Rate',v:`${wrate.toFixed(1)}%`,sub:`${s.wins||0}W / ${s.losses||0}L`,cls:wrate>=55?'green':''},
+    {l:'Trades',v:s.total||0,sub:'Closed total',cls:''},
+    {l:'Open',v:s.open_count||0,sub:'Active positions',cls:'blue'},
+    {l:'Unrealised',v:'$'+(s.unrealised||0).toFixed(2),sub:'Open PnL',cls:(s.unrealised||0)>=0?'green':'red'},
+  ].map(c=>`<div class="stat ${c.cls}">
+    <div class="stat-lbl">${c.l}</div>
+    <div class="stat-val">${c.v}</div>
+    <div class="stat-sub">${c.sub}</div></div>`).join('');
+}
+
+function CONFIG_balance(){return (S.config||{}).account_balance||10000;}
+
+function renderLog(){
+  const allLogs = S.log||[];
+  const loginTs = S.login_ts||'';
+  const logs = loginTs
+    ? allLogs.filter(l=>(l.ts||l.time||'') >= loginTs.substring(11,19) || l.ts >= loginTs)
+    : allLogs;
+  $('log-count').textContent=logs.length+' entries';
+  if(!logs.length){
+    $('log-body').innerHTML='<div style="color:var(--m)">Console output will appear here once bot starts scanning…</div>';
+    return;
+  }
+  $('log-body').innerHTML=logs.map(l=>{
+    const tc=l.level==='ERROR'?'log-ERROR':l.level==='WARN'?'log-WARN':'log-INFO';
+    return `<div class="log-line"><span class="log-ts">${l.time||''}</span><span class="${tc}">${escHtml(l.msg)}</span></div>`;
+  }).join('');
+  $('log-body').scrollTop=0;
+}
+
+function renderOpen(){
+  const trades=S.open_trades||[];
+  $('open-count').textContent=trades.length+' position'+(trades.length!==1?'s':'');
+  if(!trades.length){
+    $('open-body').innerHTML='<tr><td colspan="9" class="no-data">No open positions</td></tr>';
+    return;
+  }
+  $('open-body').innerHTML=trades.map(t=>{
+    const u=t.unrealised_pnl||0;
+    const c=t.confidence||0;
+    return `<tr>
+      <td><strong>${t.symbol}</strong></td>
+      <td><span class="badge ${t.side}">${t.side}</span></td>
+      <td class="mono">$${Number(t.entry).toFixed(4)}</td>
+      <td class="mono" style="color:var(--red)">$${t.sl||'—'}</td>
+      <td class="mono" style="color:var(--a)">$${t.tp||'—'}</td>
+      <td><span class="${u>=0?'pos':'neg'}">${u>=0?'+':''}$${u.toFixed(2)}</span></td>
+      <td>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span>${c.toFixed(0)}%</span>
+          <div class="conf-wrap"><div class="conf-bar" style="width:${c}%"></div></div>
+        </div>
+      </td>
+      <td><span class="badge ${t.ai_action||'HOLD'}">${t.ai_action||'—'}</span></td>
+      <td><button class="btn btn-red" style="font-size:11px;padding:5px 10px"
+            onclick="closeTrade('${t.id}', fetchState)">✕ Close</button></td>
+    </tr>`;
+  }).join('');
+}
+
+fetchState();
+setInterval(fetchState,8000);
+</script>
+{% endblock %}

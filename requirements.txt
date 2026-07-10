@@ -1,0 +1,13 @@
+flask>=3.0.0
+werkzeug>=3.0.0
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+colorama>=0.4.6
+python-dotenv>=1.0.1
+gunicorn>=22.0.0
+# Market data — install at least one:
+ccxt>=4.0.0
+yfinance>=0.2.28
+# Optional indicators lib:
+ta>=0.10.2

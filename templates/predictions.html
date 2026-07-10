@@ -1,0 +1,433 @@
+{% extends "base.html" %}
+{% block title %}BOT-RL · Trade Predictions{% endblock %}
+{% block body_class %}page-predictions{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="page-head">
+    <div class="ph-left">
+      <h1>🎯 Trade Predictions</h1>
+      <p id="head-meta">Loading live data…</p>
+    </div>
+    <div class="ph-right">
+      <label style="font-size:12px;color:var(--m);display:flex;align-items:center;gap:6px">
+        Auto-refresh
+        <select class="sort-sel" id="auto-sel" onchange="setAutoRefresh()" style="margin-left:0">
+          <option value="0">Off</option>
+          <option value="30">30s</option>
+          <option value="60" selected>60s</option>
+          <option value="120">2min</option>
+        </select>
+      </label>
+      <button class="btn btn-green" id="refresh-btn" onclick="doRefresh()">↺ Refresh</button>
+    </div>
+  </div>
+
+  <div class="refresh-bar" id="refresh-bar" style="display:none">
+    <span id="cd-txt">Next refresh in 60s</span>
+    <div class="rt"><div class="rf" id="rf" style="width:100%"></div></div>
+    <button class="btn btn-outline btn-sm" onclick="doRefresh()">Now</button>
+  </div>
+
+  <!-- CONFIG STRIP -->
+  <div class="config-strip" id="config-strip"></div>
+
+  <!-- SUMMARY CARDS -->
+  <div class="sum-row" id="sum-row"></div>
+
+  <!-- TIER FILTER -->
+  <div class="tier-bar">
+    <span class="tier-lbl">Show:</span>
+    <button class="tier-btn active-all" onclick="setTier('ALL',this)">All</button>
+    <button class="tier-btn" onclick="setTier('TRADE_NOW',this)">🟢 Trade now</button>
+    <button class="tier-btn" onclick="setTier('VERY_CLOSE',this)">🟡 Very close</button>
+    <button class="tier-btn" onclick="setTier('BUILDING',this)">🔵 Building</button>
+    <button class="tier-btn" onclick="setTier('WATCHING',this)">🟣 Watching</button>
+    <button class="tier-btn" onclick="setTier('EARLY',this)">⚪ Early</button>
+    <select class="sort-sel" id="sort-sel" onchange="renderCards()">
+      <option value="score">Score ↓</option>
+      <option value="ev">Exp. Value ↓</option>
+      <option value="gap">Gap ↑ (closest)</option>
+      <option value="symbol">Symbol A–Z</option>
+    </select>
+  </div>
+
+  <div id="cards-area">
+    <div class="loading"><div class="spinner"></div>Fetching live market data…</div>
+  </div>
+
+  <p style="font-size:11px;color:var(--m2);margin-top:8px;line-height:1.7">
+    Predictions are computed live from exchange OHLCV data using the same RSI(<span id="foot-rsi"></span>),
+    swing-pivot, EMA, volume and momentum engine as the bot. Scores reflect current candle alignment only —
+    the market can move before the bot's next scan. Win-rate estimates are based on published backtests of
+    RSI + swing confluence strategies; they are <em>estimates, not guarantees</em>.
+    Expected value assumes the configured 4:1 reward:risk ratio and is mathematical — not a profit promise.
+    Trading involves substantial risk of loss.
+  </p>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let D=null, _tier='ALL', _autoIv=60, _autoTimer=null, _cdTimer=null, _cdLeft=60;
+
+
+/* fetch */
+async function doRefresh(){
+  const btn=$('refresh-btn');
+  btn.disabled=true; btn.textContent='Loading…';
+  try{
+    const r=await fetch('/api/predictions');
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    D=await r.json();
+    render();
+    resetCd();
+  }catch(e){
+    $('cards-area').innerHTML=`<div class="err-card">Failed to load predictions: ${esc(e.message)}</div>`;
+  }finally{btn.disabled=false;btn.textContent='↺ Refresh';}
+}
+
+function render(){
+  if(!D) return;
+  renderNav();
+  renderMeta();
+  renderConfig();
+  renderSummary();
+  renderCards();
+}
+
+function renderNav(){
+  updateNavStatus(D.bot_running);
+}
+
+function renderMeta(){
+  $('head-meta').textContent=
+    `${D.mode} · ${D.exchange||''} · ${D.timeframe} · Updated: ${D.ts}`;
+  const p=D.predictions||[];
+  const fp=p[0];
+  $('foot-rsi').textContent=fp?`${fp.rsi_fast_period||6}/${fp.rsi_fast_period?fp.rsi_fast_period+6:12}`:'6/12';
+}
+
+function renderConfig(){
+  $('config-strip').innerHTML=[
+    {l:'Account',     v:'$'+fmt(D.account_balance||0),  cls:''},
+    {l:'Min Conf.',   v:D.min_conf+'%',                  cls:'highlight'},
+    {l:'Stop Loss',   v:D.sl_pct+'%',                    cls:''},
+    {l:'Take Profit', v:D.tp_pct+'%',                    cls:''},
+    {l:'R:R Ratio',   v:D.rr_ratio+':1',                 cls:'highlight'},
+    {l:'Mode',        v:D.mode,                           cls:''},
+    {l:'Exchange',    v:D.exchange||'—',                  cls:''},
+    {l:'Timeframe',   v:D.timeframe,                      cls:''},
+  ].map(x=>`<div class="cs-item ${x.cls}">
+    <div class="cs-lbl">${x.l}</div>
+    <div class="cs-val">${esc(x.v)}</div>
+  </div>`).join('');
+}
+
+function renderSummary(){
+  const ps=D.predictions||[];
+  const ready   = ps.filter(p=>p.meets_threshold).length;
+  const close   = ps.filter(p=>p.tier==='VERY_CLOSE').length;
+  const avgScore= ps.length?Math.round(ps.reduce((s,p)=>s+p.current_score,0)/ps.length):0;
+  const bestEV  = ps.reduce((best,p)=>p.expected_value>best?p.expected_value:best,-Infinity);
+  const totalEV = ps.reduce((s,p)=>s+(p.expected_value||0),0);
+  const buys    = ps.filter(p=>p.direction==='BUY').length;
+  const sells   = ps.filter(p=>p.direction==='SELL').length;
+  $('sum-row').innerHTML=[
+    {l:'Scanned',      v:ps.length,                               s:'Total pairs',     c:''},
+    {l:'Trade Now',    v:ready,                                   s:'Meet ≥'+D.min_conf+'%',c:'g'},
+    {l:'Very Close',   v:close,                                   s:'Within 15 pts',   c:'y'},
+    {l:'Buy signals',  v:buys,                                    s:'Bullish direction',c:'g'},
+    {l:'Sell signals', v:sells,                                   s:'Bearish direction',c:'r'},
+    {l:'Avg Score',    v:avgScore+'%',                            s:'Across all pairs', c:''},
+    {l:'Best EV',      v:(bestEV===(-Infinity)?'—':'$'+fmt(bestEV)),s:'Per trade',     c:bestEV>0?'g':'r'},
+    {l:'Portfolio EV', v:'$'+fmt(totalEV),                        s:'If all triggered',c:totalEV>0?'g':'r'},
+  ].map(x=>`<div class="sr-card ${x.c}">
+    <div class="sr-lbl">${x.l}</div>
+    <div class="sr-val">${esc(String(x.v))}</div>
+    <div class="sr-sub">${x.s}</div>
+  </div>`).join('');
+}
+
+function setTier(t,el){
+  _tier=t;
+  document.querySelectorAll('.tier-btn').forEach(b=>b.className='tier-btn');
+  if(el) el.classList.add('active-'+t.toLowerCase().replace('_now','').replace('_close','close').replace(/^active-$/,'all')||'all');
+  // Simpler: just re-apply active class by tier name
+  const cls={'ALL':'active-all','TRADE_NOW':'active-trade','VERY_CLOSE':'active-close',
+              'BUILDING':'active-build','WATCHING':'active-watch','EARLY':'active-early'}[t]||'active-all';
+  if(el){document.querySelectorAll('.tier-btn').forEach(b=>b.classList.remove('active-all','active-trade','active-close','active-build','active-watch','active-early'));el.classList.add(cls);}
+  renderCards();
+}
+
+function renderCards(){
+  if(!D) return;
+  const sort=$('sort-sel').value;
+  let ps=[...(D.predictions||[])];
+  if(_tier!=='ALL') ps=ps.filter(p=>p.tier===_tier);
+  if(sort==='score') ps.sort((a,b)=>b.current_score-a.current_score);
+  else if(sort==='ev')  ps.sort((a,b)=>b.expected_value-a.expected_value);
+  else if(sort==='gap') ps.sort((a,b)=>a.gap_to_threshold-b.gap_to_threshold);
+  else ps.sort((a,b)=>a.symbol.localeCompare(b.symbol));
+
+  const errs=D.errors||[];
+  let html='';
+  errs.forEach(e=>{html+=`<div class="err-card">❌ ${esc(e.symbol)}: ${esc(e.error)}</div>`;});
+  if(!ps.length&&!errs.length){
+    html='<div class="loading" style="padding:40px;color:var(--m)">No predictions match this filter</div>';
+  } else {
+    html+='<div class="cards-grid">'+ps.map(predCard).join('')+'</div>';
+  }
+  $('cards-area').innerHTML=html;
+}
+
+/* ── PREDICTION CARD ── */
+function predCard(p){
+  const thresh   = p.min_conf||85;
+  const score    = p.current_score||0;
+  const gap      = p.gap_to_threshold||0;
+  const fillW    = Math.min(score, 100);
+  const fillC    = score>=thresh?'#00ff88':score>=thresh*.8?'#ffd32a':score>=thresh*.6?'#00c8ff':'#ff4757';
+  const threshX  = thresh+'%';
+  const px       = p.price||0;
+  const pxFmt    = px>999?px.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
+                   :px>1?px.toFixed(4):px.toFixed(6);
+  const chgCls   = p.pct_change>0?'up':p.pct_change<0?'dn':'';
+  const ev       = p.expected_value||0;
+  const wr       = p.win_rate_estimate||0;
+
+  // Score gap badge
+  const gapBadge = gap===0
+    ?`<span class="gap-badge gap-zero">✅ Trade ready</span>`
+    :gap<=15
+    ?`<span class="gap-badge gap-small">+${gap}pts needed</span>`
+    :`<span class="gap-badge gap-large">${gap}pts away</span>`;
+
+  // Scenario items
+  const entry  = px;
+  const sl     = p.sl  || (p.direction==='BUY'?px*(1-0.005):px*(1+0.005));
+  const tp     = p.tp  || (p.direction==='BUY'?px*(1+0.02):px*(1-0.02));
+  const risk$  = p.max_loss_usd  || 0;
+  const gain$  = p.max_gain_usd  || 0;
+  const rr     = p.rr_ratio || 4;
+
+  // Level visualisation — price position between SL and TP
+  const rangeLow  = Math.min(sl, tp, px);
+  const rangeHigh = Math.max(sl, tp, px);
+  const span      = rangeHigh - rangeLow || 1;
+  const pxPct     = Math.round(((px - rangeLow)/span)*100);
+  const slPct     = Math.round(((sl - rangeLow)/span)*100);
+  const tpPct     = Math.round(((tp - rangeLow)/span)*100);
+
+  // Active / missing signals
+  const active  = (p.active_signals||[]).slice(0,4);
+  const missing = (p.inactive_signals||[]).slice(0,4);
+  const needed  = p.needed_to_trade||[];
+
+  // Roadmap steps
+  const roadmapSteps = buildRoadmap(p, needed);
+
+  return `
+<div class="pred-card tier-${p.tier}">
+  <!-- HEADER -->
+  <div class="card-hd">
+    <div>
+      <div class="ch-sym">${esc(p.symbol)}${p.in_open_trade?'  <span class="open-chip">IN TRADE</span>':''}</div>
+      <div class="ch-price mono">$${pxFmt}</div>
+      <div class="ch-chg ${chgCls}">${p.pct_change>=0?'+':''}${p.pct_change}%</div>
+    </div>
+    <div class="ch-right">
+      <span class="dir-badge dir-${p.direction.toLowerCase()}">${p.direction}</span>
+      <span class="tier-badge t-${p.tier}">${tierLabel(p.tier)}</span>
+      ${p.pattern?`<span style="font-size:10px;color:var(--m)">${esc(p.pattern)}</span>`:''}
+    </div>
+  </div>
+
+  <!-- SCORE METER -->
+  <div class="score-sec">
+    <div class="score-row">
+      <span class="score-lbl">BOT-RL confidence score</span>
+      <span>
+        <span class="score-num" style="color:${fillC}">${score}</span>
+        <span class="score-den"> / ${thresh} min</span>
+      </span>
+    </div>
+    <div class="score-track">
+      <div class="score-fill" style="width:${fillW}%;background:${fillC}"></div>
+      <div class="threshold-line" style="left:${threshX}"></div>
+    </div>
+    <div class="score-meta">
+      <span>${score>=thresh?'Qualifies for trade':'Below threshold'}</span>
+      ${gapBadge}
+    </div>
+    <!-- EV + Win Rate mini rows -->
+    <div class="ev-row" style="margin-top:10px">
+      <span class="ev-lbl">Win rate est.</span>
+      <div class="ev-track"><div class="ev-fill" style="width:${wr}%;background:var(--blue)"></div></div>
+      <span class="ev-val" style="color:var(--blue)">${wr}%</span>
+    </div>
+    <div class="ev-row">
+      <span class="ev-lbl">Expected value</span>
+      <div class="ev-track"><div class="ev-fill" style="width:${Math.min(Math.abs(ev)/Math.max(gain$,1)*100,100)}%;background:${ev>=0?'var(--a)':'var(--red)'}"></div></div>
+      <span class="ev-val" style="color:${ev>=0?'var(--a)':'var(--red)'}">${ev>=0?'+':''}$${fmt(ev)}</span>
+    </div>
+  </div>
+
+  <!-- TRADE SCENARIO -->
+  <div class="scenario-sec">
+    <div class="sec-title">Trade scenario (4:1 R:R · ${p.sl_pct}% SL locked)</div>
+    <div class="scenario-grid">
+      <div class="sc-item entry"><div class="sc-lbl">Entry</div>
+        <div class="sc-val">$${fmtPx(entry)}</div></div>
+      <div class="sc-item stop"><div class="sc-lbl">Stop Loss</div>
+        <div class="sc-val">$${fmtPx(sl)} <span style="font-size:10px;font-weight:400;color:var(--m)">-${p.sl_pct}%</span></div></div>
+      <div class="sc-item target"><div class="sc-lbl">Take Profit</div>
+        <div class="sc-val">$${fmtPx(tp)} <span style="font-size:10px;font-weight:400;color:var(--m)">+${p.tp_pct}%</span></div></div>
+      <div class="sc-item risk"><div class="sc-lbl">Max Loss</div>
+        <div class="sc-val">-$${fmt(risk$)}</div></div>
+      <div class="sc-item reward"><div class="sc-lbl">Max Gain</div>
+        <div class="sc-val">+$${fmt(gain$)}</div></div>
+      <div class="sc-item rr"><div class="sc-lbl">R:R Actual</div>
+        <div class="sc-val">${rr}:1</div></div>
+      <div class="sc-item ${ev>=0?'ev-pos':'ev-neg'}"><div class="sc-lbl">Exp. Value</div>
+        <div class="sc-val">${ev>=0?'+':''}$${fmt(ev)}</div></div>
+      <div class="sc-item wr"><div class="sc-lbl">Win Rate</div>
+        <div class="sc-val">${wr}%</div></div>
+      <div class="sc-item"><div class="sc-lbl">Pos. Size</div>
+        <div class="sc-val">${(p.position_size||0).toFixed(4)}</div></div>
+    </div>
+
+    <!-- LEVEL VISUALISATION -->
+    <div class="levels-vis">
+      <div class="level-bar-wrap">
+        <div class="level-bar-fill" style="width:100%;background:linear-gradient(90deg,var(--rd) 0%,var(--ad) 100%);opacity:.4"></div>
+        <div class="level-bar-marker" style="left:${slPct}%;background:var(--red)" title="Stop Loss"></div>
+        <div class="level-bar-marker" style="left:${pxPct}%;background:#fff;width:3px" title="Current Price"></div>
+        <div class="level-bar-marker" style="left:${tpPct}%;background:var(--a)" title="Take Profit"></div>
+      </div>
+      <div class="level-labels">
+        <span style="color:var(--red)">SL $${fmtPx(sl)}</span>
+        <span style="color:var(--m)">Entry $${fmtPx(entry)}</span>
+        <span style="color:var(--a)">TP $${fmtPx(tp)}</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ACTIVE / MISSING SIGNALS -->
+  <div class="signals-sec">
+    <div class="sec-title">Active signals</div>
+    <div class="sig-row">
+      ${active.map(s=>`<span class="sig-chip sig-active"><span class="sig-dot"></span>${esc(s)}</span>`).join('')}
+      ${active.length===0?'<span style="font-size:11px;color:var(--m2)">No signals active yet</span>':''}
+    </div>
+    ${missing.length?`<div class="sec-title" style="margin-top:10px">Missing signals</div>
+    <div class="sig-row">
+      ${missing.slice(0,4).map(s=>`<span class="sig-chip sig-missing"><span class="sig-dot"></span>${esc(s)}</span>`).join('')}
+    </div>`:''}
+  </div>
+
+  <!-- ROADMAP TO TRADE -->
+  <div class="roadmap-sec">
+    <div class="roadmap-title">${gap===0?'✅ All conditions met — bot will open on next scan':'🗺 What needs to happen to open this trade'}</div>
+    ${roadmapSteps}
+  </div>
+</div>`;
+}
+
+function buildRoadmap(p, needed){
+  const steps = [];
+  const gap = p.gap_to_threshold||0;
+  const active = p.active_signals||[];
+
+  if(gap===0){
+    return `<div class="roadmap-item">
+      <div class="roadmap-step step-done">✓</div>
+      <div><div class="roadmap-text">All required signals are aligned. Bot will open a ${p.direction} trade on the next scan cycle.</div>
+        <div class="roadmap-pts" style="color:var(--a)">Score: ${p.current_score}/${p.min_conf} ✅</div>
+      </div></div>`;
+  }
+
+  // Step 1: already active
+  if(active.length){
+    steps.push({done:true, text:`${active.length} signal${active.length>1?'s':''} already confirmed: ${active.slice(0,2).join(', ')}`,
+      pts:`+${p.current_score} pts scored`});
+  } else {
+    steps.push({done:false, text:'No signals active yet — waiting for market alignment', pts:'+0 pts'});
+  }
+
+  // Steps for each needed signal
+  needed.forEach((s,i)=>{
+    const hint = triggerHint(s.label, p);
+    steps.push({done:false, text:s.label+(hint?` — ${hint}`:''), pts:`+${s.pts} pts`});
+  });
+
+  // Final step
+  steps.push({done:false,
+    text:`Reach ${p.min_conf}% threshold → bot opens ${p.direction} @ $${fmtPx(p.entry)}`,
+    pts:`Target: ${p.min_conf} pts`});
+
+  return steps.map((s,i)=>`
+    <div class="roadmap-item">
+      <div class="roadmap-step ${s.done?'step-done':'step-todo'}">${s.done?'✓':i+1}</div>
+      <div>
+        <div class="roadmap-text" style="color:${s.done?'var(--t)':'var(--m)'}">${esc(s.text)}</div>
+        <div class="roadmap-pts" style="color:${s.done?'var(--a)':'var(--m2)'}">${esc(s.pts)}</div>
+      </div>
+    </div>`).join('');
+}
+
+function triggerHint(label, p){
+  const l = label.toLowerCase();
+  if(l.includes('oversold'))   return `RSI(${p.rsi_fast_period||6}) needs to drop below ${p.min_conf?30:30} — currently ${p.rsi_fast||'?'}`;
+  if(l.includes('overbought')) return `RSI(${p.rsi_fast_period||6}) needs to rise above 70 — currently ${p.rsi_fast||'?'}`;
+  if(l.includes('cross'))      return 'Needs RSI fast to cross slow on next candle close';
+  if(l.includes('swing low'))  return `Price needs to pull back to ${p.last_sl?'$'+fmtPx(p.last_sl):'nearby swing low'}`;
+  if(l.includes('swing high')) return `Price needs to push up to ${p.last_sh?'$'+fmtPx(p.last_sh):'nearby swing high'}`;
+  if(l.includes('ema'))        return 'EMA21 needs to cross above/below EMA50';
+  if(l.includes('volume'))     return 'Volume needs to surge > 1.5× its 20-bar average';
+  if(l.includes('momentum'))   return 'Price needs 5-bar momentum > 0.5%';
+  return '';
+}
+
+function tierLabel(t){
+  return {TRADE_NOW:'TRADE NOW',VERY_CLOSE:'VERY CLOSE',
+          BUILDING:'BUILDING',WATCHING:'WATCHING',EARLY:'EARLY'}[t]||t;
+}
+
+/* ── Auto refresh ── */
+function setAutoRefresh(){
+  _autoIv=parseInt($('auto-sel').value)||0;
+  clearInterval(_autoTimer);clearInterval(_cdTimer);
+  if(_autoIv>0){
+    $('refresh-bar').style.display='flex';
+    _autoTimer=setInterval(doRefresh,_autoIv*1000);
+    resetCd();
+  } else {
+    $('refresh-bar').style.display='none';
+  }
+}
+function resetCd(){
+  clearInterval(_cdTimer);
+  if(!_autoIv) return;
+  _cdLeft=_autoIv; tick();
+  _cdTimer=setInterval(tick,1000);
+}
+function tick(){
+  _cdLeft=Math.max(0,_cdLeft-1);
+  $('rf').style.width=Math.round(_cdLeft/_autoIv*100)+'%';
+  $('cd-txt').textContent=`Next refresh in ${_cdLeft}s`;
+}
+
+/* ── Helpers ── */
+function fmtPx(n){
+  const v=Number(n||0);
+  return v>999?v.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
+        :v>1?v.toFixed(4):v.toFixed(6);
+}
+const esc = escHtml; // alias to shared helper
+
+/* ── Boot ── */
+doRefresh();
+setAutoRefresh();
+</script>
+{% endblock %}

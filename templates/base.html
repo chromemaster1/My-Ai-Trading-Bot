@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}BOT-RL{% endblock %}</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+{% block extra_head %}{% endblock %}
+</head>
+<body class="{% block body_class %}{% endblock %}">
+
+<nav>
+  <span class="nav-logo">⚡ BOT-RL</span>
+  <a href="/" class="nav-link {{ 'active' if request.path == '/' else '' }}">🏠 Home</a>
+  <a href="/dashboard" class="nav-link {{ 'active' if request.path == '/dashboard' else '' }}">📊 Dashboard</a>
+  <a href="/analysis" class="nav-link {{ 'active' if request.path == '/analysis' else '' }}">🔍 Analysis</a>
+  <a href="/predictions" class="nav-link {{ 'active' if request.path == '/predictions' else '' }}">🎯 Predictions</a>
+  <a href="/wallet" class="nav-link {{ 'active' if request.path == '/wallet' else '' }}">💰 Wallet</a>
+  <a href="/settings" class="nav-link {{ 'active' if request.path == '/settings' else '' }}">⚙️ Settings</a>
+  <div class="nav-sep"></div>
+  <div class="pill"><span class="dot off" id="nav-dot"></span><span id="nav-status">STOPPED</span></div>
+  <span class="mono nav-user" id="nav-time">--:--:--</span>
+  <a href="/logout" class="nav-logout">Logout</a>
+</nav>
+
+{% block content %}{% endblock %}
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+{% block scripts %}{% endblock %}
+</body>
+</html>
