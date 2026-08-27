@@ -66,6 +66,7 @@
             <select id="c-market_mode" onchange="modeHint()">
               <option value="CRYPTO">CRYPTO</option>
               <option value="STOCK">STOCK</option>
+              <option value="FOREX">FOREX</option>
             </select></div>
           <div class="fg"><label>Timeframe</label>
             <select id="c-timeframe">
@@ -96,6 +97,8 @@
             <input type="number" id="c-rsi_fast" min="3" max="20"></div>
           <div class="fg"><label>RSI Slow Period (default 12)</label>
             <input type="number" id="c-rsi_slow" min="5" max="50"></div>
+          <div class="fg"><label>RSI Confirm Period (default 24)</label>
+            <input type="number" id="c-rsi_confirm" min="10" max="200"></div>
           <div class="fg"><label>Overbought Level</label>
             <input type="number" id="c-rsi_ob" min="60" max="90"></div>
           <div class="fg"><label>Oversold Level</label>
@@ -142,6 +145,18 @@
             <input type="number" id="r-interval" min="30" max="3600"></div>
           <div class="fg"><label>Max Execution Slippage % (0.003 = 0.3%)</label>
             <input type="number" id="r-maxslip" step="0.001" min="0.0005" max="0.05"></div>
+          <div class="fg"><label>Signal Exit Confirmations (default 2)</label>
+            <input type="number" id="r-exitconfirm" min="1" max="5"></div>
+          <div class="fg full">
+            <div class="toggle-row">
+              <div>
+                <div style="font-weight:600">Hold Requires Entry Confidence</div>
+                <div style="font-size:11px;color:var(--m);margin-top:2px">A trade must maintain the confidence it opened at, not just the minimum floor</div>
+              </div>
+              <label class="tgl"><input type="checkbox" id="r-holdentryconf">
+                <span class="tgl-track"></span></label>
+            </div>
+          </div>
           <div class="fg full">
             <div class="toggle-row">
               <div>
@@ -153,7 +168,109 @@
             </div>
           </div>
         </div>
+      </div>
+
+      <div class="fsec">
+        <div class="fsec-title">🏃 RIDE WINNERS — Let Working Trades Reach Target</div>
+        <div class="fgrid">
+          <div class="fg full">
+            <div class="toggle-row">
+              <div>
+                <div style="font-weight:600">Breakeven Lock</div>
+                <div style="font-size:11px;color:var(--m);margin-top:2px">Move stop-loss to entry once a trade earns its own risk back in profit</div>
+              </div>
+              <label class="tgl"><input type="checkbox" id="r-profitlock">
+                <span class="tgl-track"></span></label>
+            </div>
+          </div>
+          <div class="fg"><label>Breakeven Lock Trigger (R-multiple, default 1.0)</label>
+            <input type="number" id="r-profitlockr" step="0.1" min="0.2" max="5"></div>
+          <div class="fg full">
+            <div class="toggle-row">
+              <div>
+                <div style="font-weight:600">Relax Confidence-Exit After Breakeven Lock</div>
+                <div style="font-size:11px;color:var(--m);margin-top:2px">Once locked, only a genuine signal reversal can exit — not routine confidence wobble</div>
+              </div>
+              <label class="tgl"><input type="checkbox" id="r-relaxexit">
+                <span class="tgl-track"></span></label>
+            </div>
+          </div>
+          <div class="fg full">
+            <div class="toggle-row">
+              <div>
+                <div style="font-weight:600">Trailing Stop</div>
+                <div style="font-size:11px;color:var(--m);margin-top:2px">Keep trailing the stop behind price once a trade is running, beyond breakeven</div>
+              </div>
+              <label class="tgl"><input type="checkbox" id="r-trailing">
+                <span class="tgl-track"></span></label>
+            </div>
+          </div>
+          <div class="fg"><label>Trailing Activation (R-multiple, default 1.5)</label>
+            <input type="number" id="r-trailactivate" step="0.1" min="0.2" max="10"></div>
+          <div class="fg"><label>Trailing Distance (R-multiple behind best price, default 0.75)</label>
+            <input type="number" id="r-traildist" step="0.05" min="0.1" max="3"></div>
+        </div>
         <div style="margin-top:14px;font-size:11px;color:var(--m);line-height:1.7">
+          These four settings work together to let a trade that's genuinely working keep running toward its
+          take-profit target, instead of getting cut short by the same strict confidence checks that (correctly)
+          protect a fresh, unproven trade. <strong style="color:var(--t)">1R</strong> = the trade's own initial
+          risk distance (entry to original stop) — a trigger of 1.0R means "once up by as much as it originally
+          risked." Once <strong style="color:var(--t)">Breakeven Lock</strong> fires, the trade is structurally
+          incapable of becoming a loss, so <strong style="color:var(--t)">Relax Confidence-Exit</strong> stops
+          treating routine indicator wobble as a reason to close it — only take-profit, the (now trailing) stop,
+          or a genuine opposite-direction signal can end it from there.
+        </div>
+      </div>
+
+      <div class="fsec">
+        <div class="fsec-title">🎯 SIGNAL QUALITY — Avoid Chop & Counter-Trend Entries</div>
+        <div class="fgrid">
+          <div class="fg full">
+            <div class="toggle-row">
+              <div>
+                <div style="font-weight:600">Chop Filter</div>
+                <div style="font-size:11px;color:var(--m);margin-top:2px">Block new entries when the market is oscillating without net progress</div>
+              </div>
+              <label class="tgl"><input type="checkbox" id="r-chopfilter">
+                <span class="tgl-track"></span></label>
+            </div>
+          </div>
+          <div class="fg"><label>Efficiency Lookback (bars, default 10)</label>
+            <input type="number" id="r-choplookback" min="3" max="50"></div>
+          <div class="fg"><label>Min Efficiency Ratio (default 0.30)</label>
+            <input type="number" id="r-chopratio" step="0.01" min="0.05" max="0.95"></div>
+          <div class="fg full">
+            <div class="toggle-row">
+              <div>
+                <div style="font-weight:600">Counter-Trend Discount</div>
+                <div style="font-size:11px;color:var(--m);margin-top:2px">Scale down a signal that's fighting the prevailing EMA trend, proportional to how established it is</div>
+              </div>
+              <label class="tgl"><input type="checkbox" id="r-ctdiscount">
+                <span class="tgl-track"></span></label>
+            </div>
+          </div>
+          <div class="fg"><label>Strong Trend EMA Separation % (default 0.008 = 0.8%)</label>
+            <input type="number" id="r-strongtrendsep" step="0.001" min="0.001" max="0.05"></div>
+          <div class="fg"><label>Max Counter-Trend Discount % (default 0.35 = 35%)</label>
+            <input type="number" id="r-ctdiscountmax" step="0.05" min="0" max="0.9"></div>
+        </div>
+        <div style="margin-top:14px;font-size:11px;color:var(--m);line-height:1.7">
+          <strong style="color:var(--t)">Chop Filter</strong> uses the Efficiency Ratio (net price movement ÷ total
+          path length travelled, over the lookback window) — close to 1 means price moved efficiently in one
+          direction (a real trend); close to 0 means lots of back-and-forth for little net progress. Below the
+          threshold, new entries are capped below the confidence floor regardless of how strong other signals
+          look — it never touches trades already open, which are protected separately by Ride Winners above.
+          <br><br>
+          <strong style="color:var(--t)">Counter-Trend Discount</strong> reduces a signal's score when it's
+          betting against an established EMA trend (e.g. a SELL signal while EMA21 is well above EMA50), scaled
+          by how wide that separation actually is — a barely-separated, uncertain trend is discounted very
+          little; a wide, established one gets close to the full discount. This only affects NEW entries, same
+          as the chop filter.
+        </div>
+      </div>
+
+      <div class="fsec">
+        <div style="font-size:11px;color:var(--m);line-height:1.7">
           Take profit is always recalculated as at least 4× the actual stop-loss distance,
           so the floor above is a minimum, not a fixed target — wider stops automatically get wider targets.
           <br><br>
@@ -161,6 +278,18 @@
           if the live market has moved more than this % since a signal was detected (RSI computation + AI
           confirmation both take real time), the bot skips that entry rather than execute at a price the
           signal was never actually based on. It re-checks next scan.
+          <br><br>
+          <strong style="color:var(--t)">Signal Exit Confirmations</strong> requires the setup to fail this many
+          consecutive scans in a row (not just one) before closing a trade early on lost confidence/direction —
+          a single noisy scan won't cut a trade, but 2 in a row (default) means it's a real change.
+          Stop-loss and take-profit are never affected by this — those remain instant, checked every cycle
+          regardless of confirmations.
+          <br><br>
+          <strong style="color:var(--t)">Hold Requires Entry Confidence</strong> raises the exit-confirmation bar
+          per trade: if a trade opened at 90% confidence, it now needs to stay at or above 90% (not just the
+          minimum floor above) to count as still valid. Dropping below its own entry confidence — even while
+          still above the floor — starts the exit-confirmation clock as an early warning that conviction is
+          weakening, before a full signal flip. Turn this off to fall back to the flat minimum-floor check only.
         </div>
       </div>
       <div class="save-msg" id="risk-saved">✅ Risk settings saved</div>
@@ -182,6 +311,48 @@
           Just run <code style="color:var(--a)">python trading_bot_main.py</code> — the bot scans
           in a background thread while Flask serves this dashboard in the main thread.
           Open <code style="color:var(--blue)">http://localhost:5000</code> in any browser.
+        </div>
+      </div>
+      <div class="fsec">
+        <div class="fsec-title">🎯 MANUAL TRADE — Open or Duplicate from a Signal</div>
+        <div class="fgrid">
+          <div class="fg full">
+            <label>Signal / Trade Source</label>
+            <select id="mt-source" onchange="mtSourceChanged()">
+              <option value="">— Select a signal, open trade, or closed trade —</option>
+            </select>
+          </div>
+        </div>
+        <div id="mt-detail" style="display:none;margin-top:12px;background:var(--s2);
+          border:1px solid var(--b2);border-radius:8px;padding:12px 14px;font-size:12px;
+          color:var(--m);line-height:1.8"></div>
+        <div class="fgrid" style="margin-top:14px">
+          <div class="fg"><label>Side</label>
+            <select id="mt-side">
+              <option value="BUY">BUY</option>
+              <option value="SELL">SELL</option>
+            </select></div>
+          <div class="fg"><label>Position Size (USD)</label>
+            <input type="number" id="mt-size" placeholder="e.g. 500" min="1" step="1"></div>
+          <div class="fg"><label>Stop Loss % (0.01 = 1%)</label>
+            <input type="number" id="mt-sl" step="0.001" min="0.0005" max="0.25" placeholder="e.g. 0.01"></div>
+          <div class="fg"><label>Take Profit % (0.03 = 3%)</label>
+            <input type="number" id="mt-tp" step="0.001" min="0.001" max="1" placeholder="e.g. 0.03"></div>
+        </div>
+        <div style="margin-top:12px;display:flex;align-items:center;gap:10px">
+          <button class="btn btn-green" onclick="openManualTrade()" id="mt-btn">⚡ Open Trade</button>
+          <span id="mt-preview" style="font-size:11px;color:var(--m)"></span>
+        </div>
+        <div class="alert alert-ok" id="mt-ok"></div>
+        <div class="alert alert-err" id="mt-err"></div>
+        <div style="margin-top:12px;font-size:11px;color:var(--m);line-height:1.7">
+          Selecting an already-<strong style="color:var(--t)">open</strong> trade opens a second,
+          independent position on the same symbol (duplicate/add-on) — it does not modify the
+          existing one. Selecting a <strong style="color:var(--t)">closed</strong> trade re-opens
+          that setup fresh at the current live price, not its old entry price. The bot's own
+          <code style="color:var(--a)">max_open_trades</code> limit still applies. Execution always
+          uses the live market price at the moment you click Open, never the price shown when the
+          signal was captured.
         </div>
       </div>
       <div class="fsec">
@@ -371,6 +542,7 @@ function populateForms(){
   safeSet('c-exchange', c.crypto_exchange||'binance');
   safeSet('c-rsi_fast', c.rsi_fast_period||6);
   safeSet('c-rsi_slow', c.rsi_slow_period||12);
+  safeSet('c-rsi_confirm', c.rsi_confirm_period||24);
   safeSet('c-rsi_ob', c.rsi_overbought||70);
   safeSet('c-rsi_os', c.rsi_oversold||30);
   safeSetChecked('c-ai_confirm', c.ai_confirmation_required);
@@ -382,7 +554,21 @@ function populateForms(){
   safeSet('r-balance', c.account_balance||10000);
   safeSet('r-interval', c.scan_interval_seconds||60);
   safeSet('r-maxslip', c.max_execution_slippage_pct||0.003);
+  safeSet('r-exitconfirm', c.signal_exit_confirmations||2);
+  safeSetChecked('r-holdentryconf', c.hold_requires_entry_confidence !== false);
   safeSetChecked('r-paper', c.paper_trading);
+  safeSetChecked('r-profitlock', c.profit_lock_enabled !== false);
+  safeSet('r-profitlockr', c.profit_lock_r_multiple||1.0);
+  safeSetChecked('r-relaxexit', c.relax_exit_after_profit_lock !== false);
+  safeSetChecked('r-trailing', c.trailing_stop_enabled !== false);
+  safeSet('r-trailactivate', c.trailing_stop_activation_r||1.5);
+  safeSet('r-traildist', c.trailing_stop_distance_r||0.75);
+  safeSetChecked('r-chopfilter', c.chop_filter_enabled !== false);
+  safeSet('r-choplookback', c.chop_efficiency_lookback||10);
+  safeSet('r-chopratio', c.chop_min_efficiency_ratio||0.30);
+  safeSetChecked('r-ctdiscount', c.counter_trend_discount_enabled !== false);
+  safeSet('r-strongtrendsep', c.strong_trend_ema_sep_pct||0.008);
+  safeSet('r-ctdiscountmax', c.max_counter_trend_discount_pct||0.35);
   modeHint();
 }
 
@@ -401,6 +587,7 @@ async function saveConfig(){
     market_mode:mode,
     rsi_fast_period:+$('c-rsi_fast').value,
     rsi_slow_period:+$('c-rsi_slow').value,
+    rsi_confirm_period:+$('c-rsi_confirm').value,
     rsi_overbought:+$('c-rsi_ob').value,
     rsi_oversold:+$('c-rsi_os').value,
     ai_confirmation_required:$('c-ai_confirm').checked,
@@ -412,7 +599,7 @@ async function saveConfig(){
   const r=await post('/api/config',payload);
   if(r.ok){
     clearDirty('c-market_mode','c-symbols','c-timeframe','c-exchange',
-      'c-rsi_fast','c-rsi_slow','c-rsi_ob','c-rsi_os','c-ai_confirm','c-api_key');
+      'c-rsi_fast','c-rsi_slow','c-rsi_confirm','c-rsi_ob','c-rsi_os','c-ai_confirm','c-api_key');
     flash('cfg-saved');
     await fetchState();
   }else alert(r.error||'Save failed');
@@ -428,17 +615,109 @@ async function saveRisk(){
     account_balance:+$('r-balance').value,
     scan_interval_seconds:+$('r-interval').value,
     max_execution_slippage_pct:+$('r-maxslip').value,
+    signal_exit_confirmations:+$('r-exitconfirm').value,
+    hold_requires_entry_confidence:$('r-holdentryconf').checked,
+    profit_lock_enabled:$('r-profitlock').checked,
+    profit_lock_r_multiple:+$('r-profitlockr').value,
+    relax_exit_after_profit_lock:$('r-relaxexit').checked,
+    trailing_stop_enabled:$('r-trailing').checked,
+    trailing_stop_activation_r:+$('r-trailactivate').value,
+    trailing_stop_distance_r:+$('r-traildist').value,
+    chop_filter_enabled:$('r-chopfilter').checked,
+    chop_efficiency_lookback:+$('r-choplookback').value,
+    chop_min_efficiency_ratio:+$('r-chopratio').value,
+    counter_trend_discount_enabled:$('r-ctdiscount').checked,
+    strong_trend_ema_sep_pct:+$('r-strongtrendsep').value,
+    max_counter_trend_discount_pct:+$('r-ctdiscountmax').value,
     paper_trading:$('r-paper').checked,
   };
   const r=await post('/api/config',payload);
   if(r.ok){
-    clearDirty('r-sl','r-tp','r-minconf','r-maxrisk','r-maxopen','r-balance','r-interval','r-maxslip','r-paper');
+    clearDirty('r-sl','r-tp','r-minconf','r-maxrisk','r-maxopen','r-balance','r-interval','r-maxslip',
+      'r-exitconfirm','r-holdentryconf','r-profitlock','r-profitlockr','r-relaxexit',
+      'r-trailing','r-trailactivate','r-traildist',
+      'r-chopfilter','r-choplookback','r-chopratio','r-ctdiscount','r-strongtrendsep','r-ctdiscountmax','r-paper');
     flash('risk-saved');
     await fetchState();
   }else alert(r.error||'Save failed');
 }
 
+let MT_OPTIONS=[];
+
+async function fetchTradeableSignals(){
+  try{
+    const r=await fetch('/api/signals/tradeable');
+    const d=await r.json();
+    if(!d.ok) return;
+    MT_OPTIONS=d.options||[];
+    const sel=$('mt-source');
+    const prevValue=sel.value;
+    // Don't rebuild while the user has the dropdown open/mid-selection —
+    // same anti-snapback reasoning as the rest of this page's forms.
+    if(document.activeElement===sel) return;
+    sel.innerHTML='<option value="">— Select a signal, open trade, or closed trade —</option>'+
+      MT_OPTIONS.map((o,i)=>`<option value="${i}">${escHtml(o.label)}</option>`).join('');
+    if(prevValue && MT_OPTIONS[+prevValue]) sel.value=prevValue;
+  }catch(e){console.error(e)}
+}
+
+function mtSourceChanged(){
+  const idx=$('mt-source').value;
+  const detail=$('mt-detail');
+  if(idx===''){ detail.style.display='none'; return; }
+  const o=MT_OPTIONS[+idx];
+  if(!o){ detail.style.display='none'; return; }
+  $('mt-side').value=o.side;
+  const rows=[
+    `<strong style="color:var(--t)">${o.symbol}</strong> · ${o.type.replace('_',' ')}`,
+    o.price ? `Reference price: $${Number(o.price).toFixed(4)}` : null,
+    o.confidence!==undefined ? `Confidence: ${o.confidence}%${o.meets_threshold===false?' (below current threshold)':''}` : null,
+    o.type==='open_trade' ? `Currently open · Unrealised: ${o.unrealised_pnl>=0?'+':''}$${o.unrealised_pnl}` : null,
+    o.type==='closed_trade' ? `Closed ${o.status} · PnL: ${o.pnl>=0?'+':''}$${o.pnl}` : null,
+    o.reasons && o.reasons.length ? `Signals: ${o.reasons.join(', ')}` : null,
+  ].filter(Boolean).map(l=>`<div>${l}</div>`).join('');
+  detail.innerHTML=rows;
+  detail.style.display='block';
+}
+
+async function openManualTrade(){
+  hideAlerts('mt');
+  const idx=$('mt-source').value;
+  const o = idx!=='' ? MT_OPTIONS[+idx] : null;
+  const symbol = o ? o.symbol : null;
+  if(!symbol){ $('mt-err').textContent='❌ Select a signal or trade first'; $('mt-err').classList.add('show'); return; }
+  const side=$('mt-side').value;
+  const sizeUsd=+$('mt-size').value;
+  const slPct=+$('mt-sl').value;
+  const tpPct=+$('mt-tp').value;
+  const btn=$('mt-btn');
+  btn.disabled=true; btn.textContent='Opening…';
+  const source = o.type==='live_signal' ? `live_signal:${o.symbol}@${o.confidence}%`
+               : o.type==='open_trade'  ? `duplicate_of:${o.trade_id}`
+               :                          `reopen_of:${o.trade_id}`;
+  try{
+    const r=await post('/api/trade/manual', {
+      symbol, side, size_usd: sizeUsd, sl_pct: slPct, tp_pct: tpPct, source
+    });
+    if(r.ok){
+      showOk('mt'); $('mt-ok').textContent=`✅ Opened ${side} ${symbol} @ $${Number(r.trade.entry).toFixed(4)}`;
+      $('mt-size').value=''; $('mt-sl').value=''; $('mt-tp').value='';
+      await fetchState();
+      await fetchTradeableSignals();
+    }else{
+      $('mt-err').textContent='❌ '+(r.error||'Failed to open trade');
+      $('mt-err').classList.add('show');
+    }
+  }catch(e){
+    $('mt-err').textContent='❌ Network error: '+e;
+    $('mt-err').classList.add('show');
+  }
+  btn.disabled=false; btn.textContent='⚡ Open Trade';
+}
+
 fetchState();
 setInterval(fetchState,8000);
+fetchTradeableSignals();
+setInterval(fetchTradeableSignals,15000);
 </script>
 {% endblock %}

@@ -108,6 +108,8 @@
 
         <!-- ── CONNECT FORM (shown when not connected) ── -->
         <div id="connect-form">
+          <div id="lt-persistent-status" style="display:none;border-radius:9px;padding:10px 14px;
+            font-size:12px;margin-bottom:14px;line-height:1.6"></div>
           <div class="fgrid">
             <div class="fg full">
               <label>Live Trading Mode</label>
@@ -537,6 +539,24 @@ function renderExchangeHero(d){
   }else{
     hero.style.display='none';
     form.style.display='block';
+    // Persistent (not a 4s toast) explanation of WHY it's disconnected —
+    // this is what was missing: a failed validation flashed an error for
+    // a few seconds and then the form just sat there looking untouched,
+    // which is exactly what made "saving" look broken when credentials
+    // were actually being saved correctly, just failing Bybit's own
+    // validation. Now it stays visible until you fix it or disconnect.
+    const banner = $('lt-persistent-status');
+    if(banner){
+      if(d && d.last_error){
+        banner.style.display='block';
+        banner.style.background='var(--rd)';
+        banner.style.color='var(--red)';
+        banner.style.border='1px solid rgba(255,71,87,.3)';
+        banner.innerHTML='⚠️ <strong>Last connection attempt failed:</strong> '+escHtml(d.last_error);
+      }else{
+        banner.style.display='none';
+      }
+    }
   }
 }
 

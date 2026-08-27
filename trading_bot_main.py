@@ -8,7 +8,7 @@
 =============================================================
 """
 
-import os, sys, time, json, logging, threading, secrets, sqlite3, base64
+import os, sys, re, time, json, logging, threading, secrets, sqlite3, base64
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -59,6 +59,7 @@ CONFIG = {
     "forex_exchange"       : "yahoo",
     "rsi_fast_period"        : 6,
     "rsi_slow_period"        : 12,
+    "rsi_confirm_period"     : 24,   # RSI-24 — slower trend-confirmation filter, see TechnicalAnalysis.signal()
     "rsi_overbought"         : 70,
     "rsi_oversold"           : 30,
     "rsi_signal_threshold"   : 5,
@@ -75,6 +76,35 @@ CONFIG = {
     "ai_confirmation_required": True,
     "scan_interval_seconds"  : 60,
     "max_execution_slippage_pct": 0.003,  # 0.3% — refuse to execute if price moved more than this since signal detection
+    "signal_exit_confirmations": 2,  # consecutive scans required before closing a trade on confidence/direction loss (SL/TP unaffected — always instant)
+    "hold_requires_entry_confidence": True,  # a trade must maintain its OWN opening confidence to stay valid, not just the generic minimum — early warning for weakening conviction
+    # Ride-winners mechanism: lets a trade that's genuinely working keep
+    # running toward its take-profit target instead of getting cut short
+    # by the same strict confidence checks that (correctly) protect a
+    # fresh, unproven trade. See TradeManager.check_exits() and the
+    # confidence re-check in scan_once().
+    "profit_lock_enabled"       : True,   # move SL to breakeven once a trade earns profit_lock_r_multiple of its own risk
+    "profit_lock_r_multiple"    : 1.0,    # e.g. 1.0 = once up by as much as it originally risked (1R)
+    "relax_exit_after_profit_lock": True, # once breakeven-locked, only a genuine signal reversal can trigger an exit — not routine confidence wobble
+    "trailing_stop_enabled"     : True,   # keep trailing the stop behind price once profit-locked and still running
+    "trailing_stop_activation_r": 1.5,    # start trailing once profit reaches this many R
+    "trailing_stop_distance_r"  : 0.75,   # trail this many R behind the best price seen
+    # Chop filter: refuses NEW entries when the market hasn't been moving
+    # efficiently (lots of back-and-forth, little net progress) — see the
+    # Efficiency Ratio calculation in TechnicalAnalysis.signal(). Targets
+    # the specific pattern where trades held <5min were, as a group, a net
+    # loser while trades held longer were strongly profitable.
+    "chop_filter_enabled"        : True,
+    "chop_efficiency_lookback"   : 10,    # bars used to compute the Efficiency Ratio
+    "chop_min_efficiency_ratio"  : 0.30,  # below this, new entries are capped below threshold (0=pure noise, 1=perfectly efficient trend)
+    # Counter-trend discount: scales down a signal that's fighting the
+    # prevailing EMA trend, proportional to how established that trend is.
+    # Targets the finding that SELL signals underperformed specifically on
+    # symbols in a sustained uptrend (e.g. ETH), while the same logic
+    # worked fine elsewhere.
+    "counter_trend_discount_enabled": True,
+    "strong_trend_ema_sep_pct"   : 0.008,  # EMA21/EMA50 separation (as % of price) considered a "fully established" trend
+    "max_counter_trend_discount_pct": 0.35, # maximum score reduction applied to a counter-trend signal at full trend strength
     "paper_trading"          : True,
     "live_trading_enabled"   : False,
     "live_accounts"          : {
@@ -83,7 +113,7 @@ CONFIG = {
                    "connected":False,"balance":0.0,"last_sync":None,"last_error":""},
         "STOCK":  {"exchange":"yahoo","api_key":"","api_secret":"","passphrase":"",
                    "connected":False,"balance":0.0,"last_sync":None,"last_error":""},
-        "FOREX":   {"exchange":"yahoo","api_key":"","api_secret":"","passphrase":"",
+        "FOREX":   {"exchange":"bybit","api_key":"","api_secret":"","passphrase":"",
                    "connected":False,"balance":0.0,"last_sync":None,"last_error":""},
     },
     "log_level"              : "INFO",
@@ -338,15 +368,35 @@ def _load_persistent_state() -> dict:
                 "last_error": str(merged.get("live_last_error", "")),
             }
         }
+    # Decrypt credentials read from this file. _unprotect_secret() passes
+    # plaintext values through unchanged (no "enc:" prefix), so files saved
+    # before this fix still load correctly — they just get encrypted going
+    # forward the next time _save_persistent_state() runs.
+    for market, acc in la.items():
+        acc["api_key"] = _unprotect_secret(acc.get("api_key", ""))
+        acc["api_secret"] = _unprotect_secret(acc.get("api_secret", ""))
+        acc["passphrase"] = _unprotect_secret(acc.get("passphrase", ""))
     CONFIG["live_accounts"].update(la)
     return merged
 
 
 def _save_persistent_state() -> None:
+    # Encrypt credentials before they hit disk here too — this JSON file
+    # was writing api_key/api_secret/passphrase in PLAINTEXT while the
+    # SQLite store (save_exchange_account) correctly encrypted them. Two
+    # persistence paths with different protection levels for the same
+    # secrets is a real gap; both must be encrypted-at-rest consistently.
+    accounts = {}
+    for market, acc in (CONFIG.get("live_accounts", {}) or {}).items():
+        accounts[market] = {**acc,
+            "api_key": _protect_secret(acc.get("api_key", "")),
+            "api_secret": _protect_secret(acc.get("api_secret", "")),
+            "passphrase": _protect_secret(acc.get("passphrase", "")),
+        }
     payload = {
         "paper_trading": bool(CONFIG.get("paper_trading", True)),
         "live_trading_enabled": bool(CONFIG.get("live_trading_enabled", False)),
-        "live_accounts": CONFIG.get("live_accounts", {}),
+        "live_accounts": accounts,
     }
     Path(STATE_FILE).parent.mkdir(parents=True, exist_ok=True)
     with open(STATE_FILE, "w", encoding="utf-8") as handle:
@@ -776,6 +826,49 @@ def validate_live_connection(exchange_id: str, api_key: str,
         return False, {"ok": False, "error": msg + hint}
 
 
+# Most exchanges keep trading balance and withdrawable balance in separate
+# sub-accounts internally (e.g. Bybit's Unified Trading Account vs its
+# Funding wallet). An on-chain withdrawal can usually only be initiated
+# from the funding/spot side, so funds sitting in the trading account need
+# an internal transfer first. ccxt exposes this uniformly via
+# exchange.transfer(currency, amount, fromAccount, toAccount) — the actual
+# account-type strings differ per exchange, mapped here for the exchanges
+# this app supports.
+_TRANSFER_ACCOUNT_MAP = {
+    "bybit":    {"trading": "UNIFIED",  "funding": "FUND"},
+    "binance":  {"trading": "SPOT",     "funding": "FUNDING"},
+    "coinbase": {"trading": "trading",  "funding": "funding"},
+    "kucoin":   {"trading": "trade",    "funding": "main"},
+    "kraken":   {"trading": "spot",     "funding": "spot"},   # Kraken doesn't separate these the same way
+    "okx":      {"trading": "trading",  "funding": "funding"},
+}
+
+
+def internal_transfer_funds(market: str, amount: float,
+                            from_account: str = "trading",
+                            to_account: str = "funding") -> dict:
+    """Move funds between an exchange's internal sub-accounts (e.g. trading
+    -> funding) so they become withdrawable. Returns {"ok": bool, ...}."""
+    exchange, client_error = _get_live_exchange_client(market=market)
+    if exchange is None:
+        return {"ok": False, "error": client_error or "Live exchange client unavailable"}
+    exchange_id = getattr(exchange, "id", "") or ""
+    acct_map = _TRANSFER_ACCOUNT_MAP.get(exchange_id, {"trading": from_account, "funding": to_account})
+    frm = acct_map.get(from_account, from_account)
+    to  = acct_map.get(to_account, to_account)
+    try:
+        result = exchange.transfer("USDT", amount, frm, to)
+        return {"ok": True, "result": result}
+    except Exception as exc:
+        msg = str(exc)
+        hint = ""
+        if "insufficient" in msg.lower():
+            hint = " — check your trading account has enough free (not locked in open positions) balance"
+        elif "not supported" in msg.lower() or "not implemented" in msg.lower():
+            hint = f" — {exchange_id} may not support automated internal transfers via this API; check the exchange's app/website"
+        return {"ok": False, "error": msg + hint}
+
+
 def _extract_free_usdt(balance: dict) -> float:
     """Robustly extract free USDT from ccxt fetch_balance() across all exchanges.
     Bybit  → balance['free']['USDT']  or  balance['total']['USDT']
@@ -798,24 +891,75 @@ def _extract_free_usdt(balance: dict) -> float:
     return 0.0
 
 
+def _translate_forex_symbol_for_exchange(forex_symbol: str, exchange) -> Optional[str]:
+    """Translate a yfinance-style forex symbol (e.g. 'EURUSD=X') into
+    whatever symbol format the connected crypto exchange actually lists,
+    if it lists it at all.
+
+    This exists because forex signal generation runs on free yfinance
+    data (real EUR/USD spot rates), but LIVE EXECUTION has to happen on
+    whatever the connected exchange actually offers — and crypto
+    exchanges do not uniformly offer traditional currency pairs. Some
+    (e.g. Bybit's "TradFi" product) offer USDT-margined forex CFDs on
+    major pairs; most don't expose that through the same API surface
+    ccxt uses for spot/derivatives trading. Rather than assume either
+    way, this checks the exchange's REAL, live market list and only
+    returns a symbol that's actually tradeable there — so a live order
+    is never attempted against a guessed symbol that doesn't exist.
+    """
+    raw = forex_symbol.upper().replace("=X", "").replace("/", "").strip()
+    if len(raw) != 6:
+        return None
+    base, quote = raw[:3], raw[3:]
+
+    try:
+        exchange.load_markets()
+    except Exception as exc:
+        logger.error(f"Could not load markets for {getattr(exchange,'id','exchange')}: {exc}")
+        return None
+
+    # Try the most likely real-world formats, in priority order.
+    candidates = [
+        f"{base}/USDT",   # USDT-margined FX CFD (matches how Bybit TradFi describes its forex offering)
+        f"{base}/{quote}",  # a genuine currency pair, if the exchange lists one
+        f"{base}{quote}",   # some exchanges use no-slash symbols internally
+    ]
+    for cand in candidates:
+        if cand in exchange.symbols:
+            return cand
+    return None
+
+
 def execute_live_order(symbol: str, side: str, size: float,
                        market: Optional[str] = None) -> dict:
     """Place a market order. `size` = BASE CURRENCY quantity (e.g. 0.001 BTC)."""
     exchange, error = _get_live_exchange_client(market=market)
     if error or exchange is None:
         return {"ok": False, "error": error or "Live exchange client unavailable"}
+    m = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
     try:
-        # Normalise symbol — ccxt needs BTC/USDT not BTCUSDT
-        sym = symbol.upper().replace("_", "/")
-        if "/" not in sym and "USDT" in sym:
-            sym = sym.replace("USDT", "/USDT")
+        if m == "FOREX":
+            sym = _translate_forex_symbol_for_exchange(symbol, exchange)
+            if sym is None:
+                exchange_id = getattr(exchange, "id", "this exchange")
+                err = (f"{symbol} is not available for live trading on {exchange_id} — "
+                       f"it doesn't list a matching instrument. Signal generation for FOREX "
+                       f"runs on free market data, but live EXECUTION needs the connected "
+                       f"exchange to actually offer that pair; not all exchanges do. This "
+                       f"trade was skipped rather than sent as an invalid order.")
+                _elog(f"⚠️ {err}", "WARN")
+                return {"ok": False, "error": err}
+        else:
+            # Normalise symbol — ccxt needs BTC/USDT not BTCUSDT
+            sym = symbol.upper().replace("_", "/")
+            if "/" not in sym and "USDT" in sym:
+                sym = sym.replace("USDT", "/USDT")
         qty = float(size)
         if qty <= 0:
             return {"ok": False, "error": f"Invalid order size: {qty}"}
         order     = exchange.create_market_order(sym, side.lower(), qty)
         raw_bal   = exchange.fetch_balance()
         free_usdt = _extract_free_usdt(raw_bal)
-        m   = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
         acc = CONFIG.setdefault("live_accounts", {}).setdefault(m, {})
         acc.update({"balance": free_usdt, "last_sync": datetime.utcnow().isoformat(),
                     "last_error": "", "connected": True})
@@ -828,7 +972,6 @@ def execute_live_order(symbol: str, side: str, size: float,
         return {"ok": True, "order": order, "balance": free_usdt}
     except Exception as exc:
         err = str(exc)
-        m   = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
         acc = CONFIG.setdefault("live_accounts", {}).setdefault(m, {})
         acc["last_error"] = err
         _save_persistent_state()
@@ -869,6 +1012,17 @@ def _elog(msg: str, level: str = "INFO"):
         record_admin_activity("admin", _event_type_for_message(msg), msg, details={"level": level})
     except Exception:
         pass
+    # This used to only reach the in-memory buffer (capped at 800 entries,
+    # lost on restart) and the SQLite activity table — NOT the actual
+    # trading_bot.log file. That meant routine, high-value diagnostics
+    # (per-symbol scan summaries: price/RSI/EMA/confidence for every
+    # scan) were structurally unrecoverable once evicted from memory —
+    # exactly the data needed to audit "was a signal accurate" after the
+    # fact. Every _elog() call now also reaches the real logger, so it's
+    # durably in the log file going forward.
+    log_fn = {"ERROR": logger.error, "WARN": logger.warning,
+              "WARNING": logger.warning}.get(level.upper(), logger.info)
+    log_fn(msg)
 
 # ════════════════════════════════════════════════════════════
 #  LOGGING (terminal + file)
@@ -1056,6 +1210,27 @@ class MarketDataProvider:
         """Turns common ccxt/requests exceptions into a clear, actionable message
         instead of a bare 'GET https://...' string with no status code."""
         msg = str(e)
+        etype = type(e).__name__
+        # Retry/fallback logic (e.g. trying multiple exchanges) can end up
+        # calling this on an exception whose message is ALREADY the output
+        # of a previous _explain_error() call (wrapped and re-raised).
+        # Without this guard, the "[EType]" tag added below stacks up once
+        # per retry — this happened for real: "[DataSourceError]
+        # [DataSourceError] [DataSourceError] ccxt not installed...".
+        already_tagged = bool(re.match(r"^\[\w+\]", msg.strip()))
+
+        # Some exchanges return an HTML error/challenge page (Cloudflare
+        # blocks, WAF challenges, etc.) instead of JSON on failure, and
+        # ccxt sometimes embeds that raw HTML verbatim in the exception
+        # message. Left unchecked this dumps an entire HTML document into
+        # the log file (this happened for real — a KuCoin Cloudflare page
+        # ended up as ~90 lines in the log). Detect and collapse it to a
+        # one-line summary instead.
+        if "<!DOCTYPE" in msg or "<html" in msg.lower():
+            head = msg.split("<")[0].strip()
+            msg = f"{head} [HTML error page from exchange, {len(msg)} chars — likely a bot-protection/WAF challenge page, not a real API response]"
+        elif len(msg) > 300:
+            msg = msg[:300] + f"... [truncated, {len(msg)} chars total]"
         if "451" in msg or "restricted location" in msg.lower():
             return (f"{msg} → HTTP 451: this exchange has geo-blocked your "
                     f"server's IP/region. Not a code bug — switch exchange in "
@@ -1067,7 +1242,20 @@ class MarketDataProvider:
             return f"{msg} → Connection timed out — check network/firewall egress."
         if "name or service not known" in msg.lower() or "getaddrinfo" in msg.lower():
             return f"{msg} → DNS lookup failed — no internet access from this host."
-        return msg
+        if already_tagged:
+            return msg
+        # Some ccxt exceptions (RequestTimeout, ExchangeNotAvailable,
+        # NetworkError, DDoSProtection, etc.) have a message body that's
+        # JUST the request URL with no actual reason attached — str(e)
+        # alone is then indistinguishable from "it just didn't work,
+        # somehow". The exception CLASS still carries real signal even
+        # when its message doesn't, so always surface it. This is exactly
+        # what was missing from the BTC/USDT "LIVE DATA FETCH FAILED"
+        # entries — they gave a URL and nothing else to diagnose from.
+        if msg.strip() in ("", None) or msg.strip().startswith(("http://", "https://")) \
+           or len(msg) < 80:
+            return f"[{etype}] {msg} → see https://docs.ccxt.com/#/README?id=error-hierarchy for what {etype} means"
+        return f"[{etype}] {msg}"
 
     def _crypto(self, symbol, tf, limit):
         if not self.exchange:
@@ -1171,6 +1359,7 @@ class TechnicalAnalysis:
     def __init__(self):
         self.fast = CONFIG["rsi_fast_period"]
         self.slow = CONFIG["rsi_slow_period"]
+        self.confirm = CONFIG["rsi_confirm_period"]  # RSI-24 — slower confirmation filter, see signal()
         self.piv  = CONFIG["swing_pivot_strength"]
 
     def compute(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -1180,7 +1369,7 @@ class TechnicalAnalysis:
         return df
 
     def _rsi(self, df):
-        for p in [self.fast, self.slow]:
+        for p in [self.fast, self.slow, self.confirm]:
             d  = df["close"].diff()
             g  = d.clip(lower=0); l = -d.clip(upper=0)
             ag = g.ewm(com=p-1, min_periods=p).mean()
@@ -1237,6 +1426,7 @@ class TechnicalAnalysis:
         px  = float(last["close"])
         rf  = float(last[f"rsi_{self.fast}"])
         rs  = float(last[f"rsi_{self.slow}"])
+        rc  = float(last[f"rsi_{self.confirm}"])
         rd  = float(last["rsi_div"]); rpd = float(prev["rsi_div"])
         et  = int(last["ema_trend"])
         vs  = bool(last["vol_surge"])
@@ -1244,22 +1434,57 @@ class TechnicalAnalysis:
         atr = float(last["atr"])
         sh  = float(last["last_sh"]) if not np.isnan(last["last_sh"]) else px
         sl  = float(last["last_sl"]) if not np.isnan(last["last_sl"]) else px
+        ema21 = float(last["ema_21"]); ema50 = float(last["ema_50"])
+
+        # ── Efficiency Ratio (Kaufman ER) — chop detector ──
+        # ER = net directional movement / total path length travelled, over
+        # a lookback window. Close to 1 = price moved efficiently in one
+        # direction (a real trend). Close to 0 = lots of back-and-forth
+        # for little net progress (chop/whipsaw) — exactly the condition
+        # that was found to produce fast, small losses: RSI(6) swinging
+        # from 33 to 79 and back while price stayed range-bound. Applied
+        # below as a cap on ENTRY confidence only — it doesn't touch
+        # trades already open, which are already protected by the
+        # signal-loss-confirmation and profit-lock mechanisms.
+        er_window = min(CONFIG["chop_efficiency_lookback"], len(df) - 1)
+        efficiency_ratio = 1.0
+        if er_window >= 3:
+            closes = df["close"].iloc[-(er_window+1):].values
+            net_move = abs(closes[-1] - closes[0])
+            path_len = sum(abs(closes[i] - closes[i-1]) for i in range(1, len(closes)))
+            efficiency_ratio = (net_move / path_len) if path_len > 0 else 0.0
+
+        # ── Trend strength — how far apart the EMAs are, as a % of price.
+        # Used to scale down a signal that's fighting the prevailing trend
+        # (e.g. a SELL signal while EMA21>EMA50 in a real uptrend) —
+        # proportional to how established that trend actually is, not a
+        # flat penalty. A barely-separated EMA pair (weak/uncertain trend)
+        # gets little to no discount; a wide, established separation gets
+        # the full discount. This directly targets the finding that SELL
+        # signals underperformed specifically on symbols in a sustained
+        # uptrend (e.g. ETH), while the same SELL logic worked fine on
+        # symbols without that trend context.
+        ema_sep_pct = abs(ema21 - ema50) / px if px else 0.0
+        trend_strength = min(1.0, ema_sep_pct / CONFIG["strong_trend_ema_sep_pct"]) if CONFIG["strong_trend_ema_sep_pct"] else 0.0
 
         buy=0; sell=0; reasons_buy=[]; reasons_sell=[]
         thr = CONFIG["rsi_signal_threshold"]
 
-        # Max attainable points per side = 25+20+20+15+10+10 = 100,
-        # so the resulting score is a true 0-100% conviction scale —
-        # NOT normalised against (buy+sell), which used to artificially
-        # inflate confidence on weak/mixed signals.
+        # Max attainable points per side = 20+15+20+15+10+10+10 = 100,
+        # so the resulting score is a true 0-100% conviction scale — NOT
+        # normalised against (buy+sell), which used to artificially
+        # inflate confidence on weak/mixed signals. RSI(24) was added as a
+        # slower trend-confirmation filter; its 10 points were funded by
+        # trimming RSI-oversold/overbought (25→20) and the fast/slow cross
+        # (20→15) rather than just added on top, so the scale stays 0-100.
         if rf < CONFIG["rsi_oversold"]:
-            buy += 25; reasons_buy.append(f"RSI({self.fast})={rf:.1f} oversold")
+            buy += 20; reasons_buy.append(f"RSI({self.fast})={rf:.1f} oversold")
         if rf > CONFIG["rsi_overbought"]:
-            sell += 25; reasons_sell.append(f"RSI({self.fast})={rf:.1f} overbought")
+            sell += 20; reasons_sell.append(f"RSI({self.fast})={rf:.1f} overbought")
         if rd > thr and rpd <= thr:
-            buy += 20; reasons_buy.append("RSI fast crossed above slow")
+            buy += 15; reasons_buy.append("RSI fast crossed above slow")
         if rd < -thr and rpd >= -thr:
-            sell += 20; reasons_sell.append("RSI fast crossed below slow")
+            sell += 15; reasons_sell.append("RSI fast crossed below slow")
         if abs(px-sl)/px < 0.012:
             buy += 20; reasons_buy.append(f"Near swing low ${sl:.2f}")
         if abs(px-sh)/px < 0.012:
@@ -1275,8 +1500,55 @@ class TechnicalAnalysis:
             buy += 10; reasons_buy.append(f"Momentum +{mom:.2f}%")
         elif mom < -0.5:
             sell += 10; reasons_sell.append(f"Momentum {mom:.2f}%")
+        # RSI(24): a slower period than the fast/slow pair above — used
+        # purely as broader-trend confirmation (above 50 = bullish bias,
+        # below 50 = bearish bias), not as its own oversold/overbought
+        # trigger. Requires >52/<48 rather than exactly 50 so a value
+        # sitting right at the midline doesn't flip-flop which side gets
+        # the point on tiny noise.
+        if rc > 52:
+            buy += 10; reasons_buy.append(f"RSI({self.confirm})={rc:.1f} confirms bullish bias")
+        elif rc < 48:
+            sell += 10; reasons_sell.append(f"RSI({self.confirm})={rc:.1f} confirms bearish bias")
+
+        # ── Counter-trend discount ── applied AFTER scoring, proportional
+        # to trend_strength (0-1). A SELL score gets discounted when the
+        # EMA trend is up; a BUY score gets discounted when it's down.
+        # Discount scales with how established the trend is — weak/
+        # uncertain trends barely discount at all.
+        if CONFIG["counter_trend_discount_enabled"] and trend_strength > 0:
+            discount = trend_strength * CONFIG["max_counter_trend_discount_pct"]
+            if et == 1 and sell > 0:
+                sell_before = sell
+                sell = sell * (1 - discount)
+                reasons_sell.append(f"Counter-trend discount -{discount*100:.0f}% "
+                                     f"(EMA sep {ema_sep_pct*100:.2f}%, uptrend)")
+            elif et == -1 and buy > 0:
+                buy_before = buy
+                buy = buy * (1 - discount)
+                reasons_buy.append(f"Counter-trend discount -{discount*100:.0f}% "
+                                    f"(EMA sep {ema_sep_pct*100:.2f}%, downtrend)")
 
         min_conf = CONFIG["min_confidence_to_trade"]
+        # ── Chop cap ── if the market hasn't been moving efficiently
+        # (lots of back-and-forth, little net progress), cap BOTH sides
+        # below the entry threshold so no NEW trade can open on this
+        # scan, regardless of how strong the other confirming factors
+        # look — those factors are exactly what got fooled by chop
+        # historically. This never touches trades already open.
+        chop_capped = False
+        if CONFIG["chop_filter_enabled"] and efficiency_ratio < CONFIG["chop_min_efficiency_ratio"]:
+            cap = max(0, min_conf - 1)
+            if buy > cap or sell > cap:
+                chop_capped = True
+                if buy > cap:
+                    reasons_buy.append(f"⚠️ Capped — choppy market (ER={efficiency_ratio:.2f} "
+                                        f"< {CONFIG['chop_min_efficiency_ratio']:.2f})")
+                if sell > cap:
+                    reasons_sell.append(f"⚠️ Capped — choppy market (ER={efficiency_ratio:.2f} "
+                                         f"< {CONFIG['chop_min_efficiency_ratio']:.2f})")
+                buy = min(buy, cap)
+                sell = min(sell, cap)
         sl_floor = CONFIG["stop_loss_pct"]
         tp_floor = CONFIG["take_profit_pct"]
         # Hard 4:1 reward:risk guarantee regardless of ATR adjustment
@@ -1311,7 +1583,7 @@ class TechnicalAnalysis:
                         "reasons":["Rejected: invalid SL/TP configuration"],"price":px}
             return {"side":"BUY","confidence":conf,"reasons":reasons_buy,
                     "price":px,"sl":sl_p,"tp":tp_p,
-                    "rsi_fast":rf,"rsi_slow":rs,"swing_low":sl,"swing_high":sh}
+                    "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh}
 
         if sell > buy and sell >= min_conf:
             conf  = min(float(sell), 99.0)
@@ -1332,7 +1604,7 @@ class TechnicalAnalysis:
                         "reasons":["Rejected: invalid SL/TP configuration"],"price":px}
             return {"side":"SELL","confidence":conf,"reasons":reasons_sell,
                     "price":px,"sl":sl_p,"tp":tp_p,
-                    "rsi_fast":rf,"rsi_slow":rs,"swing_low":sl,"swing_high":sh}
+                    "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh}
 
         return {"side":"HOLD","confidence":max(buy,sell),
                 "reasons":reasons_buy if buy>=sell else reasons_sell,"price":px}
@@ -1421,24 +1693,38 @@ class TradeManager:
     def can_open(self):
         return len(self.open_trades) < CONFIG["max_open_trades"]
 
-    def open_trade(self, symbol: str, sig: dict, ai: dict, market: Optional[str] = None) -> Optional[dict]:
+    def open_trade(self, symbol: str, sig: dict, ai: dict, market: Optional[str] = None,
+                   allow_duplicate: bool = False, override_size: Optional[float] = None,
+                   opened_by: str = "bot", manual_source: str = "") -> Optional[dict]:
         with self._lock:
             if not self.can_open():
                 _elog(f"Max trades reached — skip {symbol}", "WARN"); return None
-            if any(t["symbol"]==symbol for t in self.open_trades):
+            # The autonomous scanner never duplicates a position on a symbol
+            # it's already holding — that's a deliberate safety limit. Manual
+            # "duplicate this trade" requests are an explicit, one-at-a-time
+            # human decision, so they're allowed to opt out of it.
+            if not allow_duplicate and any(t["symbol"]==symbol for t in self.open_trades):
                 _elog(f"Already in {symbol} — skip", "WARN"); return None
 
             px      = sig["price"]
             sl_dist = abs(px - sig["sl"])
             if sl_dist == 0: return None
-            risk    = self.balance * CONFIG["max_risk_per_trade"]
-            sz      = min(risk / sl_dist, self.balance * 0.5 / px)
+            if override_size is not None:
+                sz = override_size
+            else:
+                risk    = self.balance * CONFIG["max_risk_per_trade"]
+                sz      = min(risk / sl_dist, self.balance * 0.5 / px)
             cost    = sz * px
             conf    = min(sig["confidence"] + ai.get("confidence_adjustment",0), 99)
 
             m = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
             trade = {
-                "id"           : f"{symbol.replace('/','_')}_{int(time.time())}",
+                # Sub-second precision + a short random suffix — plain
+                # int(time.time()) (1-second resolution) could collide for
+                # two trades on the same symbol opened within the same
+                # second, which is now a real possibility since manual
+                # duplicate-trade requests can fire back-to-back quickly.
+                "id"           : f"{symbol.replace('/','_')}_{int(time.time()*1000)}_{secrets.token_hex(2)}",
                 "symbol"       : symbol,
                 "market"       : m,
                 "side"         : sig["side"],
@@ -1458,8 +1744,35 @@ class TradeManager:
                 "pnl"          : None,
                 "unrealised_pnl": 0.0,
                 "reasons"      : sig.get("reasons",[]),
+                # Consecutive scans in a row where the signal no longer
+                # supports this trade. A confidence-based exit requires this
+                # to hit CONFIG["signal_exit_confirmations"] (default 2)
+                # before actually closing — a single noisy scan shouldn't
+                # cut a trade early; two in a row is a real trend change.
+                # SL/TP hits are NOT gated by this — those remain instant
+                # hard stops, checked independently every cycle.
+                "signal_loss_strikes": 0,
+                "opened_by"    : opened_by,      # "bot" | "manual"
+                "manual_source": manual_source,  # e.g. "live_signal:BTC/USDT@78.5%" or "duplicate_of:BTC_USDT_1723..."
+                # Ride-winners mechanism (see check_exits and the
+                # confidence re-check in scan_once): initial_sl/initial_risk
+                # are captured ONCE here and never change even after sl
+                # itself moves to breakeven/trails — they're the fixed
+                # yardstick ("1R") that profit-lock and trailing-stop
+                # thresholds are measured against. best_price tracks the
+                # most favorable price seen so the trailing stop has
+                # something to trail from. profit_locked flips on once the
+                # trade has proven itself with real price movement, at
+                # which point routine confidence wobble stops being a
+                # reason to exit — only a genuine reversal or the (now
+                # protective) stop can end it.
+                "initial_sl"   : sig["sl"],
+                "initial_risk" : abs(px - sig["sl"]),
+                "best_price"   : px,
+                "profit_locked": False,
             }
             live_acc = CONFIG.get("live_accounts", {}).get(m, {})
+            tag = f" | MANUAL ({manual_source})" if opened_by == "manual" else ""
             if not CONFIG["paper_trading"] and CONFIG.get("live_trading_enabled", False) and live_acc.get("connected"):
                 live_result = execute_live_order(symbol, sig["side"], sz, market=m)
                 if live_result.get("ok"):
@@ -1467,20 +1780,20 @@ class TradeManager:
                     trade["execution_mode"] = "LIVE"
                     msg = (f"OPENED {symbol} {sig['side']} @ ${px:.4f} | "
                            f"SL=${sig['sl']:.4f} TP=${sig['tp']:.4f} | "
-                           f"Conf={conf:.1f}% | LIVE ORDER")
+                           f"Conf={conf:.1f}% | LIVE ORDER{tag}")
                 else:
                     trade["execution_mode"] = "PAPER"
                     trade["execution_error"] = live_result.get("error", "unknown")
                     msg = (f"OPENED {symbol} {sig['side']} @ ${px:.4f} | "
                            f"SL=${sig['sl']:.4f} TP=${sig['tp']:.4f} | "
-                           f"Conf={conf:.1f}% | LIVE FAILED ({trade['execution_error']})")
+                           f"Conf={conf:.1f}% | LIVE FAILED ({trade['execution_error']}){tag}")
             else:
                 trade["execution_mode"] = "PAPER"
                 msg = (f"OPENED {symbol} {sig['side']} @ ${px:.4f} | "
                        f"SL=${sig['sl']:.4f} TP=${sig['tp']:.4f} | "
-                       f"Conf={conf:.1f}%")
+                       f"Conf={conf:.1f}%{tag}")
             self.open_trades.append(trade)
-            logger.info(f"  ✅ {msg}"); _elog(msg, "INFO")
+            _elog(f"✅ {msg}", "INFO")
             record_admin_activity("admin", "trade", msg, details={"trade": trade})
             return trade
 
@@ -1514,7 +1827,7 @@ class TradeManager:
                     self.open_trades.remove(t)
                     self.closed_trades.append(t)
                     msg = f"MANUAL CLOSE {t['symbol']} | PnL=${pnl:.2f}"
-                    logger.info(f"  🔴 {msg}"); _elog(msg, "WARN")
+                    _elog(f"🔴 {msg}", "WARN")
                     record_admin_activity("admin", "trade", msg, details={"trade": t})
                     return t
         return None
@@ -1567,11 +1880,61 @@ class TradeManager:
             for t in list(self.open_trades):
                 px = prices.get(t["symbol"])
                 if px is None: continue
+
+                initial_risk = t.get("initial_risk") or abs(t["entry"] - t.get("initial_sl", t["sl"])) or 1e-9
                 if t["side"] == "BUY":
                     t["unrealised_pnl"] = (px - t["entry"]) * t["size"]
-                    hit_sl = px <= t["sl"]; hit_tp = px >= t["tp"]
+                    r_multiple = (px - t["entry"]) / initial_risk
+                    t["best_price"] = max(t.get("best_price", t["entry"]), px)
                 else:
                     t["unrealised_pnl"] = (t["entry"] - px) * t["size"]
+                    r_multiple = (t["entry"] - px) / initial_risk
+                    t["best_price"] = min(t.get("best_price", t["entry"]), px)
+
+                # ── Ride-winners mechanism, part 1: breakeven lock ──
+                # Once a trade has moved in its favor by profit_lock_r_multiple
+                # (default 1R — i.e. it's now up by as much as it originally
+                # risked), move the stop to breakeven. This is what lets the
+                # confidence re-check (in scan_once) safely stop treating
+                # routine indicator wobble as exit-worthy from this point on
+                # — the trade is now structurally incapable of becoming a
+                # loss, so there's nothing left to protect against by
+                # cutting it early on a soft signal.
+                if (CONFIG["profit_lock_enabled"] and not t.get("profit_locked")
+                        and r_multiple >= CONFIG["profit_lock_r_multiple"]):
+                    new_sl = t["entry"]
+                    improves = (t["side"]=="BUY" and new_sl > t["sl"]) or (t["side"]=="SELL" and new_sl < t["sl"])
+                    if improves:
+                        old_sl = t["sl"]
+                        t["sl"] = round(new_sl, 6)
+                        t["profit_locked"] = True
+                        _elog(f"🔒 {t['symbol']}: breakeven lock — SL ${old_sl:.4f} → ${t['sl']:.4f} "
+                              f"after reaching {r_multiple:.2f}R profit ({CONFIG['profit_lock_r_multiple']}R trigger). "
+                              f"Confidence-based early exit is now relaxed for this trade — only a full signal "
+                              f"reversal, TP, or this stop can close it from here.", "INFO")
+
+                # ── Ride-winners mechanism, part 2: trail the stop ──
+                # Beyond profit-lock, once favorable movement reaches
+                # trailing_stop_activation_r, keep the stop
+                # trailing_stop_distance_r behind the best price seen —
+                # this locks in progressively more of the move while still
+                # leaving real room for price to reach TP, rather than an
+                # all-or-nothing breakeven-or-target outcome.
+                if (CONFIG["trailing_stop_enabled"] and t.get("profit_locked")
+                        and r_multiple >= CONFIG["trailing_stop_activation_r"]):
+                    trail_dist = CONFIG["trailing_stop_distance_r"] * initial_risk
+                    if t["side"] == "BUY":
+                        trail_sl = round(t["best_price"] - trail_dist, 6)
+                        if trail_sl > t["sl"]:
+                            t["sl"] = trail_sl
+                    else:
+                        trail_sl = round(t["best_price"] + trail_dist, 6)
+                        if trail_sl < t["sl"]:
+                            t["sl"] = trail_sl
+
+                if t["side"] == "BUY":
+                    hit_sl = px <= t["sl"]; hit_tp = px >= t["tp"]
+                else:
                     hit_sl = px >= t["sl"]; hit_tp = px <= t["tp"]
                 if hit_tp or hit_sl:
                     pnl = t["unrealised_pnl"]
@@ -1762,22 +2125,88 @@ class TradingBot:
                     prices[sym] = px_live
 
                     min_conf   = CONFIG["min_confidence_to_trade"]
-                    still_valid = (trade is not None
-                                   and sig_open["side"] == trade["side"]
-                                   and sig_open.get("confidence", 0) >= min_conf)
+                    # Use the trade's OWN opening confidence as the bar to
+                    # remain valid, not just the generic minimum threshold.
+                    # A trade that opened at 90% but has since drifted down
+                    # to 76% is still technically "tradeable" by the 75%
+                    # minimum, but its conviction is measurably weakening —
+                    # that's an early warning the setup is softening before
+                    # it fully reverses. Requiring it to hold its OWN entry
+                    # bar (not just the floor) starts the exit-confirmation
+                    # clock on that warning sign instead of waiting for a
+                    # full signal flip or a drop below the generic minimum.
+                    entry_conf = trade.get("confidence", min_conf) if trade is not None else min_conf
+                    required_conf = (max(min_conf, entry_conf)
+                                      if CONFIG["hold_requires_entry_confidence"] else min_conf)
+                    is_reversal = (trade is not None and sig_open["side"] != trade["side"]
+                                    and sig_open["side"] != "HOLD")
 
-                    if trade is not None and not still_valid:
-                        reason = (f"signal flipped to {sig_open['side']}"
-                                  if sig_open["side"] != trade["side"] and sig_open["side"] != "HOLD"
-                                  else f"confidence dropped to {sig_open.get('confidence',0):.0f}% "
-                                       f"(< {min_conf}% required)")
-                        print(Fore.YELLOW + f"  ⚠️  {sym} — {reason}, closing open "
-                              f"{trade['side']} @ ${px_live:.4f}" + Style.RESET_ALL)
-                        _elog(f"↩️ {sym}: no longer meets confidence ({reason}) — closing trade early", "WARN")
-                        closed_early = self.tm.close_on_signal_loss(trade["id"], px_live, reason)
-                        if closed_early:
-                            open_symbols.discard(sym)
-                        continue
+                    if (trade is not None and trade.get("profit_locked")
+                            and CONFIG["relax_exit_after_profit_lock"]):
+                        # Ride-winners mechanism, part 3: once a trade has
+                        # earned breakeven-or-better (see check_exits), stop
+                        # letting routine confidence/indicator wobble decide
+                        # its fate. From here only a genuine opposite-
+                        # direction signal counts as "no longer valid" — a
+                        # HOLD reading or a confidence dip means the setup is
+                        # uncertain, not that it's actually reversed, and the
+                        # trade is now structurally incapable of becoming a
+                        # loss anyway. This is the actual fix for winners
+                        # getting cut before reaching TP: they were being
+                        # judged by the same strict bar as a fresh, unproven
+                        # trade even after price had already validated them.
+                        still_valid = not is_reversal
+                    else:
+                        still_valid = (trade is not None
+                                       and sig_open["side"] == trade["side"]
+                                       and sig_open.get("confidence", 0) >= required_conf)
+
+                    if trade is not None:
+                        needed = CONFIG["signal_exit_confirmations"]
+                        if still_valid:
+                            if trade.get("signal_loss_strikes", 0) > 0:
+                                _elog(f"↩️ {sym}: direction re-confirmed — clearing "
+                                      f"{trade['signal_loss_strikes']}/{needed} exit strike(s)", "INFO")
+                            trade["signal_loss_strikes"] = 0
+                        else:
+                            trade["signal_loss_strikes"] = trade.get("signal_loss_strikes", 0) + 1
+                            strikes = trade["signal_loss_strikes"]
+                            below_entry = (sig_open["side"] == trade["side"]
+                                           and sig_open.get("confidence", 0) < entry_conf
+                                           and sig_open.get("confidence", 0) >= min_conf)
+                            if is_reversal:
+                                reason = f"signal flipped to {sig_open['side']}"
+                                if trade.get("profit_locked"):
+                                    reason += " (profit-locked trade — only a genuine reversal triggers this)"
+                            elif below_entry:
+                                reason = (f"confidence dropped to {sig_open.get('confidence',0):.0f}% — "
+                                          f"below the {entry_conf:.0f}% it opened at (still above the "
+                                          f"{min_conf}% floor, but conviction is weakening)")
+                            else:
+                                reason = (f"confidence dropped to {sig_open.get('confidence',0):.0f}% "
+                                          f"(< {min_conf}% required)")
+                            if strikes < needed:
+                                # First (or Nth-but-not-final) unconfirmed
+                                # scan — flag it, but don't close yet. SL/TP
+                                # keep being checked independently on the
+                                # fast monitor loop regardless of this
+                                # counter, so a real stop-out is never
+                                # delayed by waiting for confirmation.
+                                print(Fore.YELLOW + f"  ⚠️  {sym} — {reason} "
+                                      f"[{strikes}/{needed} confirmation scans] — "
+                                      f"not closing yet" + Style.RESET_ALL)
+                                _elog(f"⚠️ {sym}: {reason} — strike {strikes}/{needed}, "
+                                      f"needs one more consecutive scan to confirm before closing", "WARN")
+                                continue
+                            print(Fore.YELLOW + f"  ⚠️  {sym} — {reason}, confirmed on "
+                                  f"{strikes}/{needed} consecutive scans, closing open "
+                                  f"{trade['side']} @ ${px_live:.4f}" + Style.RESET_ALL)
+                            _elog(f"↩️ {sym}: no longer meets confidence ({reason}), confirmed "
+                                  f"{strikes}/{needed} scans in a row — closing trade early", "WARN")
+                            closed_early = self.tm.close_on_signal_loss(trade["id"], px_live, reason)
+                            if closed_early:
+                                open_symbols.discard(sym)
+                            continue
 
                     print(f"  {Fore.BLUE}{sym}{Style.RESET_ALL}  "
                           f"— already in open trade, still valid ({sig_open['side']} "
@@ -1916,7 +2345,6 @@ class TradingBot:
                         _elog(f"⚠️ Trade {ai_res.get('action')} by AI {sym}: {ai_res.get('analysis', 'N/A')}", "WARN")
 
             except Exception as e:
-                logger.error(f"Error scanning {sym}: {e}")
                 _elog(f"Scan error {sym}: {e}", "ERROR")
 
         for _sym, _px in prices.items():
@@ -2178,11 +2606,20 @@ def api_predictions():
 
     MAX_SCORE = 100
     # All signal components and their point values
+    # These weights and directions must exactly mirror TechnicalAnalysis.
+    # signal()'s actual scoring — this list is what drives the "what's
+    # needed to open this trade" roadmap on the Predictions page. It had
+    # drifted out of sync with the real engine (stale weights from before
+    # RSI(24) was added, and missing the RSI(24) entries entirely), which
+    # made the roadmap show point totals that could never actually reach
+    # the confidence threshold. The top-line confidence score itself was
+    # always correct (it comes straight from signal()) — only this
+    # breakdown display was wrong.
     ALL_SIGNALS = [
-        {"key":"rsi_oversold",   "label":f"RSI({ta.fast}) Oversold",    "pts":25, "dir":"buy"},
-        {"key":"rsi_overbought", "label":f"RSI({ta.fast}) Overbought",   "pts":25, "dir":"sell"},
-        {"key":"rsi_cross_buy",  "label":"RSI Fast Cross ↑",             "pts":20, "dir":"buy"},
-        {"key":"rsi_cross_sell", "label":"RSI Fast Cross ↓",             "pts":20, "dir":"sell"},
+        {"key":"rsi_oversold",   "label":f"RSI({ta.fast}) Oversold",     "pts":20, "dir":"buy"},
+        {"key":"rsi_overbought", "label":f"RSI({ta.fast}) Overbought",   "pts":20, "dir":"sell"},
+        {"key":"rsi_cross_buy",  "label":"RSI Fast Cross ↑",             "pts":15, "dir":"buy"},
+        {"key":"rsi_cross_sell", "label":"RSI Fast Cross ↓",             "pts":15, "dir":"sell"},
         {"key":"swing_low",      "label":"At Swing Low Support",         "pts":20, "dir":"buy"},
         {"key":"swing_high",     "label":"At Swing High Resistance",     "pts":20, "dir":"sell"},
         {"key":"ema_bullish",    "label":"EMA21 > EMA50 Uptrend",        "pts":15, "dir":"buy"},
@@ -2190,6 +2627,8 @@ def api_predictions():
         {"key":"vol_surge",      "label":"Volume Surge Confirmation",    "pts":10, "dir":"both"},
         {"key":"momentum_pos",   "label":"Positive Momentum 5-bar",      "pts":10, "dir":"buy"},
         {"key":"momentum_neg",   "label":"Negative Momentum 5-bar",      "pts":10, "dir":"sell"},
+        {"key":"rsi24_bullish",  "label":f"RSI({ta.confirm}) Confirms Bullish Bias", "pts":10, "dir":"buy"},
+        {"key":"rsi24_bearish",  "label":f"RSI({ta.confirm}) Confirms Bearish Bias", "pts":10, "dir":"sell"},
     ]
 
     for sym in symbols:
@@ -2229,6 +2668,7 @@ def api_predictions():
 
             rsi_fast  = sf(last.get(f"rsi_{ta.fast}"))
             rsi_slow  = sf(last.get(f"rsi_{ta.slow}"))
+            rsi_confirm = sf(last.get(f"rsi_{ta.confirm}"))
             ema_trend = int(last.get("ema_trend", -1))
             vs        = bool(last.get("vol_surge", False))
             mom5      = sf(last.get("mom5"))
@@ -2253,6 +2693,12 @@ def api_predictions():
                 "vol_surge"     : vs,
                 "momentum_pos"  : bool(mom5 and mom5 > 0.5),
                 "momentum_neg"  : bool(mom5 and mom5 < -0.5),
+                # Must match signal()'s >52/<48 thresholds exactly (not
+                # >50/<50) — a value sitting right at the midline shouldn't
+                # flip which side gets the point on tiny noise, same
+                # reasoning as the live engine.
+                "rsi24_bullish" : bool(rsi_confirm and rsi_confirm > 52),
+                "rsi24_bearish" : bool(rsi_confirm and rsi_confirm < 48),
             }
 
             buy_score  = sum(s["pts"] for s in ALL_SIGNALS
@@ -2387,7 +2833,9 @@ def api_predictions():
                 # Indicators
                 "rsi_fast"         : round(rsi_fast, 1) if rsi_fast else None,
                 "rsi_slow"         : round(rsi_slow, 1) if rsi_slow else None,
+                "rsi_confirm"      : round(rsi_confirm, 1) if rsi_confirm else None,
                 "rsi_fast_period"  : ta.fast,
+                "rsi_confirm_period": ta.confirm,
                 "ema_trend"        : "Bullish" if ema_trend == 1 else "Bearish",
                 "vol_surge"        : vs,
                 "momentum"         : round(mom5, 2) if mom5 else None,
@@ -2603,6 +3051,34 @@ def api_wallet_sync():
     return jsonify({"ok": False, "error": payload.get("error", "Sync failed"), "exchange_dashboard": payload}), 400
 
 
+@app.route("/api/wallet/transfer", methods=["POST"])
+@_login_required
+def api_wallet_transfer():
+    """Move funds internally from the exchange's trading/derivatives
+    account to its funding/spot wallet — the step most exchanges require
+    before an on-chain withdrawal can be initiated (see internal_transfer_funds)."""
+    data   = request.json or {}
+    market = (CONFIG.get("market_mode") or "CRYPTO").strip().upper()
+    acc    = CONFIG.get("live_accounts", {}).get(market, {})
+    if not (acc.get("connected") and acc.get("api_key") and acc.get("api_secret")):
+        return jsonify({"ok": False, "error": "No connected live exchange account. Go to Settings → Live Trading to connect."}), 400
+    try:
+        amount = float(data.get("amount", 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "Invalid amount"}), 400
+    if amount <= 0:
+        return jsonify({"ok": False, "error": "Amount must be greater than 0"}), 400
+
+    result = internal_transfer_funds(market, amount, from_account="trading", to_account="funding")
+    if result.get("ok"):
+        _elog(f"Transferred ${amount:.2f} USDT from trading to funding wallet ({market})", "INFO")
+        # Refresh balance snapshot so the wallet page reflects the move immediately
+        build_exchange_dashboard_payload(market, force_refresh=True, persist=True)
+        return jsonify({"ok": True, "amount": amount})
+    _elog(f"Internal transfer failed for {market}: {result.get('error')}", "ERROR")
+    return jsonify({"ok": False, "error": result.get("error", "Transfer failed")}), 400
+
+
 @app.route("/api/exchange/status")
 @_login_required
 def api_exchange_status():
@@ -2800,6 +3276,7 @@ def api_analysis():
 
             rsi_fast  = sf(last.get(f"rsi_{ta.fast}"))
             rsi_slow  = sf(last.get(f"rsi_{ta.slow}"))
+            rsi_confirm = sf(last.get(f"rsi_{ta.confirm}"))
             ema_21    = sf(last.get("ema_21"))
             ema_50    = sf(last.get("ema_50"))
             ema_200   = sf(last.get("ema_200"))
@@ -2883,8 +3360,10 @@ def api_analysis():
                 "signal_age_s"    : signal_age_s,
                 "rsi_fast"     : round(rsi_fast, 1) if rsi_fast else None,
                 "rsi_slow"     : round(rsi_slow, 1) if rsi_slow else None,
+                "rsi_confirm"  : round(rsi_confirm, 1) if rsi_confirm else None,
                 "rsi_fast_period": ta.fast,
                 "rsi_slow_period": ta.slow,
+                "rsi_confirm_period": ta.confirm,
                 "ema_21"       : round(ema_21, 4) if ema_21 else None,
                 "ema_50"       : round(ema_50, 4) if ema_50 else None,
                 "ema_200"      : round(ema_200, 4) if ema_200 else None,
@@ -2971,12 +3450,18 @@ def api_state():
 @_login_required
 def api_config():
     data    = request.json or {}
-    allowed = ["market_mode","crypto_symbols","stock_symbols","crypto_timeframe",
-               "stock_timeframe","crypto_exchange","rsi_fast_period","rsi_slow_period",
+    allowed = ["market_mode","crypto_symbols","stock_symbols","forex_symbols","crypto_timeframe",
+               "stock_timeframe","forex_timeframe","crypto_exchange","rsi_fast_period","rsi_slow_period",
+               "rsi_confirm_period",
                "rsi_overbought","rsi_oversold","rsi_signal_threshold","stop_loss_pct",
                "take_profit_pct","min_confidence_to_trade",
                "max_risk_per_trade","max_open_trades","account_balance",
-               "scan_interval_seconds","max_execution_slippage_pct",
+               "scan_interval_seconds","max_execution_slippage_pct","signal_exit_confirmations",
+               "hold_requires_entry_confidence",
+               "profit_lock_enabled","profit_lock_r_multiple","relax_exit_after_profit_lock",
+               "trailing_stop_enabled","trailing_stop_activation_r","trailing_stop_distance_r",
+               "chop_filter_enabled","chop_efficiency_lookback","chop_min_efficiency_ratio",
+               "counter_trend_discount_enabled","strong_trend_ema_sep_pct","max_counter_trend_discount_pct",
                "paper_trading","ai_confirmation_required",
                "anthropic_api_key"]
 
@@ -2994,12 +3479,21 @@ def api_config():
         "min_confidence_to_trade": (1,      99,    "1 – 99"),
         "rsi_fast_period":         (2,      50,    "2 – 50"),
         "rsi_slow_period":         (2,      100,   "2 – 100"),
+        "rsi_confirm_period":      (10,     200,   "10 – 200"),
         "rsi_overbought":          (50,     99,    "50 – 99"),
         "rsi_oversold":            (1,      50,    "1 – 50"),
         "max_open_trades":         (1,      50,    "1 – 50"),
         "account_balance":         (1,      100000000, "> 0"),
         "scan_interval_seconds":   (5,      86400, "5 – 86400"),
         "max_execution_slippage_pct": (0.0005, 0.05, "0.05% – 5% (e.g. 0.003 = 0.3%)"),
+        "signal_exit_confirmations": (1, 5, "1 – 5 consecutive scans"),
+        "profit_lock_r_multiple":    (0.2, 5.0, "0.2 – 5.0 (multiples of initial risk)"),
+        "trailing_stop_activation_r": (0.2, 10.0, "0.2 – 10.0 (multiples of initial risk)"),
+        "trailing_stop_distance_r":  (0.1, 3.0, "0.1 – 3.0 (multiples of initial risk)"),
+        "chop_efficiency_lookback":  (3, 50, "3 – 50 bars"),
+        "chop_min_efficiency_ratio": (0.05, 0.95, "0.05 – 0.95 (0=pure noise, 1=perfect trend)"),
+        "strong_trend_ema_sep_pct":  (0.001, 0.05, "0.1% – 5% EMA separation"),
+        "max_counter_trend_discount_pct": (0.0, 0.9, "0% – 90%"),
     }
     errors = []
     for k, (lo, hi, hint) in NUMERIC_BOUNDS.items():
@@ -3015,6 +3509,24 @@ def api_config():
         try:
             if float(data["rsi_fast_period"]) >= float(data["rsi_slow_period"]):
                 errors.append("rsi_fast_period must be smaller than rsi_slow_period")
+        except (TypeError, ValueError):
+            pass
+    slow_val = data.get("rsi_slow_period", CONFIG.get("rsi_slow_period"))
+    confirm_val = data.get("rsi_confirm_period", CONFIG.get("rsi_confirm_period"))
+    if "rsi_confirm_period" in data or "rsi_slow_period" in data:
+        try:
+            if float(confirm_val) <= float(slow_val):
+                errors.append("rsi_confirm_period must be larger than rsi_slow_period "
+                               "(it's meant to be the slower, broader-trend confirmation)")
+        except (TypeError, ValueError):
+            pass
+    lock_val  = data.get("profit_lock_r_multiple", CONFIG.get("profit_lock_r_multiple"))
+    trail_val = data.get("trailing_stop_activation_r", CONFIG.get("trailing_stop_activation_r"))
+    if "profit_lock_r_multiple" in data or "trailing_stop_activation_r" in data:
+        try:
+            if float(trail_val) < float(lock_val):
+                errors.append("trailing_stop_activation_r must be >= profit_lock_r_multiple "
+                               "(trailing starts at or after the breakeven lock, not before)")
         except (TypeError, ValueError):
             pass
     if errors:
@@ -3082,6 +3594,154 @@ def api_execute_trade():
     if result.get("ok"):
         return jsonify({"ok": True, "order": result.get("order"), "balance": result.get("balance")})
     return jsonify({"ok": False, "error": result.get("error", "Execution failed")}), 400
+
+
+@app.route("/api/signals/tradeable")
+@_login_required
+def api_signals_tradeable():
+    """Feeds the manual-trade dropdown: live BUY/SELL signals from the
+    bot's own last-scan cache (the same numbers it actually acted/would
+    act on — see the single-source-of-truth note on last_signals),
+    currently open positions (for duplicating), and recently closed
+    trades (for re-opening a setup that already played out)."""
+    options = []
+
+    if _BOT and getattr(_BOT, "last_signals", None):
+        for sym, sig in _BOT.last_signals.items():
+            if sig.get("side") not in ("BUY", "SELL"):
+                continue
+            try:
+                age_s = (datetime.utcnow() - datetime.fromisoformat(sig["ts"])).total_seconds()
+            except Exception:
+                age_s = None
+            conf = round(sig.get("confidence", 0), 1)
+            options.append({
+                "type": "live_signal",
+                "symbol": sym,
+                "side": sig["side"],
+                "confidence": conf,
+                "price": sig.get("price"),
+                "sl": sig.get("sl"),
+                "tp": sig.get("tp"),
+                "ts": sig.get("ts"),
+                "age_s": round(age_s, 1) if age_s is not None else None,
+                "meets_threshold": conf >= CONFIG["min_confidence_to_trade"],
+                "reasons": sig.get("reasons", [])[:3],
+                "label": (f"{sym} {sig['side']} · {conf:.0f}% "
+                          f"{'✓ meets threshold' if conf >= CONFIG['min_confidence_to_trade'] else '· below threshold'} "
+                          f"· live"),
+            })
+
+    if _TM:
+        for t in _TM.open_trades:
+            options.append({
+                "type": "open_trade",
+                "symbol": t["symbol"],
+                "side": t["side"],
+                "confidence": t.get("confidence", 0),
+                "price": t.get("entry"),
+                "sl": t.get("sl"),
+                "tp": t.get("tp"),
+                "trade_id": t["id"],
+                "opened_at": t.get("open_time"),
+                "unrealised_pnl": round(t.get("unrealised_pnl", 0), 2),
+                "label": (f"{t['symbol']} {t['side']} · open since "
+                          f"{(t.get('open_time') or '')[11:16]} · "
+                          f"{'+'if t.get('unrealised_pnl',0)>=0 else ''}${t.get('unrealised_pnl',0):.2f} "
+                          f"· duplicate this position"),
+            })
+
+        for t in sorted(_TM.closed_trades, key=lambda x: x.get("close_time") or "", reverse=True)[:10]:
+            options.append({
+                "type": "closed_trade",
+                "symbol": t["symbol"],
+                "side": t["side"],
+                "confidence": t.get("confidence", 0),
+                "price": t.get("entry"),
+                "sl": t.get("sl"),
+                "tp": t.get("tp"),
+                "trade_id": t["id"],
+                "closed_at": t.get("close_time"),
+                "pnl": round(t.get("pnl", 0) or 0, 2),
+                "status": t.get("status"),
+                "label": (f"{t['symbol']} {t['side']} · closed {t.get('status','')} "
+                          f"{'+'if (t.get('pnl') or 0)>=0 else ''}${(t.get('pnl') or 0):.2f} "
+                          f"· reopen this setup"),
+            })
+
+    return jsonify({"ok": True, "options": options,
+                     "min_confidence_to_trade": CONFIG["min_confidence_to_trade"]})
+
+
+@app.route("/api/trade/manual", methods=["POST"])
+@_login_required
+def api_trade_manual():
+    """Manually open a trade — including duplicating an already-open
+    position or re-opening a closed one — with a user-specified position
+    size and risk/reward, independent of the bot's own auto-sizing and
+    the autonomous scanner's one-trade-per-symbol limit."""
+    if not _TM or not _BOT:
+        return jsonify({"ok": False, "error": "Bot is not running — start it first so live prices are available"}), 400
+
+    data   = request.json or {}
+    symbol = (data.get("symbol") or "").strip().upper()
+    side   = (data.get("side") or "").strip().upper()
+    source = (data.get("source") or "manual").strip()[:120]
+
+    if not symbol:
+        return jsonify({"ok": False, "error": "Symbol is required"}), 400
+    if side not in ("BUY", "SELL"):
+        return jsonify({"ok": False, "error": "side must be BUY or SELL"}), 400
+
+    try:
+        size_usd = float(data.get("size_usd", 0))
+        sl_pct   = float(data.get("sl_pct", 0))
+        tp_pct   = float(data.get("tp_pct", 0))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "size_usd, sl_pct and tp_pct must be numbers"}), 400
+
+    if size_usd <= 0:
+        return jsonify({"ok": False, "error": "Position size must be greater than 0"}), 400
+    if size_usd > _TM.balance * 0.9:
+        return jsonify({"ok": False, "error": f"Position size ${size_usd:.2f} exceeds 90% of available "
+                                               f"balance (${_TM.balance:.2f}) — reduce the size"}), 400
+    if not (0.0005 <= sl_pct <= 0.25):
+        return jsonify({"ok": False, "error": "Stop-loss % must be between 0.05% and 25% (e.g. 0.01 = 1%)"}), 400
+    if not (0.001 <= tp_pct <= 1.0):
+        return jsonify({"ok": False, "error": "Take-profit % must be between 0.1% and 100% (e.g. 0.03 = 3%)"}), 400
+
+    # Always execute at the live price right now — never the (possibly
+    # stale) price the signal was shown with in the dropdown. Same
+    # philosophy as the autonomous engine's execution-time repricing.
+    px = _BOT.data.get_price(symbol)
+    if px is None:
+        return jsonify({"ok": False, "error": f"Could not fetch a live price for {symbol} — check the symbol is valid for the current market mode"}), 400
+
+    if side == "BUY":
+        sl = round(px * (1 - sl_pct), 6)
+        tp = round(px * (1 + tp_pct), 6)
+        geometry_ok = 0 < sl < px < tp
+    else:
+        sl = round(px * (1 + sl_pct), 6)
+        tp = round(px * (1 - tp_pct), 6)
+        geometry_ok = 0 < tp < px < sl
+    if not geometry_ok:
+        return jsonify({"ok": False, "error": f"Invalid SL/TP at current price ${px:.6f} — check your % values"}), 400
+
+    size_base = size_usd / px
+    sig = {"side": side, "price": px, "sl": sl, "tp": tp,
+           "confidence": CONFIG["min_confidence_to_trade"],  # manual trades don't carry a scan-derived score
+           "reasons": [f"Manually opened by admin ({source})" if source else "Manually opened by admin"]}
+    ai = {"action": "MANUAL", "confidence_adjustment": 0, "risk_level": "MANUAL",
+          "analysis": f"Manually opened — source: {source or 'manual'}"}
+
+    m = (CONFIG.get("market_mode") or "CRYPTO").strip().upper()
+    trade = _TM.open_trade(symbol, sig, ai, market=m, allow_duplicate=True,
+                           override_size=size_base, opened_by="manual", manual_source=source)
+    if trade:
+        return jsonify({"ok": True, "trade": _clean_trade(trade)})
+    return jsonify({"ok": False, "error": f"Could not open trade — max open trades "
+                                           f"({CONFIG['max_open_trades']}) reached"}), 400
 
 # ── Settings — profile ────────────────────────────────────────
 @app.route("/api/settings/profile", methods=["GET","POST"])
@@ -3342,7 +4002,9 @@ def main():
         _paper_toggle()
         _interval_prompt()
 
-    syms = CONFIG["crypto_symbols"] if CONFIG["market_mode"]=="CRYPTO" else CONFIG["stock_symbols"]
+    syms = (CONFIG["crypto_symbols"] if CONFIG["market_mode"]=="CRYPTO"
+            else CONFIG["forex_symbols"] if CONFIG["market_mode"]=="FOREX"
+            else CONFIG["stock_symbols"])
     port = CONFIG["web_port"]
 
     _section("🚀 STARTING")

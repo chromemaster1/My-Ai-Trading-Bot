@@ -105,9 +105,12 @@ function renderHeader(){
   $('live-mode-pill').style.background = modeBg;
   $('live-exchange').textContent = live.exchange || '—';
   $('live-balance').textContent = live.connected ? '$'+Number(live.balance||0).toLocaleString('en',{minimumFractionDigits:2,maximumFractionDigits:2}) : '$0.00';
-  const liveStatusText = live.connected ? 'Linked' : (live.linked ? 'Connected' : 'Disconnected');
+  // "connected" = credentials genuinely validated against the exchange.
+  // "linked" = credentials saved but not (yet) validated — a distinct,
+  // weaker state that must never be presented as "Connected".
+  const liveStatusText = live.connected ? 'Connected' : (live.linked ? 'Not validated' : 'Disconnected');
   $('live-status').textContent = liveStatusText;
-  $('live-status').style.color = live.connected ? 'var(--a)' : (live.linked ? 'var(--yd)' : 'var(--red)');
+  $('live-status').style.color = live.connected ? 'var(--a)' : (live.linked ? 'var(--yellow)' : 'var(--red)');
   if(S.scan_count)
     $('scan-info').textContent=`Last scan: ${(S.log||[])[0]?.ts||'—'} | ${S.scan_count} scans completed`;
 }

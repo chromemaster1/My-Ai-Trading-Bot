@@ -137,6 +137,26 @@
 
     <!-- RIGHT: withdrawal form -->
     <div>
+      <div class="card" id="transfer-card" style="display:none">
+        <div class="card-title">Move Funds: Trading → Funding Wallet</div>
+        <p style="font-size:12px;color:var(--m);line-height:1.6;margin-bottom:14px">
+          Most exchanges hold trading balance separately from the withdrawable
+          funding wallet. If a withdrawal fails with an insufficient-balance
+          error even though your trading account shows funds, move them here
+          first — this is a real internal transfer on your exchange, not
+          simulated.
+        </p>
+        <div class="fg" style="margin-bottom:10px">
+          <label>Amount (USDT)</label>
+          <input type="number" id="xfer-amount" placeholder="0.00" min="1" step="0.01">
+        </div>
+        <button class="btn btn-outline" onclick="transferToFunding()" id="xfer-btn" style="width:100%;justify-content:center">
+          ↔ Move to Funding Wallet
+        </button>
+        <div class="alert alert-ok" id="xfer-ok"></div>
+        <div class="alert alert-err" id="xfer-err"></div>
+      </div>
+
       <div class="card">
         <div class="card-title">Withdraw USDT</div>
 
@@ -361,6 +381,9 @@ function renderHero(){
   }
   $('hero-sync').textContent='Last sync: '+(W.live_last_sync
     ?new Date(W.live_last_sync).toLocaleTimeString():'—');
+
+  const xferCard = $('transfer-card');
+  if(xferCard) xferCard.style.display = (W.is_live && W.live_connected) ? 'block' : 'none';
 }
 
 function renderAccountStrip(){
@@ -491,6 +514,31 @@ async function submitWithdrawal(){
   }catch(e){showWErr('Network error: '+e);}
   btn.disabled=false; btn.textContent='Confirm withdrawal';
 }
+
+async function transferToFunding(){
+  const btn=$('xfer-btn');
+  const amount=parseFloat($('xfer-amount').value||0);
+  hideAlerts('xfer');
+  if(!amount||amount<=0){ showXferErr('Enter a valid amount'); return; }
+  btn.disabled=true; btn.textContent='Moving…';
+  try{
+    const r=await fetch('/api/wallet/transfer',{
+      method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({amount})
+    });
+    const d=await r.json();
+    if(d.ok){
+      showXferOk(`✅ Moved $${fmt(amount)} to funding wallet`);
+      $('xfer-amount').value='';
+      setTimeout(loadAll,800);
+    }else{
+      showXferErr(d.error||'Transfer failed');
+    }
+  }catch(e){ showXferErr('Network error: '+e); }
+  btn.disabled=false; btn.textContent='↔ Move to Funding Wallet';
+}
+function showXferOk(msg){const e=$('xfer-ok');e.textContent=msg;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),5000)}
+function showXferErr(msg){const e=$('xfer-err');e.textContent='❌ '+msg;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),5000)}
 
 async function syncBalance(){
   try{
