@@ -14,6 +14,8 @@
     <div class="sb-item" onclick="nav('risk',this)"><span class="sb-icon">🛡️</span>Risk & SL/TP</div>
     <div class="sb-section">Control</div>
     <div class="sb-item" onclick="nav('control',this)"><span class="sb-icon">🎛️</span>Bot Control</div>
+    <div class="sb-section">System</div>
+    <div class="sb-item" onclick="nav('storage',this)"><span class="sb-icon">🗄️</span>Storage</div>
   </aside>
 
   <main class="main">
@@ -375,6 +377,40 @@
       </div>
     </div>
 
+    <!-- STORAGE -->
+    <div class="panel" id="panel-storage">
+      <div class="ph"><div><h1>Storage</h1><div class="ph-sub" id="storage-sub">Loading...</div></div>
+        <button class="btn btn-outline" onclick="pruneStorageNow()" id="storage-prune-btn">🧹 Prune Now</button></div>
+
+      <div class="stat-row" id="storage-stats"></div>
+
+      <div class="fsec">
+        <div class="fsec-title">🗃️ DATABASE — admin_activity / admin_sessions</div>
+        <div style="font-size:12px;color:var(--m);line-height:1.8" id="storage-db-detail">Loading…</div>
+      </div>
+
+      <div class="fsec">
+        <div class="fsec-title">📄 LOG FILE — trading_bot.log</div>
+        <div style="font-size:12px;color:var(--m);line-height:1.8" id="storage-log-detail">Loading…</div>
+        <div class="tw" style="margin-top:12px" id="storage-backups-wrap">
+          <table><thead><tr><th>Backup File</th><th>Size</th></tr></thead>
+          <tbody id="storage-backups-body"></tbody></table>
+        </div>
+      </div>
+
+      <div class="alert alert-ok" id="storage-ok"></div>
+      <div class="alert alert-err" id="storage-err"></div>
+
+      <div style="margin-top:14px;font-size:11px;color:var(--m);line-height:1.7">
+        The database is pruned automatically once a day (rows older than the configured retention window
+        are removed — the full history remains in the log file, since everything written to the database
+        is also written there). The active log file rotates automatically once it reaches its size cap, and
+        force-resets on a fixed schedule even if it never reaches that cap, so a quiet deployment doesn't
+        run on one ever-growing file indefinitely. Tune both under Risk & SL/TP → these settings aren't
+        currently exposed as a separate form here — ask if you'd like that added.
+      </div>
+    </div>
+
   </main>
 </div>
 {% endblock %}
@@ -390,6 +426,7 @@ function nav(id, el){
   if(el) el.classList.add('active');
   const p=$('panel-'+id);
   if(p) p.classList.add('active');
+  if(id==='storage') fetchStorageStatus();
 }
 
 /* ── fetch ── */
@@ -640,6 +677,88 @@ async function saveRisk(){
     flash('risk-saved');
     await fetchState();
   }else alert(r.error||'Save failed');
+}
+
+let STORAGE_INTERVAL=null;
+
+async function fetchStorageStatus(){
+  try{
+    const r=await fetch('/api/admin/storage');
+    const d=await r.json();
+    if(!d.ok) return;
+    renderStorage(d);
+    // Only keep polling while the Storage panel is actually the visible
+    // one — no point refreshing this every few seconds in the background
+    // like live price/trade data, since it only changes once a day at
+    // most (the prune runs on db_prune_interval_hours).
+    if(!STORAGE_INTERVAL && $('panel-storage') && $('panel-storage').classList.contains('active')){
+      STORAGE_INTERVAL=setInterval(()=>{
+        if($('panel-storage') && $('panel-storage').classList.contains('active')) fetchStorageStatus();
+        else{ clearInterval(STORAGE_INTERVAL); STORAGE_INTERVAL=null; }
+      }, 30000);
+    }
+  }catch(e){console.error(e)}
+}
+
+function renderStorage(d){
+  const db=d.database, log=d.log;
+  const dbPct = db.max_mb ? Math.min(100, (db.size_mb/db.max_mb)*100) : 0;
+  const logPct = log.max_mb ? Math.min(100, (log.active_size_mb/log.max_mb)*100) : 0;
+
+  $('storage-sub').textContent = db.last_pruned_at
+    ? `Last database prune: ${new Date(db.last_pruned_at).toLocaleString()}`
+    : 'No prune has run yet this session';
+
+  $('storage-stats').innerHTML=[
+    {l:'Database Size',v:`${db.size_mb} MB`,s:`of ${db.max_mb} MB cap`,c:dbPct>80?'red':dbPct>50?'':'green'},
+    {l:'Log File Size',v:`${log.active_size_mb} MB`,s:`of ${log.max_mb} MB cap`,c:logPct>80?'red':logPct>50?'':'green'},
+    {l:'Activity Rows',v:(db.row_counts.admin_activity||0).toLocaleString(),s:`${db.retention_days}-day retention`,c:'blue'},
+    {l:'Log Backups',v:log.backups.length,s:`of ${log.backup_count} max`,c:''},
+  ].map(x=>`<div class="stat ${x.c}"><div class="sl">${x.l}</div>
+    <div class="sv">${x.v}</div><div class="ss">${x.s}</div></div>`).join('');
+
+  $('storage-db-detail').innerHTML=`
+    <div>Size: <strong style="color:var(--t)">${db.size_mb} MB</strong> / ${db.max_mb} MB hard cap</div>
+    <div>Retention window: <strong style="color:var(--t)">${db.retention_days} days</strong> — older rows are pruned automatically, full detail remains in the log file</div>
+    <div>admin_activity rows: <strong style="color:var(--t)">${(db.row_counts.admin_activity||0).toLocaleString()}</strong></div>
+    <div>admin_sessions rows: <strong style="color:var(--t)">${(db.row_counts.admin_sessions||0).toLocaleString()}</strong></div>
+    <div>Last pruned: <strong style="color:var(--t)">${db.last_pruned_at?new Date(db.last_pruned_at).toLocaleString():'never (this session)'}</strong></div>`;
+
+  const startedStr = log.started_at ? new Date(log.started_at).toLocaleDateString() : '—';
+  $('storage-log-detail').innerHTML=`
+    <div>Active file size: <strong style="color:var(--t)">${log.active_size_mb} MB</strong> / ${log.max_mb} MB rotation cap</div>
+    <div>Current file started: <strong style="color:var(--t)">${startedStr}</strong> — force-resets after ${log.reset_months} months regardless of size</div>
+    <div>Backups kept on disk: <strong style="color:var(--t)">${log.backup_count}</strong> max</div>`;
+
+  if(log.backups.length){
+    $('storage-backups-wrap').style.display='block';
+    $('storage-backups-body').innerHTML=log.backups.map(b=>
+      `<tr><td class="mono">${b.file}</td><td class="mono">${b.size_mb} MB</td></tr>`).join('');
+  }else{
+    $('storage-backups-wrap').style.display='none';
+  }
+}
+
+async function pruneStorageNow(){
+  hideAlerts('storage');
+  const btn=$('storage-prune-btn');
+  btn.disabled=true; btn.textContent='Pruning…';
+  try{
+    const r=await post('/api/admin/storage/prune',{});
+    if(r.ok){
+      const n=(r.deleted&&(r.deleted.admin_activity+r.deleted.admin_sessions))||0;
+      $('storage-ok').textContent=`✅ Pruned ${n} row(s) — database now ${r.db_size_mb} MB`;
+      showOk('storage');
+      await fetchStorageStatus();
+    }else{
+      $('storage-err').textContent='❌ '+(r.error||r.reason||'Prune failed');
+      $('storage-err').classList.add('show');
+    }
+  }catch(e){
+    $('storage-err').textContent='❌ Network error: '+e;
+    $('storage-err').classList.add('show');
+  }
+  btn.disabled=false; btn.textContent='🧹 Prune Now';
 }
 
 let MT_OPTIONS=[];

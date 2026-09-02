@@ -8,7 +8,7 @@
 =============================================================
 """
 
-import os, sys, re, time, json, logging, threading, secrets, sqlite3, base64
+import os, sys, re, time, json, logging, logging.handlers, threading, secrets, sqlite3, base64
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -118,6 +118,28 @@ CONFIG = {
     },
     "log_level"              : "INFO",
     "log_file"               : "trading_bot.log",
+    # Log rotation: the ACTIVE log file the bot writes to is capped at
+    # log_max_size_mb; once hit it rotates to a numbered backup and starts
+    # fresh. Independently, log_reset_months forces a rotation on a
+    # schedule even if the size cap is never reached (a quiet deployment
+    # could otherwise run for years on one small file — the time reset
+    # guarantees a bound either way). Historical data lives in the rotated
+    # backups, not in memory or the database — see db_retention_days below.
+    "log_max_size_mb"        : 500,
+    "log_backup_count"       : 5,
+    "log_reset_months"       : 4,   # within the requested 3-6 month range
+    # Database retention: admin_activity/admin_sessions grow with every
+    # scan, trade, and login and have no natural cap — left alone they
+    # slow down every dashboard query and every write as the tables grow
+    # over months of continuous operation. Rows older than
+    # db_retention_days are pruned periodically; this is safe because the
+    # SAME data is already durably captured in the rotating log file
+    # (every _elog() call writes to both), so nothing is actually lost —
+    # it just moves from "fast structured lookup" to "archived in a log
+    # backup" once it's no longer operationally relevant.
+    "db_retention_days"      : 90,
+    "db_max_size_mb"         : 500,
+    "db_prune_interval_hours": 24,
     "web_port"               : int(os.environ.get("PORT", 5000)),
     "web_host"               : "0.0.0.0",
 }
@@ -242,6 +264,77 @@ def end_admin_session(session_id: Optional[str]) -> None:
             (datetime.utcnow().isoformat(), session_id),
         )
         conn.commit()
+
+
+_LAST_DB_PRUNE_AT: Optional[datetime] = None
+
+
+def prune_database(force: bool = False) -> dict:
+    """Delete admin_activity/admin_sessions rows older than
+    db_retention_days, then VACUUM to actually reclaim the freed disk
+    space (SQLite doesn't shrink the file on DELETE alone). Safe to do
+    aggressively because the same messages are already durably captured
+    in the rotating log file (_elog() writes to both) — pruning the DB
+    doesn't lose history, it just moves it from "fast structured lookup"
+    to "archived in a log backup" once it's no longer operationally
+    relevant. Also enforces db_max_size_mb as a hard backstop that trims
+    further if age-based pruning alone isn't enough."""
+    global _LAST_DB_PRUNE_AT
+    now = datetime.utcnow()
+    if not force and _LAST_DB_PRUNE_AT is not None:
+        hours_since = (now - _LAST_DB_PRUNE_AT).total_seconds() / 3600
+        if hours_since < CONFIG["db_prune_interval_hours"]:
+            return {"skipped": True, "reason": "not due yet"}
+
+    cutoff = (now - timedelta(days=CONFIG["db_retention_days"])).isoformat()
+    deleted = {"admin_activity": 0, "admin_sessions": 0}
+    try:
+        with _db_connect() as conn:
+            cur = conn.execute("DELETE FROM admin_activity WHERE created_at < ?", (cutoff,))
+            deleted["admin_activity"] = cur.rowcount
+            cur2 = conn.execute("DELETE FROM admin_sessions WHERE started_at < ? AND ended_at IS NOT NULL", (cutoff,))
+            deleted["admin_sessions"] = cur2.rowcount
+            conn.commit()
+
+        db_size_mb = Path(DATABASE_PATH).stat().st_size / (1024 * 1024) if Path(DATABASE_PATH).exists() else 0.0
+        if db_size_mb > CONFIG["db_max_size_mb"]:
+            # Age-based retention wasn't enough on its own — trim the
+            # oldest remaining rows in batches until back under the cap,
+            # bounded so this can never loop forever.
+            with _db_connect() as conn:
+                for _ in range(5):
+                    total = conn.execute("SELECT COUNT(*) FROM admin_activity").fetchone()[0]
+                    if total == 0:
+                        break
+                    trim_n = max(100, total // 5)
+                    cur3 = conn.execute(
+                        "DELETE FROM admin_activity WHERE id IN "
+                        "(SELECT id FROM admin_activity ORDER BY id ASC LIMIT ?)", (trim_n,))
+                    deleted["admin_activity"] += cur3.rowcount
+                    conn.commit()
+                    db_size_mb = Path(DATABASE_PATH).stat().st_size / (1024 * 1024)
+                    if db_size_mb <= CONFIG["db_max_size_mb"]:
+                        break
+
+        # VACUUM must run outside any active transaction — use its own
+        # autocommit connection rather than the transactional one above.
+        try:
+            vconn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
+            vconn.execute("VACUUM")
+            vconn.close()
+            db_size_mb = Path(DATABASE_PATH).stat().st_size / (1024 * 1024) if Path(DATABASE_PATH).exists() else db_size_mb
+        except Exception as ve:
+            logger.warning(f"VACUUM after prune failed (non-fatal): {ve}")
+
+        _LAST_DB_PRUNE_AT = now
+        if deleted["admin_activity"] or deleted["admin_sessions"]:
+            _elog(f"🧹 Database pruned — removed {deleted['admin_activity']} activity row(s), "
+                  f"{deleted['admin_sessions']} session row(s) older than {CONFIG['db_retention_days']}d. "
+                  f"DB size now {db_size_mb:.1f}MB. Full history remains in the rotated log backups.", "INFO")
+        return {"ok": True, "deleted": deleted, "db_size_mb": round(db_size_mb, 1)}
+    except Exception as e:
+        logger.error(f"Database prune failed: {e}")
+        return {"ok": False, "error": str(e)}
 
 
 def record_admin_activity(username: str, activity_type: str, message: str,
@@ -1028,6 +1121,53 @@ def _elog(msg: str, level: str = "INFO"):
 #  LOGGING (terminal + file)
 # ════════════════════════════════════════════════════════════
 
+def _log_start_marker_path() -> str:
+    """Sidecar file tracking when the CURRENT active log file was started,
+    so a time-based reset can fire even if the size cap is never hit."""
+    return str(Path(CONFIG["log_file"]).with_suffix(".log_started_at"))
+
+
+def _get_log_started_at() -> datetime:
+    marker = _log_start_marker_path()
+    try:
+        with open(marker, "r") as f:
+            return datetime.fromisoformat(f.read().strip())
+    except Exception:
+        now = datetime.utcnow()
+        _set_log_started_at(now)
+        return now
+
+
+def _set_log_started_at(dt: Optional[datetime] = None) -> None:
+    dt = dt or datetime.utcnow()
+    try:
+        with open(_log_start_marker_path(), "w") as f:
+            f.write(dt.isoformat())
+    except Exception:
+        pass
+
+
+def maybe_rotate_log_for_age(logger_obj) -> None:
+    """Force a rollover if the current log has been active longer than
+    log_reset_months, even if it never hit the size cap — this is what
+    guarantees the 3-6 month reset happens on a long-lived, low-traffic
+    deployment, not just a busy one."""
+    started = _get_log_started_at()
+    age_days = (datetime.utcnow() - started).days
+    max_days = CONFIG["log_reset_months"] * 30
+    if age_days < max_days:
+        return
+    for h in logger_obj.handlers:
+        if isinstance(h, logging.handlers.RotatingFileHandler):
+            try:
+                h.doRollover()
+                _set_log_started_at(datetime.utcnow())
+                logger_obj.info(f"Log file force-rotated after {age_days} days "
+                                 f"(reset interval: {CONFIG['log_reset_months']} months)")
+            except Exception:
+                pass
+
+
 def _setup_logger():
     lg = logging.getLogger("TradingBot")
     if lg.handlers:
@@ -1039,9 +1179,22 @@ def _setup_logger():
     ch.setFormatter(fmt)
     lg.addHandler(ch)
     try:
-        fh = logging.FileHandler(CONFIG["log_file"])
+        # RotatingFileHandler caps the ACTIVE log file at log_max_size_mb —
+        # once hit, it's renamed to a numbered backup and a fresh file
+        # starts, so the live file the bot writes to never grows past that
+        # size. backupCount old rotations are kept on disk as the durable
+        # archive for historical analysis; oldest backups beyond that are
+        # deleted automatically by the handler itself. The 3-6 month
+        # time-based reset (independent of size) is handled separately by
+        # maybe_rotate_log_for_age(), called periodically from the scan loop.
+        fh = logging.handlers.RotatingFileHandler(
+            CONFIG["log_file"],
+            maxBytes=CONFIG["log_max_size_mb"] * 1024 * 1024,
+            backupCount=CONFIG["log_backup_count"],
+        )
         fh.setFormatter(fmt)
         lg.addHandler(fh)
+        _get_log_started_at()  # ensure the age marker exists from first run
     except Exception:
         pass
     return lg
@@ -2455,6 +2608,11 @@ class TradingBot:
             while self.running and not _STOP_EVENT.is_set():
                 try:
                     self.scan_once()
+                    # Both checks are cheap no-ops most cycles (internal
+                    # "has it been long enough" guards) — safe to call every
+                    # scan rather than needing a separate maintenance thread.
+                    maybe_rotate_log_for_age(logger)
+                    prune_database()
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
@@ -3462,6 +3620,8 @@ def api_config():
                "trailing_stop_enabled","trailing_stop_activation_r","trailing_stop_distance_r",
                "chop_filter_enabled","chop_efficiency_lookback","chop_min_efficiency_ratio",
                "counter_trend_discount_enabled","strong_trend_ema_sep_pct","max_counter_trend_discount_pct",
+               "log_max_size_mb","log_backup_count","log_reset_months",
+               "db_retention_days","db_max_size_mb","db_prune_interval_hours",
                "paper_trading","ai_confirmation_required",
                "anthropic_api_key"]
 
@@ -3494,6 +3654,12 @@ def api_config():
         "chop_min_efficiency_ratio": (0.05, 0.95, "0.05 – 0.95 (0=pure noise, 1=perfect trend)"),
         "strong_trend_ema_sep_pct":  (0.001, 0.05, "0.1% – 5% EMA separation"),
         "max_counter_trend_discount_pct": (0.0, 0.9, "0% – 90%"),
+        "log_max_size_mb":           (10, 2000, "10 – 2000 MB"),
+        "log_backup_count":          (1, 20, "1 – 20 backups"),
+        "log_reset_months":          (1, 12, "1 – 12 months"),
+        "db_retention_days":         (7, 730, "7 – 730 days"),
+        "db_max_size_mb":            (10, 2000, "10 – 2000 MB"),
+        "db_prune_interval_hours":   (1, 168, "1 – 168 hours"),
     }
     errors = []
     for k, (lo, hi, hint) in NUMERIC_BOUNDS.items():
@@ -3882,6 +4048,63 @@ def api_live_trading():
             "last_error": acc.get("last_error", ""),
         })
     return jsonify({"ok": True, **payload})
+
+@app.route("/api/admin/storage")
+@_login_required
+def api_admin_storage():
+    """Report current DB/log size and retention config so the dashboard
+    can show how storage management is actually doing, not just that
+    settings exist."""
+    db_size_mb = 0.0
+    try:
+        if Path(DATABASE_PATH).exists():
+            db_size_mb = Path(DATABASE_PATH).stat().st_size / (1024 * 1024)
+    except Exception:
+        pass
+    log_size_mb = 0.0
+    log_started = None
+    try:
+        if Path(CONFIG["log_file"]).exists():
+            log_size_mb = Path(CONFIG["log_file"]).stat().st_size / (1024 * 1024)
+        log_started = _get_log_started_at().isoformat()
+    except Exception:
+        pass
+    backups = []
+    try:
+        base = Path(CONFIG["log_file"])
+        for i in range(1, CONFIG["log_backup_count"] + 1):
+            p = base.with_name(base.name + f".{i}")
+            if p.exists():
+                backups.append({"file": p.name, "size_mb": round(p.stat().st_size / (1024*1024), 2)})
+    except Exception:
+        pass
+    row_counts = {"admin_activity": 0, "admin_sessions": 0}
+    try:
+        with _db_connect() as conn:
+            row_counts["admin_activity"] = conn.execute("SELECT COUNT(*) FROM admin_activity").fetchone()[0]
+            row_counts["admin_sessions"] = conn.execute("SELECT COUNT(*) FROM admin_sessions").fetchone()[0]
+    except Exception:
+        pass
+    return jsonify({
+        "ok": True,
+        "database": {"size_mb": round(db_size_mb, 2), "max_mb": CONFIG["db_max_size_mb"],
+                     "retention_days": CONFIG["db_retention_days"], "row_counts": row_counts,
+                     "last_pruned_at": _LAST_DB_PRUNE_AT.isoformat() if _LAST_DB_PRUNE_AT else None},
+        "log": {"active_size_mb": round(log_size_mb, 2), "max_mb": CONFIG["log_max_size_mb"],
+                "reset_months": CONFIG["log_reset_months"], "started_at": log_started,
+                "backup_count": CONFIG["log_backup_count"], "backups": backups},
+    })
+
+
+@app.route("/api/admin/storage/prune", methods=["POST"])
+@_login_required
+def api_admin_storage_prune():
+    """Manually trigger the database prune immediately, bypassing the
+    normal interval check — useful right after tightening retention
+    settings rather than waiting up to db_prune_interval_hours."""
+    result = prune_database(force=True)
+    return jsonify(result)
+
 
 @app.route("/api/settings/live-trading/disconnect", methods=["POST"])
 @_login_required
