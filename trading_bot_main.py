@@ -97,6 +97,19 @@ CONFIG = {
     "chop_filter_enabled"        : True,
     "chop_efficiency_lookback"   : 10,    # bars used to compute the Efficiency Ratio
     "chop_min_efficiency_ratio"  : 0.30,  # below this, new entries are capped below threshold (0=pure noise, 1=perfectly efficient trend)
+    # Chop high-conviction override: during chop, a trade can still open
+    # if EVERY core signal agrees simultaneously (RSI + swing + EMA trend +
+    # RSI-confirm), a much higher bar than the normal point-threshold used
+    # in a trending market. Volume surge is the flakiest of these to
+    # reliably detect on some symbols/exchanges, so it's separately
+    # toggleable rather than a hard requirement baked into the others.
+    "chop_confluence_require_volume_surge": True,
+    # Any OPEN trade on a symbol that's CURRENTLY choppy (recomputed every
+    # scan, not frozen at entry) uses this many confirmation scans instead
+    # of the normal signal_exit_confirmations — fast invalidation since
+    # chop is inherently less predictable. The moment that symbol is no
+    # longer choppy, normal confirmation count resumes automatically.
+    "chop_exit_confirmations"    : 1,
     # Counter-trend discount: scales down a signal that's fighting the
     # prevailing EMA trend, proportional to how established that trend is.
     # Targets the finding that SELL signals underperformed specifically on
@@ -1574,7 +1587,7 @@ class TechnicalAnalysis:
 
     def signal(self, df: pd.DataFrame) -> dict:
         if len(df) < 50:
-            return {"side":"HOLD","confidence":0,"reasons":["Insufficient data"]}
+            return {"side":"HOLD","confidence":0,"reasons":["Insufficient data"],"is_chop":False}
         last = df.iloc[-1]; prev = df.iloc[-2]
         px  = float(last["close"])
         rf  = float(last[f"rsi_{self.fast}"])
@@ -1683,25 +1696,50 @@ class TechnicalAnalysis:
                                     f"(EMA sep {ema_sep_pct*100:.2f}%, downtrend)")
 
         min_conf = CONFIG["min_confidence_to_trade"]
-        # ── Chop cap ── if the market hasn't been moving efficiently
-        # (lots of back-and-forth, little net progress), cap BOTH sides
-        # below the entry threshold so no NEW trade can open on this
-        # scan, regardless of how strong the other confirming factors
-        # look — those factors are exactly what got fooled by chop
-        # historically. This never touches trades already open.
+        # ── Chop handling ── two behaviours depending on confluence:
+        #   1) Full agreement across EVERY core signal simultaneously (not
+        #      just a point total clearing the normal threshold) still
+        #      opens a trade even during chop — this is deliberately a much
+        #      higher bar than a normal trending-market entry. Trade-off:
+        #      far fewer chop-period entries, each one much more selective.
+        #   2) Anything less than full agreement gets capped below
+        #      threshold exactly as before — those partial-agreement setups
+        #      are exactly what got fooled by chop historically.
+        # is_chop is returned in the signal dict either way so the exit
+        # management side (scan_once) can apply faster invalidation to any
+        # OPEN trade while its symbol is currently choppy — recomputed
+        # fresh every scan, so the moment chop clears, both entry and exit
+        # behaviour revert to the normal strategy automatically.
+        is_chop = bool(CONFIG["chop_filter_enabled"] and efficiency_ratio < CONFIG["chop_min_efficiency_ratio"])
         chop_capped = False
-        if CONFIG["chop_filter_enabled"] and efficiency_ratio < CONFIG["chop_min_efficiency_ratio"]:
+        chop_override = False
+        if is_chop:
+            vol_ok = vs or not CONFIG["chop_confluence_require_volume_surge"]
+            buy_confluence = (rf < CONFIG["rsi_oversold"] and abs(px-sl)/px < 0.012
+                               and et == 1 and rc > 52 and vol_ok)
+            sell_confluence = (rf > CONFIG["rsi_overbought"] and abs(px-sh)/px < 0.012
+                                and et == -1 and rc < 48 and vol_ok)
             cap = max(0, min_conf - 1)
-            if buy > cap or sell > cap:
-                chop_capped = True
-                if buy > cap:
+            if buy > cap:
+                if buy_confluence:
+                    chop_override = True
+                    reasons_buy.append(f"⚡ Chop high-conviction override (ER={efficiency_ratio:.2f}) — "
+                                        f"RSI oversold + swing low + uptrend + RSI({self.confirm}) + volume all agree")
+                else:
+                    chop_capped = True
+                    buy = min(buy, cap)
                     reasons_buy.append(f"⚠️ Capped — choppy market (ER={efficiency_ratio:.2f} "
-                                        f"< {CONFIG['chop_min_efficiency_ratio']:.2f})")
-                if sell > cap:
+                                        f"< {CONFIG['chop_min_efficiency_ratio']:.2f}), full confluence not met")
+            if sell > cap:
+                if sell_confluence:
+                    chop_override = True
+                    reasons_sell.append(f"⚡ Chop high-conviction override (ER={efficiency_ratio:.2f}) — "
+                                         f"RSI overbought + swing high + downtrend + RSI({self.confirm}) + volume all agree")
+                else:
+                    chop_capped = True
+                    sell = min(sell, cap)
                     reasons_sell.append(f"⚠️ Capped — choppy market (ER={efficiency_ratio:.2f} "
-                                         f"< {CONFIG['chop_min_efficiency_ratio']:.2f})")
-                buy = min(buy, cap)
-                sell = min(sell, cap)
+                                         f"< {CONFIG['chop_min_efficiency_ratio']:.2f}), full confluence not met")
         sl_floor = CONFIG["stop_loss_pct"]
         tp_floor = CONFIG["take_profit_pct"]
         # Hard 4:1 reward:risk guarantee regardless of ATR adjustment
@@ -1733,9 +1771,9 @@ class TechnicalAnalysis:
                       f"sl=${sl_p:.4f} tp=${tp_p:.4f}) — check stop_loss_pct/"
                       f"take_profit_pct in Risk settings", "ERROR")
                 return {"side":"HOLD","confidence":0,
-                        "reasons":["Rejected: invalid SL/TP configuration"],"price":px}
+                        "reasons":["Rejected: invalid SL/TP configuration"],"price":px,"is_chop":is_chop}
             return {"side":"BUY","confidence":conf,"reasons":reasons_buy,
-                    "price":px,"sl":sl_p,"tp":tp_p,
+                    "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
                     "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh}
 
         if sell > buy and sell >= min_conf:
@@ -1754,13 +1792,13 @@ class TechnicalAnalysis:
                       f"sl=${sl_p:.4f} tp=${tp_p:.4f}) — check stop_loss_pct/"
                       f"take_profit_pct in Risk settings", "ERROR")
                 return {"side":"HOLD","confidence":0,
-                        "reasons":["Rejected: invalid SL/TP configuration"],"price":px}
+                        "reasons":["Rejected: invalid SL/TP configuration"],"price":px,"is_chop":is_chop}
             return {"side":"SELL","confidence":conf,"reasons":reasons_sell,
-                    "price":px,"sl":sl_p,"tp":tp_p,
+                    "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
                     "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh}
 
         return {"side":"HOLD","confidence":max(buy,sell),
-                "reasons":reasons_buy if buy>=sell else reasons_sell,"price":px}
+                "reasons":reasons_buy if buy>=sell else reasons_sell,"price":px,"is_chop":is_chop}
 
 # ════════════════════════════════════════════════════════════
 #  AI ANALYZER
@@ -2315,7 +2353,17 @@ class TradingBot:
                                        and sig_open.get("confidence", 0) >= required_conf)
 
                     if trade is not None:
-                        needed = CONFIG["signal_exit_confirmations"]
+                        # Fast invalidation while this symbol is CURRENTLY
+                        # choppy (recomputed fresh every scan from sig_open,
+                        # never frozen at entry) — chop is inherently less
+                        # predictable, so a trade sitting on one gets cut
+                        # on a single unconfirmed scan instead of waiting
+                        # for the normal 2-in-a-row confirmation. The moment
+                        # this symbol is no longer choppy, normal management
+                        # resumes automatically on the very next scan — no
+                        # separate mode to manually turn back off.
+                        in_chop_now = bool(sig_open.get("is_chop"))
+                        needed = CONFIG["chop_exit_confirmations"] if in_chop_now else CONFIG["signal_exit_confirmations"]
                         if still_valid:
                             if trade.get("signal_loss_strikes", 0) > 0:
                                 _elog(f"↩️ {sym}: direction re-confirmed — clearing "
@@ -2338,6 +2386,8 @@ class TradingBot:
                             else:
                                 reason = (f"confidence dropped to {sig_open.get('confidence',0):.0f}% "
                                           f"(< {min_conf}% required)")
+                            if in_chop_now:
+                                reason += f" [chop — fast {needed}-scan invalidation active]"
                             if strikes < needed:
                                 # First (or Nth-but-not-final) unconfirmed
                                 # scan — flag it, but don't close yet. SL/TP
@@ -3619,6 +3669,7 @@ def api_config():
                "profit_lock_enabled","profit_lock_r_multiple","relax_exit_after_profit_lock",
                "trailing_stop_enabled","trailing_stop_activation_r","trailing_stop_distance_r",
                "chop_filter_enabled","chop_efficiency_lookback","chop_min_efficiency_ratio",
+               "chop_confluence_require_volume_surge","chop_exit_confirmations",
                "counter_trend_discount_enabled","strong_trend_ema_sep_pct","max_counter_trend_discount_pct",
                "log_max_size_mb","log_backup_count","log_reset_months",
                "db_retention_days","db_max_size_mb","db_prune_interval_hours",
@@ -3652,6 +3703,7 @@ def api_config():
         "trailing_stop_distance_r":  (0.1, 3.0, "0.1 – 3.0 (multiples of initial risk)"),
         "chop_efficiency_lookback":  (3, 50, "3 – 50 bars"),
         "chop_min_efficiency_ratio": (0.05, 0.95, "0.05 – 0.95 (0=pure noise, 1=perfect trend)"),
+        "chop_exit_confirmations":   (1, 5, "1 – 5 consecutive scans"),
         "strong_trend_ema_sep_pct":  (0.001, 0.05, "0.1% – 5% EMA separation"),
         "max_counter_trend_discount_pct": (0.0, 0.9, "0% – 90%"),
         "log_max_size_mb":           (10, 2000, "10 – 2000 MB"),
