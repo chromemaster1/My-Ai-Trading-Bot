@@ -1864,9 +1864,14 @@ class AIAnalyzer:
 
     def analyze(self, symbol: str, sig: dict, df: pd.DataFrame) -> dict:
         key = CONFIG["anthropic_api_key"]
+        # AI is an enhancement, not a hard dependency.  If no API key is
+        # configured, explicitly report AI as unavailable so the caller can
+        # fall back to the validated technical strategy instead of pretending
+        # that an AI confirmation occurred.
         if not key:
-            return {"action":"CONFIRM","confidence_adjustment":0,
-                    "analysis":"No API key — skipped.","risk_level":"MEDIUM"}
+            return {"action":None,"ai_available":False,"confidence_adjustment":0,
+                    "analysis":"AI not connected — technical strategy only.",
+                    "risk_level":"MEDIUM","error":"No Anthropic API key configured"}
         last   = df.iloc[-1]
         recent = df["close"].tail(10).tolist()
         prompt = (
@@ -1904,9 +1909,14 @@ class AIAnalyzer:
             clean = raw.strip().replace("```json","").replace("```","").strip()
             return json.loads(clean)
         except Exception as e:
+            # A configured AI service can fail transiently (401/429/5xx,
+            # timeout, malformed JSON, etc.).  Do NOT manufacture a CONFIRM
+            # result.  The scanner will treat this as an AI-unavailable event
+            # and use the technical strategy on its own.
             logger.warning(f"AI call failed: {e}")
-            return {"action":"CONFIRM","confidence_adjustment":0,
-                    "analysis":f"AI unavailable:{e}","risk_level":"MEDIUM"}
+            return {"action":None,"ai_available":False,"confidence_adjustment":0,
+                    "analysis":f"AI unavailable: {e}","risk_level":"MEDIUM",
+                    "error":str(e)}
 
 # ════════════════════════════════════════════════════════════
 #  TRADE MANAGER
@@ -2028,11 +2038,21 @@ class TradeManager:
                            f"SL=${sig['sl']:.4f} TP=${sig['tp']:.4f} | "
                            f"Conf={conf:.1f}% | LIVE ORDER{tag}")
                 else:
+                    # LIVE entry failed: explicitly fall back to the normal
+                    # paper-trade lifecycle.  The failed exchange order must
+                    # never prevent the strategy from managing a paper position,
+                    # and the trade is clearly tagged so the dashboard/logs do
+                    # not imply that an exchange position exists.
                     trade["execution_mode"] = "PAPER"
+                    trade["live_order_failed"] = True
+                    trade["paper_fallback"] = True
                     trade["execution_error"] = live_result.get("error", "unknown")
                     msg = (f"OPENED {symbol} {sig['side']} @ ${px:.4f} | "
                            f"SL=${sig['sl']:.4f} TP=${sig['tp']:.4f} | "
-                           f"Conf={conf:.1f}% | LIVE FAILED ({trade['execution_error']}){tag}")
+                           f"Conf={conf:.1f}% | LIVE FAILED → PAPER FALLBACK "
+                           f"({trade['execution_error']}){tag}")
+                    _elog(f"↩️ {symbol}: live order failed; switched to PAPER trade management — "
+                          f"{trade['execution_error']}", "WARN")
             else:
                 trade["execution_mode"] = "PAPER"
                 msg = (f"OPENED {symbol} {sig['side']} @ ${px:.4f} | "
@@ -2119,6 +2139,66 @@ class TradeManager:
                     record_admin_activity("admin", "trade", msg, details={"trade": t})
                     return t
         return None
+
+    def close_live_position_for_data_safety(self, trade_id: str, reason: str) -> Optional[dict]:
+        """Emergency-close a live position when OHLCV data is stale/unavailable.
+
+        This path deliberately uses an exchange MARKET order and never uses an
+        old candle close as an execution price.  If the exchange cannot close
+        the position, the internal trade remains OPEN so the bot does not claim
+        that a real position was closed when it was not.
+        """
+        with self._lock:
+            trade = next((t for t in self.open_trades if t["id"] == trade_id), None)
+            if trade is None:
+                return None
+
+            m = (trade.get("market") or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
+            live_acc = CONFIG.get("live_accounts", {}).get(m, {})
+            if not live_acc.get("connected"):
+                _elog(f"Live data-safety close refused for {trade['symbol']}: live account disconnected", "ERROR")
+                return None
+
+            close_side = "SELL" if trade["side"] == "BUY" else "BUY"
+            try:
+                live_result = execute_live_order(trade["symbol"], close_side, trade["size"], market=m)
+            except Exception as exc:
+                _elog(f"Live data-safety close exception for {trade['symbol']}: {exc}", "ERROR")
+                return None
+
+            if not live_result.get("ok"):
+                err = live_result.get("error", "unknown live close error")
+                trade["execution_error"] = err
+                _elog(f"Live data-safety close FAILED for {trade['symbol']}: {err} — keeping internal trade OPEN", "ERROR")
+                return None
+
+            order = live_result.get("order") or {}
+            fill_px = order.get("average") or order.get("price")
+            try:
+                fill_px = float(fill_px) if fill_px is not None else None
+            except (TypeError, ValueError):
+                fill_px = None
+
+            # A successful exchange close is authoritative.  If the exchange
+            # did not return a usable fill price, retain entry only for internal
+            # PnL bookkeeping; we never used it as the execution price.
+            accounting_px = fill_px if fill_px is not None and fill_px > 0 else trade["entry"]
+            pnl = ((accounting_px - trade["entry"]) if trade["side"] == "BUY"
+                   else (trade["entry"] - accounting_px)) * trade["size"]
+            trade.update({"pnl": pnl, "status": "DATA_SAFETY_EXIT",
+                          "close_time": datetime.utcnow().isoformat(),
+                          "close_price": fill_px, "unrealised_pnl": 0.0,
+                          "close_reason": reason, "execution_mode": "LIVE",
+                          "exchange_close_id": order.get("id", "")})
+            self.balance += pnl
+            self.open_trades.remove(trade)
+            self.closed_trades.append(trade)
+            msg = (f"DATA SAFETY EXIT {trade['symbol']} | {reason} | "
+                   f"Fill=${fill_px:.6f}" if fill_px is not None else
+                   f"DATA SAFETY EXIT {trade['symbol']} | {reason} | Fill=exchange-confirmed")
+            _elog(msg, "ERROR")
+            record_admin_activity("admin", "trade", msg, details={"trade": trade})
+            return trade
 
     def check_exits(self, prices: dict) -> list:
         closed = []
@@ -2340,17 +2420,34 @@ class TradingBot:
                     trade = next((t for t in self.tm.open_trades if t["symbol"] == sym), None)
                     df_open = self.data.get_ohlcv(sym, self.tf, limit=200)
                     if df_open is None or len(df_open) < 50:
-                        # Live data unavailable — fall back to last ticker
-                        # price so SL/TP monitoring isn't starved, but skip
-                        # the confidence re-check this cycle (no data to judge it on).
+                        # A live position must never make a signal-based exit
+                        # decision from a stale/missing OHLCV candle.  If live
+                        # trading is active, treat stale/unavailable market
+                        # data as a risk event and close the position using a
+                        # genuine live ticker price when one is available.
+                        # In paper mode we simply stop the signal re-check for
+                        # this cycle and let the fast price monitor continue.
                         px_live = self.data.get_price(sym)
                         if px_live is not None:
                             prices[sym] = px_live
+                        if (not CONFIG.get("paper_trading", True)
+                                and CONFIG.get("live_trading_enabled", False)
+                                and trade is not None):
+                            reason = "live OHLCV data stale/unavailable — closing live position for data safety"
+                            _elog(f"⚠️ {sym}: {reason}" + (f" @ ${px_live:.4f}" if px_live is not None else " — market close required"), "ERROR")
+                            if px_live is not None:
+                                closed_stale = self.tm.close_on_signal_loss(trade["id"], px_live, reason)
+                            else:
+                                closed_stale = self.tm.close_live_position_for_data_safety(trade["id"], reason)
+                            if closed_stale:
+                                open_symbols.discard(sym)
+                            continue
+                        if px_live is not None:
                             print(f"  {Fore.BLUE}{sym}{Style.RESET_ALL}  "
-                                  f"— open trade, re-scan data unavailable, price only (${px_live:.4f})")
+                                  f"— open trade, OHLCV unavailable/stale; price only (${px_live:.4f})")
                         else:
                             print(f"  {Fore.BLUE}{sym}{Style.RESET_ALL} "
-                                  f"— open trade, price fetch failed this tick")
+                                  f"— open trade, OHLCV and live price unavailable; no exit decision made")
                         continue
 
                     df_open  = self.ta.compute(df_open)
@@ -2367,7 +2464,22 @@ class TradingBot:
                     # match what the market is actually doing right now.
                     px_live = self.data.get_price(sym)
                     if px_live is None:
-                        px_live = float(df_open["close"].iloc[-1])  # last-resort fallback only
+                        # Never use the OHLCV candle close for a live exit
+                        # decision.  It may be minutes old on multi-minute
+                        # timeframes.  The fast monitor can only act on a live
+                        # ticker (or its separately time-limited price cache).
+                        if (not CONFIG.get("paper_trading", True)
+                                and CONFIG.get("live_trading_enabled", False)
+                                and trade is not None):
+                            reason = "live ticker unavailable — closing live position rather than using stale candle price"
+                            _elog(f"⚠️ {sym}: {reason}", "ERROR")
+                            closed_stale = self.tm.close_live_position_for_data_safety(trade["id"], reason)
+                            if closed_stale:
+                                open_symbols.discard(sym)
+                            continue
+                        print(f"  {Fore.BLUE}{sym}{Style.RESET_ALL} "
+                              f"— live ticker unavailable; no signal-based exit decision this cycle")
+                        continue
                     prices[sym] = px_live
 
                     min_conf   = CONFIG["min_confidence_to_trade"]
@@ -2516,21 +2628,33 @@ class TradingBot:
                           f"Conf={sig['confidence']:.0f}% | SL=${sig['sl']:.4f} TP=${sig['tp']:.4f} | "
                           f"Reasons: {reasons_str}", "INFO")
 
+                    # AI is optional.  When connected it can strengthen or
+                    # reject/wait on a technical signal.  When it is not
+                    # connected (or temporarily unavailable), the validated
+                    # technical strategy remains allowed to trade, especially
+                    # in paper mode.  Crucially, an outage is never represented
+                    # as a fake AI CONFIRM.
                     if CONFIG["ai_confirmation_required"]:
                         print(Fore.YELLOW + "  🤖 AI confirmation..." + Style.RESET_ALL)
                         ai_res = self.ai.analyze(sym, sig, df)
-                        print(f"  AI: {Fore.CYAN}{ai_res.get('action')}{Style.RESET_ALL}"
-                              f" — {ai_res.get('analysis','')}")
-                        _elog(f"🤖 AI analyzed {sym}: Action={ai_res.get('action')} | "
-                              f"Confidence Adj={ai_res.get('confidence_adjustment', 0):+.0f}% | "
-                              f"Risk={ai_res.get('risk_level', 'MEDIUM')} | "
-                              f"Analysis: {ai_res.get('analysis','N/A')}", "INFO")
+                        if ai_res.get("ai_available") is False:
+                            print(Fore.YELLOW + f"  AI: unavailable — {ai_res.get('analysis','')}; using technical strategy" + Style.RESET_ALL)
+                            _elog(f"🤖 AI unavailable for {sym}: {ai_res.get('analysis','N/A')} | Technical strategy remains eligible", "WARN")
+                        else:
+                            print(f"  AI: {Fore.CYAN}{ai_res.get('action')}{Style.RESET_ALL}"
+                                  f" — {ai_res.get('analysis','')}")
+                            _elog(f"🤖 AI analyzed {sym}: Action={ai_res.get('action')} | "
+                                  f"Confidence Adj={ai_res.get('confidence_adjustment', 0):+.0f}% | "
+                                  f"Risk={ai_res.get('risk_level', 'MEDIUM')} | "
+                                  f"Analysis: {ai_res.get('analysis','N/A')}", "INFO")
                     else:
-                        ai_res = {"action":"CONFIRM","confidence_adjustment":0,
+                        ai_res = {"action":None,"ai_available":False,"confidence_adjustment":0,
                                   "analysis":"AI disabled","risk_level":"MEDIUM"}
 
-                    if ai_res.get("action") == "CONFIRM":
-                        adj = sig["confidence"] + ai_res.get("confidence_adjustment",0)
+                    ai_available = ai_res.get("ai_available", True) is not False
+                    technical_only = not ai_available
+                    if technical_only or ai_res.get("action") == "CONFIRM":
+                        adj = sig["confidence"] + (ai_res.get("confidence_adjustment",0) if ai_available else 0)
                         min_conf = CONFIG["min_confidence_to_trade"]
                         if adj >= min_conf:
                             # Re-anchor entry/SL/TP to the live ticker price
