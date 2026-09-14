@@ -153,6 +153,10 @@ CONFIG = {
     "db_retention_days"      : 90,
     "db_max_size_mb"         : 500,
     "db_prune_interval_hours": 24,
+    # Flag as a likely stale/cached data source if the SAME OHLCV data
+    # persists across this many consecutive scan intervals — see
+    # MarketDataProvider._check_stale_repeat().
+    "stale_repeat_scan_multiple": 2,
     "web_port"               : int(os.environ.get("PORT", 5000)),
     "web_host"               : "0.0.0.0",
 }
@@ -1277,6 +1281,16 @@ class MarketDataProvider:
         self.healthy = False
         self.last_error = None
         self.geo_blocked_exchanges = []
+        # Stale-repeat detection: tracks a cheap fingerprint of the last
+        # OHLCV data actually fetched per symbol, and how long that exact
+        # data has persisted. _validate_freshness() only catches data that's
+        # absolutely old (hours) — it says nothing about whether the SAME
+        # candle data is being served scan after scan by something upstream
+        # (an exchange edge cache, a proxy, etc.) even though each fetch
+        # "succeeds" with no error. This catches that case directly, which
+        # an absolute-age check structurally cannot.
+        self._last_ohlcv_sig: dict = {}
+        self._last_ohlcv_changed_at: dict = {}
 
         if mode == "CRYPTO":
             if not CCXT_AVAILABLE:
@@ -1313,6 +1327,15 @@ class MarketDataProvider:
                 exchange = ex_class({
                     "enableRateLimit": True,
                     "options": {"defaultType": "spot"},
+                    # Explicit no-cache headers on every request — a mitigation
+                    # attempt for the case where something between this host
+                    # and the exchange (a proxy, CDN, or the exchange's own
+                    # edge cache) is honoring cache-control and serving a
+                    # repeated response. This can't force a remote cache to
+                    # comply, but it removes any ambiguity about whether the
+                    # REQUEST itself was asking to be cached.
+                    "headers": {"Cache-Control": "no-cache, no-store, must-revalidate",
+                                "Pragma": "no-cache"},
                 })
                 # Lightweight connectivity check — fetch one ticker instead of
                 # load_markets() which calls /exchangeInfo and triggers 451 geo-blocks
@@ -1423,6 +1446,35 @@ class MarketDataProvider:
             return f"[{etype}] {msg} → see https://docs.ccxt.com/#/README?id=error-hierarchy for what {etype} means"
         return f"[{etype}] {msg}"
 
+    def _check_stale_repeat(self, df: pd.DataFrame, symbol: str, tf: str):
+        """Detect the SAME candle data being served across multiple
+        fetches — something _validate_freshness cannot catch on its own,
+        since a repeated-but-recent candle still passes an absolute-age
+        check. For a genuinely live, liquid pair, seeing byte-identical
+        close prices across several consecutive scans is far more likely
+        to mean something upstream (an exchange edge cache, a proxy
+        between the host and the exchange, etc.) is serving a cached
+        response than that the market truly hasn't ticked at all."""
+        sig = tuple(round(v, 8) for v in df["close"].tail(5).tolist())
+        now = datetime.utcnow()
+        prev_sig = self._last_ohlcv_sig.get(symbol)
+        if prev_sig != sig:
+            self._last_ohlcv_sig[symbol] = sig
+            self._last_ohlcv_changed_at[symbol] = now
+            return
+        first_seen = self._last_ohlcv_changed_at.get(symbol, now)
+        unchanged_for = now - first_seen
+        threshold = timedelta(seconds=CONFIG["scan_interval_seconds"] * CONFIG["stale_repeat_scan_multiple"])
+        if unchanged_for > threshold:
+            logger.warning(
+                f"⚠️ [{symbol}] Identical OHLCV data for {unchanged_for} "
+                f"(unchanged since {first_seen.strftime('%H:%M:%S')} UTC) — likely the "
+                f"exchange/network serving a cached response rather than live data. "
+                f"Not a code error (each fetch 'succeeded'), but nothing in the data "
+                f"has actually moved across multiple scans.")
+            _elog(f"⚠️ {symbol}: possible stale/cached market data — unchanged for "
+                  f"{unchanged_for} across repeated fetches", "WARN")
+
     def _crypto(self, symbol, tf, limit):
         if not self.exchange:
             raise DataSourceError(self.last_error or "Exchange not initialised")
@@ -1435,6 +1487,7 @@ class MarketDataProvider:
         df.set_index("timestamp", inplace=True)
         df = df.astype(float)
         self._validate_freshness(df, symbol, tf)
+        self._check_stale_repeat(df, symbol, tf)
         return df
 
     def _stock(self, symbol, tf, limit):
@@ -1452,6 +1505,7 @@ class MarketDataProvider:
                             "Close":"close","Volume":"volume"}, inplace=True)
         df = df[["open","high","low","close","volume"]].tail(limit)
         self._validate_freshness(df, symbol, tf)
+        self._check_stale_repeat(df, symbol, tf)
         return df
 
     def _forex(self, symbol, tf, limit):
@@ -1467,6 +1521,7 @@ class MarketDataProvider:
                             "Close":"close","Volume":"volume"}, inplace=True)
         df = df[["open","high","low","close","volume"]].tail(limit)
         self._validate_freshness(df, symbol, tf)
+        self._check_stale_repeat(df, symbol, tf)
         return df
 
     def _map_tf(self, tf: str) -> str:
