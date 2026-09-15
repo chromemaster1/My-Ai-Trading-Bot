@@ -49,10 +49,10 @@ colorama.init(autoreset=True)
 
 CONFIG = {
     "market_mode"            : "CRYPTO",
-    "crypto_symbols"         : ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT"],
+    "crypto_symbols"         : ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XAUT/USDT"],
     "crypto_exchange"        : "binance",
     "crypto_timeframe"       : "15m",
-    "stock_symbols"          : ["AAPL", "TSLA", "NVDA", "AMZN"],
+    "stock_symbols"          : ["AAPL", "TSLA", "NVDA", "AMZN", "XAGUSD=X", "XAUUSD=X"],
     "stock_timeframe"        : "15m",
     "forex_symbols"         : ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X"],
     "forex_timeframe"       : "15m",
@@ -169,6 +169,46 @@ DATABASE_PATH = os.environ.get(
     "TRADING_BOT_DB_FILE",
     os.path.join(Path(__file__).resolve().parent, "trade_bot.db"),
 )
+
+
+def normalize_market_symbol(symbol: str, market: Optional[str] = None) -> str:
+    """Normalise symbols across crypto/stock/forex markets so new metals tickers
+    like XAUT/USDT and XAUUSD=X behave the same as the built-in pairs.
+
+    This prevents crashes caused by mixed casing, missing slash formatting, or
+    raw ticker names being passed through without a market-specific normalisation
+    step before the data provider or exchange client sees them.
+    """
+    if symbol is None:
+        return ""
+    value = str(symbol).strip()
+    if not value:
+        return ""
+
+    market_key = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
+    value = value.replace(" ", "").upper()
+
+    if market_key == "CRYPTO":
+        if "/" in value:
+            base, quote = value.split("/", 1)
+            return f"{base.strip()}/{quote.strip()}" if base and quote else value
+        if value.endswith("USDT"):
+            base = value[:-4].strip()
+            return f"{base}/USDT" if base else value
+        if 3 <= len(value) <= 10 and value not in {"USD", "EUR", "GBP", "JPY", "AUD", "CHF"}:
+            return f"{value}/USDT"
+        return value
+
+    if market_key in {"STOCK", "FOREX"}:
+        if value.endswith("=X"):
+            return value
+        if "/" in value:
+            return value
+        if value.endswith("USD") and len(value) >= 6:
+            return value
+        return value
+
+    return value
 
 
 def _get_secret_key() -> bytes:
@@ -1047,6 +1087,7 @@ def execute_live_order(symbol: str, side: str, size: float,
     if error or exchange is None:
         return {"ok": False, "error": error or "Live exchange client unavailable"}
     m = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
+    symbol = normalize_market_symbol(symbol, m)
     try:
         if m == "FOREX":
             sym = _translate_forex_symbol_for_exchange(symbol, exchange)
@@ -1061,7 +1102,7 @@ def execute_live_order(symbol: str, side: str, size: float,
                 return {"ok": False, "error": err}
         else:
             # Normalise symbol — ccxt needs BTC/USDT not BTCUSDT
-            sym = symbol.upper().replace("_", "/")
+            sym = normalize_market_symbol(symbol, m)
             if "/" not in sym and "USDT" in sym:
                 sym = sym.replace("USDT", "/USDT")
         qty = float(size)
@@ -1538,6 +1579,7 @@ class MarketDataProvider:
         return False
 
     def _crypto(self, symbol, tf, limit):
+        symbol = normalize_market_symbol(symbol, "CRYPTO")
         if not self.exchange:
             raise DataSourceError(self.last_error or "Exchange not initialised")
         raw = self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
@@ -1554,6 +1596,7 @@ class MarketDataProvider:
         return df
 
     def _stock(self, symbol, tf, limit):
+        symbol = normalize_market_symbol(symbol, "STOCK")
         if not YF_AVAILABLE:
             raise DataSourceError("yfinance not installed")
         imap = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m",
@@ -1573,6 +1616,7 @@ class MarketDataProvider:
         return df
 
     def _forex(self, symbol, tf, limit):
+        symbol = normalize_market_symbol(symbol, "FOREX")
         if not YF_AVAILABLE:
             raise DataSourceError("yfinance not installed")
         # Yahoo forex tickers like EURUSD=X are expected
@@ -1614,6 +1658,7 @@ class MarketDataProvider:
     def get_price(self, symbol: str) -> Optional[float]:
         """Live ticker price. Returns None (never a fake number) on failure."""
         try:
+            symbol = normalize_market_symbol(symbol, self.mode)
             if self.mode == "CRYPTO" and self.exchange:
                 ticker = self.exchange.fetch_ticker(symbol)
                 px = ticker.get("last") or ticker.get("close")
