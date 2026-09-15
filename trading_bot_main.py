@@ -1446,34 +1446,96 @@ class MarketDataProvider:
             return f"[{etype}] {msg} → see https://docs.ccxt.com/#/README?id=error-hierarchy for what {etype} means"
         return f"[{etype}] {msg}"
 
-    def _check_stale_repeat(self, df: pd.DataFrame, symbol: str, tf: str):
-        """Detect the SAME candle data being served across multiple
-        fetches — something _validate_freshness cannot catch on its own,
-        since a repeated-but-recent candle still passes an absolute-age
-        check. For a genuinely live, liquid pair, seeing byte-identical
-        close prices across several consecutive scans is far more likely
-        to mean something upstream (an exchange edge cache, a proxy
-        between the host and the exchange, etc.) is serving a cached
-        response than that the market truly hasn't ticked at all."""
+    def _check_stale_repeat(self, df: pd.DataFrame, symbol: str, tf: str) -> bool:
+        """Detect an OHLCV feed that is actually stuck, not merely an open candle.
+
+        A candle is allowed to remain unchanged while its timeframe is still open;
+        that is normal market behaviour. Once the same five closes persist beyond
+        the configured repeat window, independently verify the exchange ticker.
+        If the ticker is fresh, the OHLCV candle is considered legitimately open.
+        If the ticker is also unavailable/stale, reject the OHLCV frame entirely so
+        it can never drive a signal or trade decision.
+        """
         sig = tuple(round(v, 8) for v in df["close"].tail(5).tolist())
         now = datetime.utcnow()
         prev_sig = self._last_ohlcv_sig.get(symbol)
         if prev_sig != sig:
             self._last_ohlcv_sig[symbol] = sig
             self._last_ohlcv_changed_at[symbol] = now
-            return
+            return True
+
         first_seen = self._last_ohlcv_changed_at.get(symbol, now)
         unchanged_for = now - first_seen
-        threshold = timedelta(seconds=CONFIG["scan_interval_seconds"] * CONFIG["stale_repeat_scan_multiple"])
-        if unchanged_for > threshold:
+        threshold = timedelta(
+            seconds=CONFIG["scan_interval_seconds"] * CONFIG["stale_repeat_scan_multiple"]
+        )
+        if unchanged_for <= threshold:
+            return True
+
+        # Before declaring the OHLCV feed stale, use an independent live ticker.
+        # This avoids false positives when the current 15m candle legitimately has
+        # not changed yet, while still blocking a genuinely frozen exchange/cache
+        # response from reaching TechnicalAnalysis.
+        ticker_ok = False
+        ticker_price = None
+        try:
+            if self.mode == "CRYPTO" and self.exchange:
+                ticker = self.exchange.fetch_ticker(symbol)
+                ticker_price = ticker.get("last") or ticker.get("close")
+                ticker_ts = ticker.get("timestamp")
+                if ticker_price is not None:
+                    ticker_price = float(ticker_price)
+                    ticker_fresh = True
+                    if ticker_ts:
+                        ticker_dt = datetime.utcfromtimestamp(float(ticker_ts) / 1000.0)
+                        ticker_age = now - ticker_dt
+                        ticker_fresh = ticker_age <= timedelta(
+                            seconds=max(30, CONFIG["scan_interval_seconds"] * 3)
+                        )
+
+                    # A fresh ticker alone is not enough: if its price has moved
+                    # materially away from the last OHLCV close, the OHLCV response
+                    # itself is lagging/cached and must be rejected. If it is still
+                    # effectively equal to the candle close, the unchanged candle can
+                    # legitimately be the currently-open candle.
+                    candle_close = float(df["close"].iloc[-1])
+                    price_gap = abs(ticker_price - candle_close) / max(abs(candle_close), 1e-12)
+                    price_consistent = price_gap <= 0.0002  # 0.02%
+                    ticker_ok = ticker_fresh and price_consistent
+
+                    if ticker_fresh and not price_consistent:
+                        logger.error(
+                            f"❌ [{symbol}] OHLCV rejected: live ticker ${ticker_price:.8f} "
+                            f"differs {price_gap * 100:.3f}% from candle close "
+                            f"${candle_close:.8f} after {unchanged_for} of unchanged data"
+                        )
+        except Exception as e:
             logger.warning(
-                f"⚠️ [{symbol}] Identical OHLCV data for {unchanged_for} "
-                f"(unchanged since {first_seen.strftime('%H:%M:%S')} UTC) — likely the "
-                f"exchange/network serving a cached response rather than live data. "
-                f"Not a code error (each fetch 'succeeded'), but nothing in the data "
-                f"has actually moved across multiple scans.")
-            _elog(f"⚠️ {symbol}: possible stale/cached market data — unchanged for "
-                  f"{unchanged_for} across repeated fetches", "WARN")
+                f"⚠️ [{symbol}] repeated OHLCV verification ticker failed: "
+                f"{self._explain_error(e)}"
+            )
+
+        if ticker_ok:
+            self._last_ohlcv_changed_at[symbol] = now
+            _elog(
+                f"ℹ️ {symbol}: OHLCV unchanged for {unchanged_for}, but live ticker "
+                f"is fresh (${float(ticker_price):.8f}); treating this as an open "
+                f"candle rather than cached/stale data",
+                "INFO",
+            )
+            return True
+
+        logger.error(
+            f"❌ [{symbol}] OHLCV feed rejected as stale/cached: identical candle "
+            f"data for {unchanged_for} and no fresh live ticker confirmation. "
+            f"Symbol skipped — no indicators/signals will be calculated from this data."
+        )
+        _elog(
+            f"❌ {symbol}: stale/cached market data rejected — unchanged for "
+            f"{unchanged_for}; no fresh ticker confirmation; symbol skipped",
+            "ERROR",
+        )
+        return False
 
     def _crypto(self, symbol, tf, limit):
         if not self.exchange:
@@ -1487,7 +1549,8 @@ class MarketDataProvider:
         df.set_index("timestamp", inplace=True)
         df = df.astype(float)
         self._validate_freshness(df, symbol, tf)
-        self._check_stale_repeat(df, symbol, tf)
+        if not self._check_stale_repeat(df, symbol, tf):
+            return None
         return df
 
     def _stock(self, symbol, tf, limit):
@@ -1505,7 +1568,8 @@ class MarketDataProvider:
                             "Close":"close","Volume":"volume"}, inplace=True)
         df = df[["open","high","low","close","volume"]].tail(limit)
         self._validate_freshness(df, symbol, tf)
-        self._check_stale_repeat(df, symbol, tf)
+        if not self._check_stale_repeat(df, symbol, tf):
+            return None
         return df
 
     def _forex(self, symbol, tf, limit):
@@ -1521,7 +1585,8 @@ class MarketDataProvider:
                             "Close":"close","Volume":"volume"}, inplace=True)
         df = df[["open","high","low","close","volume"]].tail(limit)
         self._validate_freshness(df, symbol, tf)
-        self._check_stale_repeat(df, symbol, tf)
+        if not self._check_stale_repeat(df, symbol, tf):
+            return None
         return df
 
     def _map_tf(self, tf: str) -> str:
