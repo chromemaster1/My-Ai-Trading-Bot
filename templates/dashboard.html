@@ -452,7 +452,7 @@ function render(){
 
   const log=S.log||[];
   const live=(S.live_trading||{});
-  const liveStatusText = live.connected ? 'Linked' : (live.linked ? 'Connected' : 'Disconnected');
+  const liveStatusText = live.connected ? 'Connected' : (live.linked ? 'Not validated' : 'Disconnected');
   const exch = live.exchange||'—';
   $('ov-sub').textContent=S.scan_count
     ?`Scan #${S.scan_count} · last: ${log[0]?.ts||'—'} · Exchange: ${exch} · ${liveStatusText}`

@@ -562,17 +562,31 @@ _EXCHANGE_CACHE_LOCK = threading.Lock()
 
 def build_live_trading_payload() -> dict:
     market = (CONFIG.get("market_mode") or "CRYPTO").strip().upper()
-    acc = CONFIG.get("live_accounts", {}).get(market, {})
+    live_accounts = CONFIG.get("live_accounts") or {}
+    acc = live_accounts.get(market, {})
+
+    # Prefer the current market account's validation result. A stale legacy
+    # alias must never resurrect a false "Connected" state after a failed
+    # validation or after the user disconnects this market.
+    linked = bool((acc.get("api_key") or "") and (acc.get("api_secret") or ""))
+    connected = bool(acc.get("connected", False))
+    if not acc and live_accounts:
+        connected = False
+    elif not acc and not live_accounts:
+        # Backwards-compatibility fallback only when no per-market state exists yet.
+        linked = bool((CONFIG.get("live_api_key") or "") and (CONFIG.get("live_api_secret") or ""))
+        connected = bool(CONFIG.get("live_account_connected", False)) and linked and not (CONFIG.get("live_last_error") or "").strip()
+
     return {
         "enabled": bool(CONFIG.get("live_trading_enabled", False)),
         "exchange": acc.get("exchange") or CONFIG.get("live_exchange", "binance"),
-        "linked": bool((acc.get("api_key") or "") and (acc.get("api_secret") or "")),
-        "connected": bool(acc.get("connected", False) or CONFIG.get("live_account_connected", False)),
+        "linked": linked,
+        "connected": connected,
         "balance": round(float(acc.get("balance", CONFIG.get("live_balance", 0.0)) or 0.0), 2),
         "last_sync": acc.get("last_sync") or CONFIG.get("live_last_sync"),
         "last_error": acc.get("last_error") or CONFIG.get("live_last_error", ""),
         # include a compact accounts map for UI components that may need per-market info
-        "accounts": { m: v for m, v in CONFIG.get("live_accounts", {}).items() },
+        "accounts": { m: v for m, v in live_accounts.items() },
     }
 
 
@@ -870,7 +884,10 @@ def _sync_alias_live_account():
     CONFIG["live_account_connected"] = bool(ca.get("connected", False))
     CONFIG["live_balance"] = float(ca.get("balance", 0.0) or 0.0)
     CONFIG["live_last_sync"] = ca.get("last_sync")
-    CONFIG["live_last_error"] = ca.get("last_error", "")
+    if ca.get("last_error") and not ca.get("connected", False):
+        CONFIG["live_last_error"] = ca.get("last_error", "")
+    else:
+        CONFIG["live_last_error"] = ca.get("last_error", "")
 
 load_runtime_state_from_db()
 _sync_alias_live_account()
