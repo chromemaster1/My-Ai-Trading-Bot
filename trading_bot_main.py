@@ -47,6 +47,16 @@ colorama.init(autoreset=True)
 #  GLOBAL SHARED STATE
 # ════════════════════════════════════════════════════════════
 
+def _clean_credential(value) -> str:
+    """Normalise copied credentials so hidden whitespace or stray characters
+    do not break exchange signatures (common with copied Bybit keys)."""
+    if value is None:
+        return ""
+    value = str(value).strip()
+    value = value.replace("\u200b", "").replace("\ufeff", "")
+    return value
+
+
 CONFIG = {
     "market_mode"            : "CRYPTO",
     "crypto_symbols"         : ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XAUT/USDT"],
@@ -124,8 +134,10 @@ CONFIG = {
     "paper_trading"          : True,
     "live_trading_enabled"   : False,
     "live_accounts"          : {
-        "CRYPTO": {"exchange":"binance","api_key":os.environ.get("LIVE_API_KEY",""),
-                   "api_secret":os.environ.get("LIVE_API_SECRET",""),"passphrase":os.environ.get("LIVE_PASSPHRASE",""),
+        "CRYPTO": {"exchange": "binance",
+                   "api_key": _clean_credential(os.environ.get("LIVE_API_KEY", "")),
+                   "api_secret": _clean_credential(os.environ.get("LIVE_API_SECRET", "")),
+                   "passphrase": _clean_credential(os.environ.get("LIVE_PASSPHRASE", "")),
                    "connected":False,"balance":0.0,"last_sync":None,"last_error":""},
         "STOCK":  {"exchange":"yahoo","api_key":"","api_secret":"","passphrase":"",
                    "connected":False,"balance":0.0,"last_sync":None,"last_error":""},
@@ -526,9 +538,9 @@ def _load_persistent_state() -> dict:
     # before this fix still load correctly — they just get encrypted going
     # forward the next time _save_persistent_state() runs.
     for market, acc in la.items():
-        acc["api_key"] = _unprotect_secret(acc.get("api_key", ""))
-        acc["api_secret"] = _unprotect_secret(acc.get("api_secret", ""))
-        acc["passphrase"] = _unprotect_secret(acc.get("passphrase", ""))
+        acc["api_key"] = _clean_credential(_unprotect_secret(acc.get("api_key", "")))
+        acc["api_secret"] = _clean_credential(_unprotect_secret(acc.get("api_secret", "")))
+        acc["passphrase"] = _clean_credential(_unprotect_secret(acc.get("passphrase", "")))
     CONFIG["live_accounts"].update(la)
     return merged
 
@@ -976,6 +988,9 @@ def validate_live_connection(exchange_id: str, api_key: str,
                              api_secret: str, passphrase: str = "") -> tuple[bool, dict]:
     if not CCXT_AVAILABLE:
         return False, {"ok": False, "error": "ccxt is not installed"}
+    api_key = _clean_credential(api_key)
+    api_secret = _clean_credential(api_secret)
+    passphrase = _clean_credential(passphrase)
     ex_cls = getattr(ccxt, exchange_id.lower(), None)
     if ex_cls is None:
         return False, {"ok": False, "error": f"Unsupported exchange: {exchange_id}"}
