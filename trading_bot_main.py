@@ -66,7 +66,10 @@ CONFIG = {
     "swing_lookback"         : 20,
     "swing_pivot_strength"   : 3,
     "stop_loss_pct"          : 0.005,    # 0.5% — tight stop
-    "take_profit_pct"        : 0.020,    # 2.0% — locks a 4:1 reward:risk ratio
+    "take_profit_pct"        : 0.020,    # 2.0% default profit target; dynamic RR logic can override this for fast trades
+    "confirmed_trade_min_rr" : 4.0,      # full ride-out mode: only the strongest setups keep the original 4:1 reward:risk profile
+    "fast_trade_min_rr"      : 1.0,      # quick trades can open on a 1R or 2R target and exit fast once that objective is reached
+    "fast_trade_target_rr"   : 2.0,      # default fast-trade target; weaker but valid setups can trade on a 2:1 path instead of waiting for 4:1
     "min_confidence_to_trade": 85,       # only open trades with >=85% combined confidence
     "max_risk_per_trade"     : 0.01,
     "max_open_trades"        : 3,
@@ -1907,11 +1910,26 @@ class TechnicalAnalysis:
                                          f"< {CONFIG['chop_min_efficiency_ratio']:.2f}), full confluence not met")
         sl_floor = CONFIG["stop_loss_pct"]
         tp_floor = CONFIG["take_profit_pct"]
-        # Hard 4:1 reward:risk guarantee regardless of ATR adjustment
-        min_rr = 4.0
+        confirmed_rr = float(CONFIG.get("confirmed_trade_min_rr", 4.0))
+        fast_min_rr = float(CONFIG.get("fast_trade_min_rr", 1.0))
+        fast_target_rr = float(CONFIG.get("fast_trade_target_rr", 2.0))
+
+        def _mode_for_side(side_score: float, opposite_score: float, trend_is_bullish: bool, trend_is_bearish: bool, strong_confirmation: bool) -> tuple[str, float]:
+            # Only materially stronger setups deserve the full 4:1 ride path.
+            # A marginal but valid 85%-level signal should stay FAST unless it
+            # has a clear margin above the normal trade threshold and a clean
+            # confluence of momentum/trend/RSI filters.
+            if strong_confirmation and side_score >= min_conf + 10 and (side_score - opposite_score) >= 15:
+                return "RIDE", confirmed_rr
+            return "FAST", max(fast_min_rr, min(fast_target_rr, 2.0))
 
         if buy > sell and buy >= min_conf:
             conf  = min(float(buy), 99.0)
+            strong_confirmation = (
+                rc > 60 and et == 1 and vs and abs(px - sl) / px < 0.012
+                and buy >= min_conf + 10 and (buy - sell) >= 15
+            )
+            trade_mode, rr_target = _mode_for_side(buy, sell, et == 1, et == -1, strong_confirmation)
             # WIDER of the two candidates, not tighter: a stop placed at
             # whichever distance gives the trade more room survives normal
             # price noise. Picking the tighter one (the previous behaviour)
@@ -1921,7 +1939,7 @@ class TechnicalAnalysis:
             # they were never given room to work.
             sl_p  = min(round(px*(1-sl_floor), 6), round(px-atr*1.2, 6))
             risk_dist = px - sl_p
-            tp_p  = round(px + max(risk_dist*min_rr, px*tp_floor), 6)
+            tp_p  = round(px + max(risk_dist*rr_target, px*tp_floor), 6)
             if not (0 < sl_p < px < tp_p):
                 # A sane BUY must have sl < price < tp. If config values
                 # (stop_loss_pct / take_profit_pct) are misconfigured —
@@ -1939,14 +1957,20 @@ class TechnicalAnalysis:
                         "reasons":["Rejected: invalid SL/TP configuration"],"price":px,"is_chop":is_chop}
             return {"side":"BUY","confidence":conf,"reasons":reasons_buy,
                     "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
+                    "trade_mode":trade_mode,"rr_target":rr_target,
                     "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh}
 
         if sell > buy and sell >= min_conf:
             conf  = min(float(sell), 99.0)
+            strong_confirmation = (
+                rc < 40 and et == -1 and vs and abs(px - sh) / px < 0.012
+                and sell >= min_conf + 10 and (sell - buy) >= 15
+            )
+            trade_mode, rr_target = _mode_for_side(sell, buy, et == 1, et == -1, strong_confirmation)
             # Same fix as BUY, mirrored: WIDER of the two candidates.
             sl_p  = max(round(px*(1+sl_floor), 6), round(px+atr*1.2, 6))
             risk_dist = sl_p - px
-            tp_p  = round(px - max(risk_dist*min_rr, px*tp_floor), 6)
+            tp_p  = round(px - max(risk_dist*rr_target, px*tp_floor), 6)
             if not (0 < tp_p < px < sl_p):
                 # A sane SELL must have tp < price < sl (and tp must be a
                 # real positive price). Same misconfiguration guard as BUY.
@@ -1960,10 +1984,12 @@ class TechnicalAnalysis:
                         "reasons":["Rejected: invalid SL/TP configuration"],"price":px,"is_chop":is_chop}
             return {"side":"SELL","confidence":conf,"reasons":reasons_sell,
                     "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
+                    "trade_mode":trade_mode,"rr_target":rr_target,
                     "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh}
 
         return {"side":"HOLD","confidence":max(buy,sell),
-                "reasons":reasons_buy if buy>=sell else reasons_sell,"price":px,"is_chop":is_chop}
+                "reasons":reasons_buy if buy>=sell else reasons_sell,"price":px,"is_chop":is_chop,
+                "trade_mode":"FAST","rr_target":fast_min_rr}
 
 # ════════════════════════════════════════════════════════════
 #  AI ANALYZER
@@ -1985,10 +2011,11 @@ class AIAnalyzer:
         last   = df.iloc[-1]
         recent = df["close"].tail(10).tolist()
         prompt = (
-            f"Expert algo trading analyst applying STRICT risk filtering — "
+            f"Expert algo trading analyst applying layered risk filtering — "
             f"this strategy only trades signals with >={CONFIG['min_confidence_to_trade']}% "
-            f"combined conviction and a 4:1 reward:risk ratio. Be conservative: REJECT or "
-            f"WAIT on anything showing mixed signals, low volume, or choppy price action. "
+            f"combined conviction. For confirmed momentum setups, keep the original 4:1 ride-out profile; "
+            f"for fast tactical entries, allow a lower but valid 2:1 or 1:1 RR target and exit quickly once that objective is reached. "
+            f"Be conservative: REJECT or WAIT on anything showing mixed signals, low volume, or choppy price action. "
             f"Analyze signal, respond ONLY valid JSON.\n\n"
             f"SYMBOL:{symbol} MARKET:{CONFIG['market_mode']}\n"
             f"SIGNAL:{sig['side']} @ ${sig.get('price',0):.4f} "
@@ -1996,7 +2023,7 @@ class AIAnalyzer:
             f"RSI{CONFIG['rsi_fast_period']}:{sig.get('rsi_fast','?')} "
             f"RSI{CONFIG['rsi_slow_period']}:{sig.get('rsi_slow','?')}\n"
             f"SL:${sig.get('sl',0):.4f} TP:${sig.get('tp',0):.4f} "
-            f"(R:R ratio ~4:1)\n"
+            f"(RR mode={sig.get('trade_mode','RIDE')} target ~{sig.get('rr_target', 4.0):.1f}:1)\n"
             f"EMA_trend:{'Bullish' if last.get('ema_trend',0)==1 else 'Bearish'} "
             f"VolSurge:{last.get('vol_surge',False)}\n"
             f"Recent closes:{[round(c,2) for c in recent]}\n"
@@ -2135,6 +2162,8 @@ class TradeManager:
                 "initial_sl"   : sig["sl"],
                 "initial_risk" : abs(px - sig["sl"]),
                 "best_price"   : px,
+                "trade_mode"   : sig.get("trade_mode", "RIDE"),
+                "rr_target"    : float(sig.get("rr_target", CONFIG.get("confirmed_trade_min_rr", 4.0))),
                 "profit_locked": False,
             }
             live_acc = CONFIG.get("live_accounts", {}).get(m, {})
@@ -2368,18 +2397,30 @@ class TradeManager:
                         if trail_sl < t["sl"]:
                             t["sl"] = trail_sl
 
-                if t["side"] == "BUY":
-                    hit_sl = px <= t["sl"]; hit_tp = px >= t["tp"]
+                target_rr = float(t.get("rr_target") or CONFIG.get("fast_trade_target_rr", 2.0) or 2.0)
+                if t.get("trade_mode") == "FAST":
+                    if t["side"] == "BUY":
+                        fast_target_hit = px >= (t["entry"] + (initial_risk * target_rr))
+                    else:
+                        fast_target_hit = px <= (t["entry"] - (initial_risk * target_rr))
                 else:
-                    hit_sl = px >= t["sl"]; hit_tp = px <= t["tp"]
+                    fast_target_hit = False
+
+                if t["side"] == "BUY":
+                    hit_sl = px <= t["sl"]; hit_tp = px >= t["tp"] or fast_target_hit
+                else:
+                    hit_sl = px >= t["sl"]; hit_tp = px <= t["tp"] or fast_target_hit
                 if hit_tp or hit_sl:
                     pnl = t["unrealised_pnl"]
                     lbl = "TP" if hit_tp else "SL"
+                    if fast_target_hit and not hit_sl:
+                        lbl = "TP"
                     # CRITICAL: define msg BEFORE using it below
                     msg = f"Trade {lbl}: {t['symbol']} | PnL=${pnl:.2f}"
                     t.update({"pnl":pnl,"status":lbl,
                                "close_time":datetime.utcnow().isoformat(),
-                               "close_price":px,"unrealised_pnl":0.0})
+                               "close_price":px,"unrealised_pnl":0.0,
+                               "close_reason": "FAST_TARGET" if fast_target_hit and not hit_sl else ("TP" if hit_tp else "SL")})
                     # Place live counter-order on exchange when running live
                     if not CONFIG.get("paper_trading", True) and CONFIG.get("live_trading_enabled"):
                         m = (t.get("market") or CONFIG.get("market_mode") or "CRYPTO").upper()
