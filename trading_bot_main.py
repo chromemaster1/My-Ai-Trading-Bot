@@ -60,7 +60,7 @@ def _clean_credential(value) -> str:
 CONFIG = {
     "market_mode"            : "CRYPTO",
     "crypto_symbols"         : ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XAUT/USDT"],
-    "crypto_exchange"        : "binance",
+    "crypto_exchange"        : "bybit",
     "crypto_timeframe"       : "15m",
     "stock_symbols"          : ["AAPL", "TSLA", "NVDA", "AMZN", "XAGUSD=X", "XAUUSD=X"],
     "stock_timeframe"        : "15m",
@@ -1331,6 +1331,10 @@ class DataSourceError(Exception):
     """Raised when live market data cannot be fetched — never silently fall back to fake data."""
     pass
 
+class NetworkUnavailableError(DataSourceError):
+    """Host-wide network outage; callers should stop the bot rather than use stale data."""
+    pass
+
 class MarketDataProvider:
     """
     Always fetches LIVE data from the real exchange/market.
@@ -1348,7 +1352,7 @@ class MarketDataProvider:
     """
     # Tried in order. All expose the same public OHLCV/ticker endpoints via ccxt,
     # so signal/strategy logic is 100% unaffected by which one ends up active.
-    FALLBACK_EXCHANGES = ["binance", "kraken", "coinbase", "kucoin", "bybit"]
+    FALLBACK_EXCHANGES = ["bybit", "binance", "coinbase", "kraken", "kucoin"]
 
     def __init__(self, mode: str):
         self.mode = mode
@@ -1357,6 +1361,11 @@ class MarketDataProvider:
         self.healthy = False
         self.last_error = None
         self.geo_blocked_exchanges = []
+        self._exchange_clients = {}
+        self._exchange_cooldowns = {}
+        self.fatal_network_error = False
+        self.fatal_network_message = ""
+        self._last_fresh_ohlcv = {}
         # Stale-repeat detection: tracks a cheap fingerprint of the last
         # OHLCV data actually fetched per symbol, and how long that exact
         # data has persisted. _validate_freshness() only catches data that's
@@ -1390,85 +1399,169 @@ class MarketDataProvider:
             self.healthy = True
             logger.info("✅ Yahoo Finance data source ready")
 
-    def _connect_crypto(self):
-        # Preferred exchange first (user-configurable), then the fallback list.
-        preferred = CONFIG.get("crypto_exchange", "binance").lower()
-        candidates = [preferred] + [e for e in self.FALLBACK_EXCHANGES if e != preferred]
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        text = f"{type(exc).__name__} {exc}".lower()
+        return ("ddosprotection" in text or "ratelimitexceeded" in text or
+                "rate limit" in text or "too much request weight" in text or
+                "ip banned" in text or "http 418" in text or " 418 " in text or
+                "http 429" in text or " 429 " in text or "code:-1003" in text or
+                '"code":-1003' in text)
 
+    def _is_network_error(self, exc: Exception) -> bool:
+        text = f"{type(exc).__name__} {exc}".lower()
+        if self._is_rate_limit_error(exc):
+            return False
+        return any(x in text for x in (
+            "networkerror", "exchangeunavailable", "requesttimeout",
+            "timed out", "timeout", "connection reset", "connection refused",
+            "connection aborted", "connection error", "dns", "getaddrinfo",
+            "name or service not known", "temporary failure in name resolution",
+            "max retries exceeded", "remote disconnected"
+        ))
+
+    def _internet_available(self) -> bool:
+        """Check general Internet only after an exchange network failure."""
+        try:
+            import requests
+            for url in ("https://www.cloudflare.com", "https://example.com"):
+                try:
+                    r = requests.get(url, timeout=4, headers={"Cache-Control":"no-cache"})
+                    if r.status_code < 500:
+                        return True
+                except Exception:
+                    continue
+        except Exception:
+            return False
+        return False
+
+    def _mark_exchange_cooldown(self, ex_id: str, exc: Exception):
+        now = time.time()
+        text = str(exc)
+        # Binance -1003 often includes an absolute millisecond ban-until timestamp.
+        import re as _re
+        m = _re.search(r"(?:until|retry-after)[^0-9]*(\d{10,})", text, _re.I)
+        if m:
+            raw = int(m.group(1))
+            until = raw / 1000.0 if raw > 10_000_000_000 else now + raw
+        else:
+            until = now + (300 if ("418" in text or "ip banned" in text.lower() or "too much request weight" in text.lower()) else 60)
+        self._exchange_cooldowns[ex_id] = until
+        logger.warning(f"⏳ {ex_id}: rate-limit cooldown until {datetime.utcfromtimestamp(until).isoformat()} UTC; skipping it until then")
+
+    def _exchange_on_cooldown(self, ex_id: str) -> bool:
+        until = self._exchange_cooldowns.get(ex_id, 0)
+        if time.time() >= until:
+            self._exchange_cooldowns.pop(ex_id, None)
+            return False
+        return True
+
+    def _build_exchange(self, ex_id: str):
+        if ex_id in self._exchange_clients:
+            return self._exchange_clients[ex_id]
+        if not hasattr(ccxt, ex_id):
+            return None
+        ex_class = getattr(ccxt, ex_id)
+        exchange = ex_class({
+            "enableRateLimit": True,
+            "options": {"defaultType": "spot"},
+            "headers": {"Cache-Control":"no-cache, no-store, must-revalidate", "Pragma":"no-cache"},
+        })
+        self._exchange_clients[ex_id] = exchange
+        return exchange
+
+    def _candidate_exchanges(self):
+        # Fixed failover order prevents a previously failed/blocked exchange
+        # from becoming the only source for the next symbol.
+        return [e for e in self.FALLBACK_EXCHANGES if hasattr(ccxt, e)]
+
+    def _connect_crypto(self):
+        self.fatal_network_error = False
+        self.fatal_network_message = ""
+        preferred = CONFIG.get("crypto_exchange", "bybit").lower()
+        candidates = [preferred] + [e for e in self._candidate_exchanges() if e != preferred]
         for ex_id in candidates:
-            if not hasattr(ccxt, ex_id):
+            if self._exchange_on_cooldown(ex_id):
+                logger.warning(f"⏭️ {ex_id}: currently rate-limited/banned; skipping connection attempt")
                 continue
             try:
-                ex_class = getattr(ccxt, ex_id)
-                exchange = ex_class({
-                    "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
-                    # Explicit no-cache headers on every request — a mitigation
-                    # attempt for the case where something between this host
-                    # and the exchange (a proxy, CDN, or the exchange's own
-                    # edge cache) is honoring cache-control and serving a
-                    # repeated response. This can't force a remote cache to
-                    # comply, but it removes any ambiguity about whether the
-                    # REQUEST itself was asking to be cached.
-                    "headers": {"Cache-Control": "no-cache, no-store, must-revalidate",
-                                "Pragma": "no-cache"},
-                })
-                # Lightweight connectivity check — fetch one ticker instead of
-                # load_markets() which calls /exchangeInfo and triggers 451 geo-blocks
-                try:
-                    exchange.fetch_ticker("BTC/USDT")
-                except Exception:
-                    exchange.fetch_time()   # fallback ping
-                self.exchange    = exchange
-                self.exchange_id = ex_id
-                self.healthy     = True
+                exchange = self._build_exchange(ex_id)
+                if exchange is None:
+                    continue
+                exchange.fetch_ticker("BTC/USDT")
+                self.exchange, self.exchange_id, self.healthy = exchange, ex_id, True
                 CONFIG["crypto_exchange"] = ex_id
                 if ex_id != preferred:
-                    logger.warning(
-                        f"⚠️  '{preferred}' was unreachable — auto-switched to "
-                        f"'{ex_id}' for live crypto data")
+                    logger.warning(f"⚠️ '{preferred}' unavailable — auto-switched to '{ex_id}' for live market data")
                 logger.info(f"✅ Connected to {ex_id} — live data confirmed")
                 return
             except Exception as e:
-                msg = self._explain_error(e)
+                if self._is_rate_limit_error(e):
+                    self._mark_exchange_cooldown(ex_id, e)
+                    logger.error(f"❌ {ex_id}: rate limit/IP ban ({self._explain_error(e)}). Trying next exchange immediately")
+                    continue
+                if self._is_network_error(e):
+                    if not self._internet_available():
+                        self.fatal_network_error = True
+                        self.fatal_network_message = f"Host Internet unavailable while connecting to {ex_id}: {self._explain_error(e)}"
+                        logger.critical(f"🛑 {self.fatal_network_message}")
+                        break
+                    logger.error(f"❌ {ex_id}: exchange network error ({self._explain_error(e)}). Internet is available; trying next exchange")
+                    continue
                 if "451" in str(e) or "restricted location" in str(e).lower():
                     self.geo_blocked_exchanges.append(ex_id)
-                    logger.error(
-                        f"❌ {ex_id}: blocked your server's region (HTTP 451 — "
-                        f"geo-restriction, not a code/network issue). Trying next exchange...")
-                else:
-                    logger.error(f"❌ {ex_id} connection failed: {msg}. Trying next exchange...")
-                self.last_error = msg
-                continue
-
-        # Every candidate failed
+                logger.error(f"❌ {ex_id}: {self._explain_error(e)}. Trying next exchange")
         self.healthy = False
-        if self.geo_blocked_exchanges:
-            self.last_error = (
-                f"All exchanges geo-blocked your server's IP/region: "
-                f"{', '.join(self.geo_blocked_exchanges)}. This is the hosting "
-                f"provider's location being restricted by the exchange, not a bug. "
-                f"Fix: deploy from a different region, use a residential/VPN egress, "
-                f"or pick an exchange in Settings that isn't blocked from your region."
-            )
+        self.last_error = self.fatal_network_message or "No live crypto exchange could be reached"
         logger.error(f"❌ No crypto exchange could be reached: {self.last_error}")
 
-    def get_ohlcv(self, symbol: str, tf: str = "15m",
-                  limit: int = 200) -> Optional[pd.DataFrame]:
-        """Returns live OHLCV data, or None if it cannot be fetched.
-        Caller MUST check for None and skip the symbol — never substitutes
-        simulated data, so a stale connection can never silently drive trades."""
-        try:
-            if self.mode == "CRYPTO":
-                return self._crypto(symbol, tf, limit)
-            if self.mode == "FOREX":
-                return self._forex(symbol, tf, limit)
-            return self._stock(symbol, tf, limit)
-        except Exception as e:
-            reason = self._explain_error(e)
-            self.last_error = reason
-            logger.error(f"❌ [{symbol}] LIVE DATA FETCH FAILED: {reason} — symbol skipped this scan")
-            return None
+    def get_ohlcv(self, symbol: str, tf: str = "15m", limit: int = 200) -> Optional[pd.DataFrame]:
+        """Fetch LIVE OHLCV. Crypto symbols fail over per-symbol; rejected/stale data is never used."""
+        if self.mode != "CRYPTO":
+            try:
+                if self.mode == "FOREX": return self._forex(symbol, tf, limit)
+                if self.mode == "STOCK": return self._stock(symbol, tf, limit)
+                return self._stock(symbol, tf, limit)
+            except Exception as e:
+                logger.error(f"❌ [{symbol}] LIVE DATA FETCH FAILED: {self._explain_error(e)} — symbol skipped")
+                return None
+
+        symbol = normalize_market_symbol(symbol, "CRYPTO")
+        failures = []
+        preferred = CONFIG.get("crypto_exchange", "bybit").lower()
+        candidates = [preferred] + [e for e in self._candidate_exchanges() if e != preferred]
+        for ex_id in candidates:
+            if self._exchange_on_cooldown(ex_id):
+                failures.append(f"{ex_id}: cooldown")
+                continue
+            try:
+                exchange = self._build_exchange(ex_id)
+                if exchange is None:
+                    continue
+                self.exchange, self.exchange_id = exchange, ex_id
+                df = self._crypto(symbol, tf, limit)
+                if df is None:
+                    failures.append(f"{ex_id}: stale/invalid OHLCV")
+                    continue
+                self.healthy = True
+                CONFIG["crypto_exchange"] = ex_id
+                if ex_id != preferred:
+                    logger.warning(f"🔄 {symbol}: market-data failover {preferred} → {ex_id}")
+                return df
+            except Exception as e:
+                failures.append(f"{ex_id}: {self._explain_error(e)}")
+                if self._is_rate_limit_error(e):
+                    self._mark_exchange_cooldown(ex_id, e)
+                    logger.warning(f"⏭️ {symbol}: {ex_id} rate-limited/banned; immediately trying next exchange")
+                    continue
+                if self._is_network_error(e) and not self._internet_available():
+                    self.fatal_network_error = True
+                    self.fatal_network_message = f"Host Internet unavailable while fetching {symbol}: {self._explain_error(e)}"
+                    raise NetworkUnavailableError(self.fatal_network_message)
+                logger.warning(f"⏭️ {symbol}: {ex_id} failed; trying next exchange")
+
+        self.healthy = False if self.exchange is None else self.healthy
+        logger.error(f"❌ {symbol}: live OHLCV unavailable on all exchanges this scan — {' | '.join(failures)}")
+        return None
 
     @staticmethod
     def _explain_error(e: Exception) -> str:
@@ -1522,95 +1615,76 @@ class MarketDataProvider:
             return f"[{etype}] {msg} → see https://docs.ccxt.com/#/README?id=error-hierarchy for what {etype} means"
         return f"[{etype}] {msg}"
 
-    def _check_stale_repeat(self, df: pd.DataFrame, symbol: str, tf: str) -> bool:
-        """Detect an OHLCV feed that is actually stuck, not merely an open candle.
+    @staticmethod
+    def _ohlcv_signature(df: pd.DataFrame):
+        cols = [c for c in ("open","high","low","close","volume") if c in df.columns]
+        rows = []
+        for idx, row in df.tail(5).iterrows():
+            rows.append((str(idx),) + tuple(round(float(row[c]), 10) for c in cols))
+        return tuple(rows)
 
-        A candle is allowed to remain unchanged while its timeframe is still open;
-        that is normal market behaviour. Once the same five closes persist beyond
-        the configured repeat window, independently verify the exchange ticker.
-        If the ticker is fresh, the OHLCV candle is considered legitimately open.
-        If the ticker is also unavailable/stale, reject the OHLCV frame entirely so
-        it can never drive a signal or trade decision.
-        """
-        sig = tuple(round(v, 8) for v in df["close"].tail(5).tolist())
-        now = datetime.utcnow()
-        prev_sig = self._last_ohlcv_sig.get(symbol)
-        if prev_sig != sig:
-            self._last_ohlcv_sig[symbol] = sig
-            self._last_ohlcv_changed_at[symbol] = now
-            return True
-
-        first_seen = self._last_ohlcv_changed_at.get(symbol, now)
-        unchanged_for = now - first_seen
-        threshold = timedelta(
-            seconds=CONFIG["scan_interval_seconds"] * CONFIG["stale_repeat_scan_multiple"]
-        )
-        if unchanged_for <= threshold:
-            return True
-
-        # Before declaring the OHLCV feed stale, use an independent live ticker.
-        # This avoids false positives when the current 15m candle legitimately has
-        # not changed yet, while still blocking a genuinely frozen exchange/cache
-        # response from reaching TechnicalAnalysis.
-        ticker_ok = False
-        ticker_price = None
+    def _force_refresh_crypto(self, symbol: str, tf: str, limit: int, previous_sig):
+        """Use a fresh client to force an independent OHLCV request; identical data is rejected."""
+        ex_id = self.exchange_id
+        if not ex_id or self._exchange_on_cooldown(ex_id):
+            return None
         try:
-            if self.mode == "CRYPTO" and self.exchange:
-                ticker = self.exchange.fetch_ticker(symbol)
-                ticker_price = ticker.get("last") or ticker.get("close")
-                ticker_ts = ticker.get("timestamp")
-                if ticker_price is not None:
-                    ticker_price = float(ticker_price)
-                    ticker_fresh = True
-                    if ticker_ts:
-                        ticker_dt = datetime.utcfromtimestamp(float(ticker_ts) / 1000.0)
-                        ticker_age = now - ticker_dt
-                        ticker_fresh = ticker_age <= timedelta(
-                            seconds=max(30, CONFIG["scan_interval_seconds"] * 3)
-                        )
-
-                    # A fresh ticker alone is not enough: if its price has moved
-                    # materially away from the last OHLCV close, the OHLCV response
-                    # itself is lagging/cached and must be rejected. If it is still
-                    # effectively equal to the candle close, the unchanged candle can
-                    # legitimately be the currently-open candle.
-                    candle_close = float(df["close"].iloc[-1])
-                    price_gap = abs(ticker_price - candle_close) / max(abs(candle_close), 1e-12)
-                    price_consistent = price_gap <= 0.0002  # 0.02%
-                    ticker_ok = ticker_fresh and price_consistent
-
-                    if ticker_fresh and not price_consistent:
-                        logger.error(
-                            f"❌ [{symbol}] OHLCV rejected: live ticker ${ticker_price:.8f} "
-                            f"differs {price_gap * 100:.3f}% from candle close "
-                            f"${candle_close:.8f} after {unchanged_for} of unchanged data"
-                        )
+            # A separate CCXT instance prevents any local client-level state from
+            # being reused. It cannot bypass an exchange IP ban; such a response
+            # is immediately classified and the caller fails over.
+            ex_class = getattr(ccxt, ex_id)
+            fresh = ex_class({"enableRateLimit": True, "options":{"defaultType":"spot"},
+                              "headers":{"Cache-Control":"no-cache, no-store, must-revalidate", "Pragma":"no-cache"}})
+            raw = fresh.fetch_ohlcv(symbol, tf, limit=limit)
+            if not raw or len(raw) < 10:
+                return None
+            df = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+            df.set_index("timestamp", inplace=True)
+            df = df.astype(float)
+            self._validate_freshness(df, symbol, tf)
+            sig = self._ohlcv_signature(df)
+            if sig == previous_sig:
+                logger.error(f"❌ [{symbol}] forced OHLCV refresh from {ex_id} returned identical data; rejecting it")
+                return None
+            self._last_fresh_ohlcv[(symbol, tf)] = df
+            self._last_ohlcv_sig[symbol] = sig
+            self._last_ohlcv_changed_at[symbol] = datetime.utcnow()
+            logger.info(f"✅ [{symbol}] independent OHLCV refresh succeeded on {ex_id}")
+            return df
         except Exception as e:
-            logger.warning(
-                f"⚠️ [{symbol}] repeated OHLCV verification ticker failed: "
-                f"{self._explain_error(e)}"
-            )
+            if self._is_rate_limit_error(e):
+                self._mark_exchange_cooldown(ex_id, e)
+                logger.warning(f"⏭️ [{symbol}] forced refresh hit {ex_id} rate limit/ban; failover will continue")
+            elif self._is_network_error(e) and not self._internet_available():
+                self.fatal_network_error = True
+                self.fatal_network_message = f"Host Internet unavailable during forced OHLCV refresh for {symbol}: {self._explain_error(e)}"
+            else:
+                logger.warning(f"⚠️ [{symbol}] independent OHLCV refresh failed on {ex_id}: {self._explain_error(e)}")
+            return None
 
-        if ticker_ok:
-            self._last_ohlcv_changed_at[symbol] = now
-            _elog(
-                f"ℹ️ {symbol}: OHLCV unchanged for {unchanged_for}, but live ticker "
-                f"is fresh (${float(ticker_price):.8f}); treating this as an open "
-                f"candle rather than cached/stale data",
-                "INFO",
-            )
+    def _check_stale_repeat(self, df: pd.DataFrame, symbol: str, tf: str) -> bool:
+        """Strict repeated-data guard. Fresh ticker never makes frozen OHLCV acceptable."""
+        sig = self._ohlcv_signature(df)
+        now = datetime.utcnow()
+        key = (symbol, tf)
+        prev_sig = self._last_ohlcv_sig.get(key)
+        if prev_sig != sig:
+            self._last_ohlcv_sig[key] = sig
+            self._last_ohlcv_changed_at[key] = now
+            self._last_fresh_ohlcv[key] = df
             return True
-
-        logger.error(
-            f"❌ [{symbol}] OHLCV feed rejected as stale/cached: identical candle "
-            f"data for {unchanged_for} and no fresh live ticker confirmation. "
-            f"Symbol skipped — no indicators/signals will be calculated from this data."
-        )
-        _elog(
-            f"❌ {symbol}: stale/cached market data rejected — unchanged for "
-            f"{unchanged_for}; no fresh ticker confirmation; symbol skipped",
-            "ERROR",
-        )
+        first_seen = self._last_ohlcv_changed_at.get(key, now)
+        unchanged_for = now - first_seen
+        threshold = timedelta(seconds=CONFIG["scan_interval_seconds"] * CONFIG["stale_repeat_scan_multiple"])
+        if unchanged_for <= threshold:
+            self._last_fresh_ohlcv[key] = df
+            return True
+        logger.warning(f"⚠️ [{symbol}] OHLCV unchanged for {unchanged_for}; forcing independent refresh now")
+        refreshed = self._force_refresh_crypto(symbol, tf, len(df), sig) if self.mode == "CRYPTO" else None
+        if refreshed is not None:
+            return True
+        logger.error(f"❌ [{symbol}] OHLCV remains stale/unchanged after forced refresh — symbol skipped; no analysis or trade decision will use it")
         return False
 
     def _crypto(self, symbol, tf, limit):
@@ -1620,15 +1694,14 @@ class MarketDataProvider:
         raw = self.exchange.fetch_ohlcv(symbol, tf, limit=limit)
         if not raw or len(raw) < 10:
             raise DataSourceError(f"Exchange returned insufficient candles for {symbol}")
-        df  = pd.DataFrame(raw,
-                columns=["timestamp","open","high","low","close","volume"])
+        df = pd.DataFrame(raw, columns=["timestamp","open","high","low","close","volume"])
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         df.set_index("timestamp", inplace=True)
         df = df.astype(float)
         self._validate_freshness(df, symbol, tf)
         if not self._check_stale_repeat(df, symbol, tf):
             return None
-        return df
+        return self._last_fresh_ohlcv.get((symbol, tf), df)
 
     def _stock(self, symbol, tf, limit):
         symbol = normalize_market_symbol(symbol, "STOCK")
@@ -1691,7 +1764,7 @@ class MarketDataProvider:
                 f"threshold of {max_age}. Data feed may be stale.")
 
     def get_price(self, symbol: str) -> Optional[float]:
-        """Live ticker price. Returns None (never a fake number) on failure."""
+        """Fetch a genuine live ticker. Rate-limited exchange returns None; host outage is fatal."""
         try:
             symbol = normalize_market_symbol(symbol, self.mode)
             if self.mode == "CRYPTO" and self.exchange:
@@ -1700,12 +1773,20 @@ class MarketDataProvider:
                 if px is None:
                     raise DataSourceError(f"No last price in ticker for {symbol}")
                 return float(px)
-            if (self.mode == "STOCK" or self.mode == "FOREX") and YF_AVAILABLE:
+            if self.mode in ("STOCK", "FOREX") and YF_AVAILABLE:
                 return float(yf.Ticker(symbol).fast_info.last_price)
         except Exception as e:
-            logger.error(f"❌ [{symbol}] Live price fetch failed: {self._explain_error(e)}")
+            if self.mode == "CRYPTO" and self._is_rate_limit_error(e) and self.exchange_id:
+                self._mark_exchange_cooldown(self.exchange_id, e)
+            elif self._is_network_error(e) and not self._internet_available():
+                self.fatal_network_error = True
+                self.fatal_network_message = f"Host Internet unavailable while fetching live price for {symbol}: {self._explain_error(e)}"
+                logger.critical(f"🛑 {self.fatal_network_message}")
+            else:
+                logger.error(f"❌ [{symbol}] Live price fetch failed: {self._explain_error(e)}")
             return None
         return None
+
 
 # Seconds represented by each supported candle timeframe.
 _TF_SECONDS = {
@@ -2909,7 +2990,15 @@ class TradingBot:
                         print(Fore.YELLOW+f"  ⚠️  {msg}"+Style.RESET_ALL)
                         _elog(f"⚠️ Trade {ai_res.get('action')} by AI {sym}: {ai_res.get('analysis', 'N/A')}", "WARN")
 
+            except NetworkUnavailableError:
+                self.running = False
+                _STOP_EVENT.set()
+                raise
             except Exception as e:
+                if getattr(self.data, "fatal_network_error", False):
+                    self.running = False
+                    _STOP_EVENT.set()
+                    raise NetworkUnavailableError(self.data.fatal_network_message)
                 _elog(f"Scan error {sym}: {e}", "ERROR")
 
         for _sym, _px in prices.items():
@@ -2985,20 +3074,12 @@ class TradingBot:
                 _cache_price(sym, px)          # genuine live price — refresh the cache
                 prices[sym] = px
                 continue
-            cached, age = _cached_price_if_fresh(sym)
-            if cached is not None:
-                px = cached
-                _elog(f"{sym}: live price fetch failed — using cached price "
-                      f"${cached:.4f} from {age:.1f}s ago (< {PRICE_CACHE_MAX_AGE}s "
-                      f"freshness limit) so SL/TP can still be checked", "WARN")
-                prices[sym] = px           # NOT re-cached — don't refresh its timestamp
-            elif age is not None:
-                _elog(f"{sym}: live price fetch failed and cached price is "
-                      f"{age:.1f}s old (stale, > {PRICE_CACHE_MAX_AGE}s limit) — "
-                      f"exit check skipped this cycle rather than act on stale data", "ERROR")
-            else:
-                _elog(f"{sym}: live price fetch failed and no cached price "
-                      f"available yet — exit check skipped this cycle", "ERROR")
+            if getattr(self.data, "fatal_network_error", False):
+                self.running = False
+                _STOP_EVENT.set()
+                logger.critical(f"🛑 Bot stopped: {self.data.fatal_network_message}")
+                return
+            _elog(f"{sym}: genuine live price unavailable — exit check skipped; no cached price will be used", "ERROR")
         if prices:
             self.tm.check_exits(prices)
 
@@ -3027,7 +3108,18 @@ class TradingBot:
                     prune_database()
                 except KeyboardInterrupt:
                     raise
+                except NetworkUnavailableError as e:
+                    self.running = False
+                    _STOP_EVENT.set()
+                    logger.critical(f"🛑 Bot stopped: {e}")
+                    _elog(f"BOT STOPPED — Internet unavailable: {e}", "ERROR")
+                    break
                 except Exception as e:
+                    if getattr(self.data, "fatal_network_error", False):
+                        self.running = False
+                        _STOP_EVENT.set()
+                        logger.critical(f"🛑 Bot stopped due to host network outage: {self.data.fatal_network_message}")
+                        break
                     logger.error(f"Scan loop error: {e}", exc_info=True)
                     _elog(f"Loop error: {e}", "ERROR")
 
