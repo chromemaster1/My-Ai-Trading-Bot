@@ -58,10 +58,25 @@ def _clean_credential(value) -> str:
 
 
 CONFIG = {
-    "market_mode"            : "CRYPTO",
+    "market_mode"            : "CRYPTO",   # legacy single-market field — kept as a fallback for older config/UI that only knows one mode
+    # Multi-market: the bot scans and trades every market listed here
+    # concurrently (e.g. crypto spot + crypto futures + forex at once).
+    # This is the source of truth for what's active; market_mode above is
+    # only consulted when this is empty. See _resolve_active_markets().
+    "active_markets"         : ["CRYPTO"],
     "crypto_symbols"         : ["BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XAUT/USDT"],
     "crypto_exchange"        : "bybit",
     "crypto_timeframe"       : "15m",
+    "futures_symbols"        : ["BTC/USDT", "ETH/USDT"],
+    "futures_exchange"       : "bybit",
+    "futures_timeframe"      : "15m",
+    # Futures execution settings — only used when a FUTURES trade is
+    # actually sent live (see execute_live_order). Leverage is applied
+    # per-symbol before the order; margin mode is best-effort since not
+    # every exchange exposes it through ccxt uniformly.
+    "futures_leverage"       : 3,
+    "futures_margin_mode"    : "isolated",   # "isolated" | "cross"
+    "futures_settle_currency": "USDT",       # used to build ccxt's BASE/QUOTE:SETTLE perpetual symbol
     "stock_symbols"          : ["AAPL", "TSLA", "NVDA", "AMZN", "XAGUSD=X", "XAUUSD=X"],
     "stock_timeframe"        : "15m",
     "forex_symbols"         : ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X"],
@@ -143,6 +158,11 @@ CONFIG = {
                    "connected":False,"balance":0.0,"last_sync":None,"last_error":""},
         "FOREX":   {"exchange":"bybit","api_key":"","api_secret":"","passphrase":"",
                    "connected":False,"balance":0.0,"last_sync":None,"last_error":""},
+        "FUTURES": {"exchange": "bybit",
+                   "api_key": _clean_credential(os.environ.get("LIVE_API_KEY", "")),
+                   "api_secret": _clean_credential(os.environ.get("LIVE_API_SECRET", "")),
+                   "passphrase": _clean_credential(os.environ.get("LIVE_PASSPHRASE", "")),
+                   "connected":False,"balance":0.0,"last_sync":None,"last_error":""},
     },
     "log_level"              : "INFO",
     "log_file"               : "trading_bot.log",
@@ -203,7 +223,11 @@ def normalize_market_symbol(symbol: str, market: Optional[str] = None) -> str:
     market_key = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
     value = value.replace(" ", "").upper()
 
-    if market_key == "CRYPTO":
+    if market_key in {"CRYPTO", "FUTURES"}:
+        # FUTURES shares crypto's BASE/QUOTE notation — ccxt uses the same
+        # unified symbol format for perpetuals (settlement suffixes like
+        # ":USDT" are appended by the execution layer, not here, so the
+        # data/signal side stays identical between spot and futures).
         if "/" in value:
             base, quote = value.split("/", 1)
             return f"{base.strip()}/{quote.strip()}" if base and quote else value
@@ -970,12 +994,15 @@ def _get_live_exchange_client(api_key: Optional[str] = None,
     if not k or not s:
         return None, (f"No API credentials for {m}. "
                       "Go to Settings → Live Trading to connect.")
-    ex_id = (acc.get("exchange") or CONFIG.get("crypto_exchange","binance")).lower()
+    ex_id = (acc.get("exchange") or CONFIG.get(
+        "futures_exchange" if m == "FUTURES" else "crypto_exchange", "binance")).lower()
     ex_cls = getattr(ccxt, ex_id, None)
     if ex_cls is None:
         return None, f"Unsupported exchange: {ex_id}"
+    # FUTURES orders must be placed against the derivatives book, not spot —
+    # same exchange and credentials, different defaultType.
     kwargs = {"apiKey": k, "secret": s, "enableRateLimit": True,
-              "options": {"defaultType": "spot"}}
+              "options": {"defaultType": "future" if m == "FUTURES" else "spot"}}
     if p: kwargs["password"] = p
     try:
         # Do NOT call load_markets() — triggers 451 geo-blocks on public endpoints
@@ -1115,6 +1142,61 @@ def _translate_forex_symbol_for_exchange(forex_symbol: str, exchange) -> Optiona
     return None
 
 
+def _resolve_futures_symbol(symbol: str, exchange) -> Optional[str]:
+    """Resolve a spot-style symbol (BTC/USDT) to the exchange's actual
+    perpetual/futures contract symbol, validated against its real market
+    list rather than guessed. ccxt's unified notation for a USDT-settled
+    perpetual is BASE/QUOTE:SETTLE (e.g. BTC/USDT:USDT), but not every
+    exchange lists every pair as a perpetual — returning None here means
+    the caller skips the trade instead of sending an invalid order."""
+    base_symbol = normalize_market_symbol(symbol, "FUTURES")
+    settle = CONFIG.get("futures_settle_currency", "USDT")
+    try:
+        exchange.load_markets()
+    except Exception as exc:
+        logger.error(f"Could not load futures markets for "
+                     f"{getattr(exchange,'id','exchange')}: {exc}")
+        return None
+
+    candidates = [f"{base_symbol}:{settle}", base_symbol]
+    for cand in candidates:
+        mkt = exchange.markets.get(cand)
+        if mkt and (mkt.get("swap") or mkt.get("future") or mkt.get("contract")):
+            return cand
+    # Last resort: any listed contract market with the same base/quote
+    if "/" in base_symbol:
+        base, quote = base_symbol.split("/", 1)
+        for msym, mkt in exchange.markets.items():
+            if (mkt.get("swap") or mkt.get("future") or mkt.get("contract")) \
+               and mkt.get("base") == base and mkt.get("quote") == quote:
+                return msym
+    return None
+
+
+def _apply_futures_leverage(exchange, sym: str) -> None:
+    """Best-effort leverage + margin mode setup before a futures order.
+    Deliberately non-fatal: exchanges differ in whether these are
+    settable via ccxt, and several reject the call as an error when the
+    value is already what you asked for. Failing the whole trade over
+    that would be wrong — the order itself still uses the account's
+    existing settings, so this is logged rather than raised."""
+    lev  = CONFIG.get("futures_leverage")
+    mode = (CONFIG.get("futures_margin_mode") or "").lower()
+    if mode in ("isolated", "cross"):
+        try:
+            exchange.set_margin_mode(mode, sym)
+        except Exception as exc:
+            logger.warning(f"Could not set {mode} margin on {sym} "
+                           f"(continuing with account default): {exc}")
+    if lev:
+        try:
+            exchange.set_leverage(int(lev), sym)
+            _elog(f"Futures leverage set to {int(lev)}x on {sym}", "INFO")
+        except Exception as exc:
+            logger.warning(f"Could not set leverage {lev}x on {sym} "
+                           f"(continuing with account default): {exc}")
+
+
 def execute_live_order(symbol: str, side: str, size: float,
                        market: Optional[str] = None) -> dict:
     """Place a market order. `size` = BASE CURRENCY quantity (e.g. 0.001 BTC)."""
@@ -1135,6 +1217,15 @@ def execute_live_order(symbol: str, side: str, size: float,
                        f"trade was skipped rather than sent as an invalid order.")
                 _elog(f"⚠️ {err}", "WARN")
                 return {"ok": False, "error": err}
+        elif m == "FUTURES":
+            sym = _resolve_futures_symbol(symbol, exchange)
+            if sym is None:
+                exchange_id = getattr(exchange, "id", "this exchange")
+                err = (f"{symbol} has no matching perpetual/futures contract on "
+                       f"{exchange_id}. Skipped rather than sent as an invalid order.")
+                _elog(f"⚠️ {err}", "WARN")
+                return {"ok": False, "error": err}
+            _apply_futures_leverage(exchange, sym)
         else:
             # Normalise symbol — ccxt needs BTC/USDT not BTCUSDT
             sym = normalize_market_symbol(symbol, m)
@@ -1377,7 +1468,7 @@ class MarketDataProvider:
         self._last_ohlcv_sig: dict = {}
         self._last_ohlcv_changed_at: dict = {}
 
-        if mode == "CRYPTO":
+        if mode == "CRYPTO" or mode == "FUTURES":
             if not CCXT_AVAILABLE:
                 self.last_error = "ccxt not installed — run: pip install ccxt"
                 logger.error(f"❌ {self.last_error}")
@@ -1456,17 +1547,24 @@ class MarketDataProvider:
         return True
 
     def _build_exchange(self, ex_id: str):
-        if ex_id in self._exchange_clients:
-            return self._exchange_clients[ex_id]
+        # Cache key is namespaced by mode: FUTURES needs its own ccxt
+        # client with defaultType="future" on the SAME exchange id that
+        # CRYPTO uses with "spot". Keying the cache on ex_id alone would
+        # hand a spot client to the futures provider (or vice versa)
+        # depending on which connected first.
+        is_futures = (self.mode == "FUTURES")
+        cache_key = f"{ex_id}:{'future' if is_futures else 'spot'}"
+        if cache_key in self._exchange_clients:
+            return self._exchange_clients[cache_key]
         if not hasattr(ccxt, ex_id):
             return None
         ex_class = getattr(ccxt, ex_id)
         exchange = ex_class({
             "enableRateLimit": True,
-            "options": {"defaultType": "spot"},
+            "options": {"defaultType": "future" if is_futures else "spot"},
             "headers": {"Cache-Control":"no-cache, no-store, must-revalidate", "Pragma":"no-cache"},
         })
-        self._exchange_clients[ex_id] = exchange
+        self._exchange_clients[cache_key] = exchange
         return exchange
 
     def _candidate_exchanges(self):
@@ -1477,7 +1575,10 @@ class MarketDataProvider:
     def _connect_crypto(self):
         self.fatal_network_error = False
         self.fatal_network_message = ""
-        preferred = CONFIG.get("crypto_exchange", "bybit").lower()
+        # FUTURES reuses this exact connection path — same exchanges, same
+        # failover/cooldown logic — just with its own exchange preference key.
+        exchange_key = "futures_exchange" if self.mode == "FUTURES" else "crypto_exchange"
+        preferred = CONFIG.get(exchange_key, "bybit").lower()
         candidates = [preferred] + [e for e in self._candidate_exchanges() if e != preferred]
         for ex_id in candidates:
             if self._exchange_on_cooldown(ex_id):
@@ -1489,10 +1590,10 @@ class MarketDataProvider:
                     continue
                 exchange.fetch_ticker("BTC/USDT")
                 self.exchange, self.exchange_id, self.healthy = exchange, ex_id, True
-                CONFIG["crypto_exchange"] = ex_id
+                CONFIG[exchange_key] = ex_id
                 if ex_id != preferred:
-                    logger.warning(f"⚠️ '{preferred}' unavailable — auto-switched to '{ex_id}' for live market data")
-                logger.info(f"✅ Connected to {ex_id} — live data confirmed")
+                    logger.warning(f"⚠️ '{preferred}' unavailable — auto-switched to '{ex_id}' for live {self.mode.lower()} data")
+                logger.info(f"✅ Connected to {ex_id} ({self.mode}) — live data confirmed")
                 return
             except Exception as e:
                 if self._is_rate_limit_error(e):
@@ -1516,7 +1617,7 @@ class MarketDataProvider:
 
     def get_ohlcv(self, symbol: str, tf: str = "15m", limit: int = 200) -> Optional[pd.DataFrame]:
         """Fetch LIVE OHLCV. Crypto symbols fail over per-symbol; rejected/stale data is never used."""
-        if self.mode != "CRYPTO":
+        if self.mode not in ("CRYPTO", "FUTURES"):
             try:
                 if self.mode == "FOREX": return self._forex(symbol, tf, limit)
                 if self.mode == "STOCK": return self._stock(symbol, tf, limit)
@@ -1681,7 +1782,7 @@ class MarketDataProvider:
             self._last_fresh_ohlcv[key] = df
             return True
         logger.warning(f"⚠️ [{symbol}] OHLCV unchanged for {unchanged_for}; forcing independent refresh now")
-        refreshed = self._force_refresh_crypto(symbol, tf, len(df), sig) if self.mode == "CRYPTO" else None
+        refreshed = self._force_refresh_crypto(symbol, tf, len(df), sig) if self.mode in ("CRYPTO", "FUTURES") else None
         if refreshed is not None:
             return True
         logger.error(f"❌ [{symbol}] OHLCV remains stale/unchanged after forced refresh — symbol skipped; no analysis or trade decision will use it")
@@ -1758,7 +1859,7 @@ class MarketDataProvider:
                    "15m":timedelta(hours=2),"30m":timedelta(hours=4),
                    "1h":timedelta(hours=8),"4h":timedelta(hours=24),
                    "1d":timedelta(days=4)}.get(tf, timedelta(hours=6))
-        if self.mode == "CRYPTO" and age > max_age:
+        if self.mode in ("CRYPTO", "FUTURES") and age > max_age:
             raise DataSourceError(
                 f"{symbol}: latest candle is {age} old — exceeds freshness "
                 f"threshold of {max_age}. Data feed may be stale.")
@@ -1767,7 +1868,7 @@ class MarketDataProvider:
         """Fetch a genuine live ticker. Rate-limited exchange returns None; host outage is fatal."""
         try:
             symbol = normalize_market_symbol(symbol, self.mode)
-            if self.mode == "CRYPTO" and self.exchange:
+            if self.mode in ("CRYPTO", "FUTURES") and self.exchange:
                 ticker = self.exchange.fetch_ticker(symbol)
                 px = ticker.get("last") or ticker.get("close")
                 if px is None:
@@ -1776,7 +1877,7 @@ class MarketDataProvider:
             if self.mode in ("STOCK", "FOREX") and YF_AVAILABLE:
                 return float(yf.Ticker(symbol).fast_info.last_price)
         except Exception as e:
-            if self.mode == "CRYPTO" and self._is_rate_limit_error(e) and self.exchange_id:
+            if self.mode in ("CRYPTO", "FUTURES") and self._is_rate_limit_error(e) and self.exchange_id:
                 self._mark_exchange_cooldown(self.exchange_id, e)
             elif self._is_network_error(e) and not self._internet_available():
                 self.fatal_network_error = True
@@ -2602,27 +2703,96 @@ class TradeManager:
 #  TRADING BOT
 # ════════════════════════════════════════════════════════════
 
+_MARKET_SPECS = {
+    "CRYPTO":  ("crypto_symbols",  "crypto_timeframe"),
+    "FUTURES": ("futures_symbols", "futures_timeframe"),
+    "STOCK":   ("stock_symbols",   "stock_timeframe"),
+    "FOREX":   ("forex_symbols",   "forex_timeframe"),
+}
+
+
+def _resolve_active_markets() -> list:
+    """Single source of truth for which markets/symbols/timeframes are
+    active — shared by TradingBot's scan loop and the /api/predictions
+    and /api/analysis routes so all three always agree instead of each
+    re-deriving it independently and drifting apart.
+
+    Symbols are normalised per-market on the way out, so a symbol typed
+    into Settings in any casing/format reaches the data provider and the
+    exchange client in the shape each expects."""
+    active = CONFIG.get("active_markets") or [CONFIG.get("market_mode", "CRYPTO")]
+    seen = set()
+    active = [m.strip().upper() for m in active
+              if m and not (m.strip().upper() in seen or seen.add(m.strip().upper()))]
+    out = []
+    for mode in active:
+        spec = _MARKET_SPECS.get(mode)
+        if not spec:
+            continue
+        sym_key, tf_key = spec
+        symbols = [normalize_market_symbol(s, mode) for s in CONFIG.get(sym_key, []) if s]
+        symbols = [s for s in symbols if s]
+        if not symbols:
+            continue
+        out.append({"mode": mode, "symbols": symbols, "tf": CONFIG.get(tf_key, "15m")})
+    if not out:
+        out = [{"mode": "CRYPTO",
+                "symbols": [normalize_market_symbol(s, "CRYPTO") for s in CONFIG.get("crypto_symbols", [])],
+                "tf": CONFIG.get("crypto_timeframe", "15m")}]
+    return out
+
+
+def _apply_runtime_config_to_bot():
+    """Apply relevant CONFIG changes to the running _BOT without full restart.
+
+    Rebuilds the `markets` contexts from `_resolve_active_markets()` and
+    swaps them into the running bot so subsequent scans use the new
+    symbols/timeframes/exchanges immediately.
+    """
+    global _BOT
+    if not _BOT:
+        return
+    try:
+        new_markets = [{**m, "data": MarketDataProvider(m["mode"])} for m in _resolve_active_markets()]
+        _BOT.markets = new_markets
+        _BOT.markets_by_mode = {m["mode"]: m for m in new_markets}
+        # Point the bot to the first market's context so anything reading
+        # self.mode/self.data/self.tf/self.symbols between scans sees sane values.
+        first = new_markets[0]
+        _BOT.mode, _BOT.data, _BOT.tf, _BOT.symbols = (
+            first["mode"], first["data"], first["tf"], first["symbols"])
+        _elog("Runtime config applied to running bot — markets updated", "INFO")
+    except Exception as e:
+        logger.error(f"Failed to apply runtime config to running bot: {e}")
+
+
 class TradingBot:
     def __init__(self, tm: TradeManager):
-        self.mode       = CONFIG["market_mode"]
-        self.data       = MarketDataProvider(self.mode)
         self.ta         = TechnicalAnalysis()
         self.ai         = AIAnalyzer()
         self.tm         = tm
         self.running    = False
         self.scan_count = 0
-        if self.mode == "CRYPTO":
-            self.symbols = CONFIG.get("crypto_symbols", [])
-            self.tf = CONFIG.get("crypto_timeframe", "15m")
-        elif self.mode == "STOCK":
-            self.symbols = CONFIG.get("stock_symbols", [])
-            self.tf = CONFIG.get("stock_timeframe", "15m")
-        elif self.mode == "FOREX":
-            self.symbols = CONFIG.get("forex_symbols", [])
-            self.tf = CONFIG.get("forex_timeframe", "15m")
-        else:  # CUSTOM or unknown falls back to crypto+stock
-            self.symbols = CONFIG.get("crypto_symbols", []) + CONFIG.get("stock_symbols", [])
-            self.tf = CONFIG.get("crypto_timeframe", "15m")
+
+        # Multi-market: the bot scans/trades every configured market
+        # concurrently (crypto spot + futures + forex etc.), each with its
+        # OWN data provider, symbol list and timeframe, since those
+        # genuinely differ per market. Trade-management logic (exits, chop
+        # filter, profit-lock, live execution) needed no changes for this —
+        # every trade already records its own "market" and is routed
+        # individually where it matters (see monitor_open_trades).
+        self.markets = [{**m, "data": MarketDataProvider(m["mode"])}
+                        for m in _resolve_active_markets()]
+        self.markets_by_mode = {m["mode"]: m for m in self.markets}
+
+        # self.mode/data/tf/symbols are swapped to each market's context by
+        # scan_once() before every pass, so everything downstream always
+        # refers to "whichever market is being scanned right now" — exactly
+        # as it did when only one market existed. Seeded to the first market
+        # so anything reading them before the first scan has sane values.
+        first = self.markets[0]
+        self.mode, self.data, self.tf, self.symbols = (
+            first["mode"], first["data"], first["tf"], first["symbols"])
 
         # Scan cadence is its own setting (CONFIG["scan_interval_seconds"]),
         # independent of the candle timeframe a trade is opened/closed on
@@ -2644,13 +2814,26 @@ class TradingBot:
         self.last_signals = {}
 
     def scan_once(self):
+        """One full pass over EVERY active market. self.mode/data/tf/symbols
+        are pointed at each market's context in turn before calling
+        _scan_one_market() — the per-symbol scan logic below is unchanged
+        and unaware multiple markets exist; it just always operates on
+        whichever market is currently assigned to those attributes."""
+        for ctx in self.markets:
+            self.mode    = ctx["mode"]
+            self.data    = ctx["data"]
+            self.tf      = ctx["tf"]
+            self.symbols = ctx["symbols"]
+            self._scan_one_market()
+
+    def _scan_one_market(self):
         global _PRICE_CACHE
         self.scan_count += 1
         ts = datetime.utcnow().strftime("%H:%M:%S")
         _section(f"🔍 SCAN #{self.scan_count}  [{ts} UTC]  {self.mode}")
         _elog(f"Scan #{self.scan_count} — {self.mode}", "INFO")
 
-        if self.mode == "CRYPTO" and not self.data.healthy:
+        if self.mode in ("CRYPTO", "FUTURES") and not self.data.healthy:
             msg = (f"No crypto exchange reachable — {self.data.last_error or 'unknown error'}")
             print(Fore.RED + f"  ⚠️  {msg}" + Style.RESET_ALL)
             _elog(msg, "ERROR")
@@ -3069,15 +3252,24 @@ class TradingBot:
         prices = {}
         for t in open_trades:
             sym = t["symbol"]
-            px = self.data.get_price(sym)
+            # Route through THIS trade's own market provider rather than
+            # whichever market self.data currently points at — self.data is
+            # reassigned per-market during scan_once(), so using it directly
+            # would price a forex position off the crypto feed (or vice
+            # versa) depending purely on scan timing. Each trade already
+            # records the market it belongs to.
+            mkt = (t.get("market") or self.mode or "CRYPTO").upper()
+            ctx = self.markets_by_mode.get(mkt)
+            provider = ctx["data"] if ctx else self.data
+            px = provider.get_price(sym)
             if px is not None:
                 _cache_price(sym, px)          # genuine live price — refresh the cache
                 prices[sym] = px
                 continue
-            if getattr(self.data, "fatal_network_error", False):
+            if getattr(provider, "fatal_network_error", False):
                 self.running = False
                 _STOP_EVENT.set()
-                logger.critical(f"🛑 Bot stopped: {self.data.fatal_network_message}")
+                logger.critical(f"🛑 Bot stopped: {provider.fatal_network_message}")
                 return
             _elog(f"{sym}: genuine live price unavailable — exit check skipped; no cached price will be used", "ERROR")
         if prices:
@@ -3085,9 +3277,11 @@ class TradingBot:
 
     def run(self):
         self.running = True
-        syms = ", ".join(self.symbols)
-        _elog(f"Bot started — {self.mode} | Paper={CONFIG['paper_trading']} | "
-              f"Timeframe={self.tf} | Scan every {self.scan_interval_seconds}s | {syms}", "INFO")
+        summary = " | ".join(f"{m['mode']}({m['tf']}): {', '.join(m['symbols'])}"
+                             for m in self.markets)
+        _elog(f"Bot started — {len(self.markets)} active market(s) | "
+              f"Paper={CONFIG['paper_trading']} | Scan every {self.scan_interval_seconds}s "
+              f":: {summary}", "INFO")
         # Two independent cadences:
         #  1) Full scan (self.scan_interval_seconds, below) — looks for new
         #     entries AND re-checks every open position's signal on its own
@@ -3225,12 +3419,6 @@ def api_predictions():
       - Expected value calculation using the 4:1 R:R ratio
     All numbers are computed from live OHLCV — no fabricated data.
     """
-    mode    = CONFIG["market_mode"]
-    symbols = (CONFIG["crypto_symbols"] if mode == "CRYPTO" else
-               CONFIG["stock_symbols"]  if mode == "STOCK"  else
-               CONFIG.get("forex_symbols", []))
-    tf       = (CONFIG["crypto_timeframe"] if mode == "CRYPTO" else
-                CONFIG["stock_timeframe"])
     min_conf = CONFIG["min_confidence_to_trade"]
     sl_floor = CONFIG["stop_loss_pct"]
     tp_floor = CONFIG["take_profit_pct"]
@@ -3238,7 +3426,6 @@ def api_predictions():
     risk_amt = bal * CONFIG["max_risk_per_trade"]
     min_rr   = 4.0
 
-    data_provider = _BOT.data if (_BOT and _BOT.data) else MarketDataProvider(mode)
     ta = TechnicalAnalysis()
 
     predictions = []
@@ -3293,238 +3480,248 @@ def api_predictions():
         {"key":"rsi24_bearish",  "label":f"RSI({ta.confirm}) Confirms Bearish Bias", "pts":10, "dir":"sell"},
     ]
 
-    for sym in symbols:
-        try:
-            df = data_provider.get_ohlcv(sym, tf, limit=200)
-            if df is None or len(df) < 50:
-                errors.append({"symbol": sym, "error": data_provider.last_error or "No data"})
-                continue
+    active_markets = _resolve_active_markets()
+    for _mctx in active_markets:
+        mode    = _mctx["mode"]
+        symbols = _mctx["symbols"]
+        tf      = _mctx["tf"]
+        # Reuse the running bot's already-connected provider for this
+        # exact market when available, rather than opening a duplicate.
+        _bot_ctx = _BOT.markets_by_mode.get(mode) if (_BOT and getattr(_BOT, "markets_by_mode", None)) else None
+        data_provider = _bot_ctx["data"] if _bot_ctx else MarketDataProvider(mode)
+        for sym in symbols:
+            try:
+                df = data_provider.get_ohlcv(sym, tf, limit=200)
+                if df is None or len(df) < 50:
+                    errors.append({"symbol": sym, "error": data_provider.last_error or "No data"})
+                    continue
 
-            df   = ta.compute(df)
-            sig  = ta.signal(df)
+                df   = ta.compute(df)
+                sig  = ta.signal(df)
 
-            # Same single-source-of-truth fix as /api/analysis — see the
-            # comment there for why this matters.
-            signal_synced = False
-            signal_age_s  = None
-            if _BOT and _BOT.running and sym in _BOT.last_signals:
-                cached = _BOT.last_signals[sym]
-                try:
-                    age = (datetime.utcnow() - datetime.fromisoformat(cached["ts"])).total_seconds()
-                except Exception:
-                    age = None
-                if age is not None and age <= max(_BOT.scan_interval_seconds * 2, 120):
-                    sig = cached
-                    signal_synced = True
-                    signal_age_s = round(age, 1)
+                # Same single-source-of-truth fix as /api/analysis — see the
+                # comment there for why this matters.
+                signal_synced = False
+                signal_age_s  = None
+                if _BOT and _BOT.running and sym in _BOT.last_signals:
+                    cached = _BOT.last_signals[sym]
+                    try:
+                        age = (datetime.utcnow() - datetime.fromisoformat(cached["ts"])).total_seconds()
+                    except Exception:
+                        age = None
+                    if age is not None and age <= max(_BOT.scan_interval_seconds * 2, 120):
+                        sig = cached
+                        signal_synced = True
+                        signal_age_s = round(age, 1)
 
-            last = df.iloc[-1]; prev = df.iloc[-2]
-            px   = float(last["close"])
+                last = df.iloc[-1]; prev = df.iloc[-2]
+                px   = float(last["close"])
 
-            def sf(v):
-                try:
-                    f = float(v)
-                    return None if (np.isnan(f) or np.isinf(f)) else round(f, 6)
-                except Exception:
-                    return None
+                def sf(v):
+                    try:
+                        f = float(v)
+                        return None if (np.isnan(f) or np.isinf(f)) else round(f, 6)
+                    except Exception:
+                        return None
 
-            rsi_fast  = sf(last.get(f"rsi_{ta.fast}"))
-            rsi_slow  = sf(last.get(f"rsi_{ta.slow}"))
-            rsi_confirm = sf(last.get(f"rsi_{ta.confirm}"))
-            ema_trend = int(last.get("ema_trend", -1))
-            vs        = bool(last.get("vol_surge", False))
-            mom5      = sf(last.get("mom5"))
-            atr       = sf(last.get("atr")) or (px * sl_floor)
-            last_sh   = sf(last.get("last_sh"))
-            last_sl_s = sf(last.get("last_sl"))
-            thr       = CONFIG["rsi_signal_threshold"]
-            rsi_div   = float(last.get("rsi_div", 0) or 0)
-            rsi_pdiv  = float(prev.get("rsi_div", 0) or 0)
-            pct_chg   = round((px - float(df["close"].iloc[-2])) / float(df["close"].iloc[-2]) * 100, 3)
+                rsi_fast  = sf(last.get(f"rsi_{ta.fast}"))
+                rsi_slow  = sf(last.get(f"rsi_{ta.slow}"))
+                rsi_confirm = sf(last.get(f"rsi_{ta.confirm}"))
+                ema_trend = int(last.get("ema_trend", -1))
+                vs        = bool(last.get("vol_surge", False))
+                mom5      = sf(last.get("mom5"))
+                atr       = sf(last.get("atr")) or (px * sl_floor)
+                last_sh   = sf(last.get("last_sh"))
+                last_sl_s = sf(last.get("last_sl"))
+                thr       = CONFIG["rsi_signal_threshold"]
+                rsi_div   = float(last.get("rsi_div", 0) or 0)
+                rsi_pdiv  = float(prev.get("rsi_div", 0) or 0)
+                pct_chg   = round((px - float(df["close"].iloc[-2])) / float(df["close"].iloc[-2]) * 100, 3)
 
-            # Score which signals are currently active
-            active = {
-                "rsi_oversold"  : bool(rsi_fast and rsi_fast < CONFIG["rsi_oversold"]),
-                "rsi_overbought": bool(rsi_fast and rsi_fast > CONFIG["rsi_overbought"]),
-                "rsi_cross_buy" : bool(rsi_div > thr and rsi_pdiv <= thr),
-                "rsi_cross_sell": bool(rsi_div < -thr and rsi_pdiv >= -thr),
-                "swing_low"     : bool(last_sl_s and abs(px - last_sl_s) / px < 0.012),
-                "swing_high"    : bool(last_sh  and abs(px - last_sh)  / px < 0.012),
-                "ema_bullish"   : ema_trend == 1,
-                "ema_bearish"   : ema_trend != 1,
-                "vol_surge"     : vs,
-                "momentum_pos"  : bool(mom5 and mom5 > 0.5),
-                "momentum_neg"  : bool(mom5 and mom5 < -0.5),
-                # Must match signal()'s >52/<48 thresholds exactly (not
-                # >50/<50) — a value sitting right at the midline shouldn't
-                # flip which side gets the point on tiny noise, same
-                # reasoning as the live engine.
-                "rsi24_bullish" : bool(rsi_confirm and rsi_confirm > 52),
-                "rsi24_bearish" : bool(rsi_confirm and rsi_confirm < 48),
-            }
+                # Score which signals are currently active
+                active = {
+                    "rsi_oversold"  : bool(rsi_fast and rsi_fast < CONFIG["rsi_oversold"]),
+                    "rsi_overbought": bool(rsi_fast and rsi_fast > CONFIG["rsi_overbought"]),
+                    "rsi_cross_buy" : bool(rsi_div > thr and rsi_pdiv <= thr),
+                    "rsi_cross_sell": bool(rsi_div < -thr and rsi_pdiv >= -thr),
+                    "swing_low"     : bool(last_sl_s and abs(px - last_sl_s) / px < 0.012),
+                    "swing_high"    : bool(last_sh  and abs(px - last_sh)  / px < 0.012),
+                    "ema_bullish"   : ema_trend == 1,
+                    "ema_bearish"   : ema_trend != 1,
+                    "vol_surge"     : vs,
+                    "momentum_pos"  : bool(mom5 and mom5 > 0.5),
+                    "momentum_neg"  : bool(mom5 and mom5 < -0.5),
+                    # Must match signal()'s >52/<48 thresholds exactly (not
+                    # >50/<50) — a value sitting right at the midline shouldn't
+                    # flip which side gets the point on tiny noise, same
+                    # reasoning as the live engine.
+                    "rsi24_bullish" : bool(rsi_confirm and rsi_confirm > 52),
+                    "rsi24_bearish" : bool(rsi_confirm and rsi_confirm < 48),
+                }
 
-            buy_score  = sum(s["pts"] for s in ALL_SIGNALS
-                             if s["dir"] in ("buy","both") and active.get(s["key"]))
-            sell_score = sum(s["pts"] for s in ALL_SIGNALS
-                             if s["dir"] in ("sell","both") and active.get(s["key"]))
-            # primary_dir / current_score come from the CANONICAL sig
-            # (TechnicalAnalysis.signal(), possibly bot-synced above) rather
-            # than being independently re-derived from buy_score/sell_score.
-            # buy_score/sell_score are kept only to drive the "which
-            # individual signals are lit up" breakdown below — the actual
-            # score/direction shown to the user must always trace back to
-            # the one canonical computation, or this page can drift out of
-            # sync with the live engine even when scanning the exact same
-            # candle, just from two hand-written copies of the same formula
-            # going out of sync over time.
-            primary_dir   = sig["side"] if sig["side"] in ("BUY","SELL") else ("BUY" if buy_score >= sell_score else "SELL")
-            current_score = round(sig.get("confidence", 0), 1)
-            gap_to_threshold = max(0, min_conf - current_score)
+                buy_score  = sum(s["pts"] for s in ALL_SIGNALS
+                                 if s["dir"] in ("buy","both") and active.get(s["key"]))
+                sell_score = sum(s["pts"] for s in ALL_SIGNALS
+                                 if s["dir"] in ("sell","both") and active.get(s["key"]))
+                # primary_dir / current_score come from the CANONICAL sig
+                # (TechnicalAnalysis.signal(), possibly bot-synced above) rather
+                # than being independently re-derived from buy_score/sell_score.
+                # buy_score/sell_score are kept only to drive the "which
+                # individual signals are lit up" breakdown below — the actual
+                # score/direction shown to the user must always trace back to
+                # the one canonical computation, or this page can drift out of
+                # sync with the live engine even when scanning the exact same
+                # candle, just from two hand-written copies of the same formula
+                # going out of sync over time.
+                primary_dir   = sig["side"] if sig["side"] in ("BUY","SELL") else ("BUY" if buy_score >= sell_score else "SELL")
+                current_score = round(sig.get("confidence", 0), 1)
+                gap_to_threshold = max(0, min_conf - current_score)
 
-            # SL/TP: use the canonical signal's own sl/tp when it has them
-            # (BUY/SELL case — this is what the bot would actually use).
-            # Only fall back to a fresh projection for the HOLD case, purely
-            # to show what a hypothetical trade would look like if this
-            # symbol reached threshold.
-            sl_price = sig.get("sl")
-            tp_price = sig.get("tp")
-            sl_dist = risk_dist = 0.0
-            if sl_price is None or tp_price is None:
-                if primary_dir == "BUY":
-                    sl_price  = round(min(px*(1-sl_floor), px - atr*1.2), 6)
-                    risk_dist = px - sl_price
-                    tp_price  = round(px + max(risk_dist*min_rr, px*tp_floor), 6)
+                # SL/TP: use the canonical signal's own sl/tp when it has them
+                # (BUY/SELL case — this is what the bot would actually use).
+                # Only fall back to a fresh projection for the HOLD case, purely
+                # to show what a hypothetical trade would look like if this
+                # symbol reached threshold.
+                sl_price = sig.get("sl")
+                tp_price = sig.get("tp")
+                sl_dist = risk_dist = 0.0
+                if sl_price is None or tp_price is None:
+                    if primary_dir == "BUY":
+                        sl_price  = round(min(px*(1-sl_floor), px - atr*1.2), 6)
+                        risk_dist = px - sl_price
+                        tp_price  = round(px + max(risk_dist*min_rr, px*tp_floor), 6)
+                    else:
+                        sl_price  = round(max(px*(1+sl_floor), px + atr*1.2), 6)
+                        risk_dist = sl_price - px
+                        tp_price  = round(px - max(risk_dist*min_rr, px*tp_floor), 6)
                 else:
-                    sl_price  = round(max(px*(1+sl_floor), px + atr*1.2), 6)
-                    risk_dist = sl_price - px
-                    tp_price  = round(px - max(risk_dist*min_rr, px*tp_floor), 6)
-            else:
-                risk_dist = abs(px - sl_price)
+                    risk_dist = abs(px - sl_price)
 
-            sl_pct = round(abs(risk_dist / px) * 100, 3) if px else 0
-            tp_pct = round(abs((tp_price - px) / px) * 100, 3) if px and tp_price else 0
-            rr_actual = round(tp_pct / sl_pct, 1) if sl_pct else 0
+                sl_pct = round(abs(risk_dist / px) * 100, 3) if px else 0
+                tp_pct = round(abs((tp_price - px) / px) * 100, 3) if px and tp_price else 0
+                rr_actual = round(tp_pct / sl_pct, 1) if sl_pct else 0
 
-            # Position sizing
-            pos_size  = round(risk_amt / risk_dist, 6) if risk_dist > 0 else 0
-            pos_value = round(pos_size * px, 2)
-            max_loss  = round(risk_dist * pos_size, 2)
-            max_gain  = round(max_loss * min_rr, 2)
-            win_rate  = estimate_win_rate(current_score)
-            ev        = expected_value(win_rate, max_loss)
+                # Position sizing
+                pos_size  = round(risk_amt / risk_dist, 6) if risk_dist > 0 else 0
+                pos_value = round(pos_size * px, 2)
+                max_loss  = round(risk_dist * pos_size, 2)
+                max_gain  = round(max_loss * min_rr, 2)
+                win_rate  = estimate_win_rate(current_score)
+                ev        = expected_value(win_rate, max_loss)
 
-            # Signals still needed to reach threshold
-            missing_dir = "buy" if primary_dir == "BUY" else "sell"
-            inactive_signals = [
-                s for s in ALL_SIGNALS
-                if s["dir"] in (missing_dir, "both") and not active.get(s["key"])
-            ]
-            # Find the minimum combination that would close the gap
-            needed_combos = []
-            remaining_gap = gap_to_threshold
-            for sig_item in sorted(inactive_signals, key=lambda x: -x["pts"]):
-                if remaining_gap <= 0:
-                    break
-                needed_combos.append(sig_item)
-                remaining_gap -= sig_item["pts"]
+                # Signals still needed to reach threshold
+                missing_dir = "buy" if primary_dir == "BUY" else "sell"
+                inactive_signals = [
+                    s for s in ALL_SIGNALS
+                    if s["dir"] in (missing_dir, "both") and not active.get(s["key"])
+                ]
+                # Find the minimum combination that would close the gap
+                needed_combos = []
+                remaining_gap = gap_to_threshold
+                for sig_item in sorted(inactive_signals, key=lambda x: -x["pts"]):
+                    if remaining_gap <= 0:
+                        break
+                    needed_combos.append(sig_item)
+                    remaining_gap -= sig_item["pts"]
 
-            # When would the next trigger likely fire?
-            # RSI(6) moves fast — estimate bars to oversold/overbought from current level
-            bars_to_rsi_trigger = None
-            if rsi_fast is not None:
-                if primary_dir == "BUY" and rsi_fast > CONFIG["rsi_oversold"]:
-                    bars_to_rsi_trigger = max(1, int((rsi_fast - CONFIG["rsi_oversold"]) / 3))
-                elif primary_dir == "SELL" and rsi_fast < CONFIG["rsi_overbought"]:
-                    bars_to_rsi_trigger = max(1, int((CONFIG["rsi_overbought"] - rsi_fast) / 3))
+                # When would the next trigger likely fire?
+                # RSI(6) moves fast — estimate bars to oversold/overbought from current level
+                bars_to_rsi_trigger = None
+                if rsi_fast is not None:
+                    if primary_dir == "BUY" and rsi_fast > CONFIG["rsi_oversold"]:
+                        bars_to_rsi_trigger = max(1, int((rsi_fast - CONFIG["rsi_oversold"]) / 3))
+                    elif primary_dir == "SELL" and rsi_fast < CONFIG["rsi_overbought"]:
+                        bars_to_rsi_trigger = max(1, int((CONFIG["rsi_overbought"] - rsi_fast) / 3))
 
-            # Candlestick pattern
-            body   = abs(px - float(last["open"]))
-            candle = float(last["high"]) - float(last["low"])
-            wick_r = (float(last["high"]) - max(px, float(last["open"]))) / candle if candle else 0
-            wick_l = (min(px, float(last["open"])) - float(last["low"])) / candle if candle else 0
-            # A zero-range candle (high == low — happens on very quiet bars)
-            # would otherwise divide by zero here; treat it as a Doji
-            # (no real body relative to range) instead of crashing.
-            pattern = ("Doji" if (candle == 0 or body/candle < 0.1) else
-                       "Hammer" if wick_l > 0.6 else
-                       "Shooting Star" if wick_r > 0.6 else
-                       "Bullish" if px > float(last["open"]) else "Bearish")
+                # Candlestick pattern
+                body   = abs(px - float(last["open"]))
+                candle = float(last["high"]) - float(last["low"])
+                wick_r = (float(last["high"]) - max(px, float(last["open"]))) / candle if candle else 0
+                wick_l = (min(px, float(last["open"])) - float(last["low"])) / candle if candle else 0
+                # A zero-range candle (high == low — happens on very quiet bars)
+                # would otherwise divide by zero here; treat it as a Doji
+                # (no real body relative to range) instead of crashing.
+                pattern = ("Doji" if (candle == 0 or body/candle < 0.1) else
+                           "Hammer" if wick_l > 0.6 else
+                           "Shooting Star" if wick_r > 0.6 else
+                           "Bullish" if px > float(last["open"]) else "Bearish")
 
-            # Readiness tier
-            if current_score >= min_conf:
-                tier = "TRADE_NOW"
-            elif current_score >= min_conf * 0.82:
-                tier = "VERY_CLOSE"
-            elif current_score >= min_conf * 0.65:
-                tier = "BUILDING"
-            elif current_score >= min_conf * 0.45:
-                tier = "WATCHING"
-            else:
-                tier = "EARLY"
+                # Readiness tier
+                if current_score >= min_conf:
+                    tier = "TRADE_NOW"
+                elif current_score >= min_conf * 0.82:
+                    tier = "VERY_CLOSE"
+                elif current_score >= min_conf * 0.65:
+                    tier = "BUILDING"
+                elif current_score >= min_conf * 0.45:
+                    tier = "WATCHING"
+                else:
+                    tier = "EARLY"
 
-            predictions.append({
-                "symbol"           : sym,
-                "price"            : round(px, 6),
-                "pct_change"       : pct_chg,
-                "direction"        : primary_dir,
-                "current_score"    : current_score,
-                "min_conf"         : min_conf,
-                "gap_to_threshold" : gap_to_threshold,
-                "tier"             : tier,
-                "meets_threshold"  : current_score >= min_conf,
-                "in_open_trade"    : any(t["symbol"]==sym for t in (_TM.open_trades if _TM else [])),
-                # Trade parameters
-                "entry"            : round(px, 6),
-                "sl"               : sl_price,
-                "tp"               : tp_price,
-                "sl_pct"           : sl_pct,
-                "tp_pct"           : tp_pct,
-                "rr_ratio"         : rr_actual,
-                "synced_with_bot"  : signal_synced,
-                "signal_age_s"     : signal_age_s,
-                # Position & risk
-                "position_size"    : pos_size,
-                "position_value"   : pos_value,
-                "max_loss_usd"     : max_loss,
-                "max_gain_usd"     : max_gain,
-                "risk_amount"      : round(risk_amt, 2),
-                "account_balance"  : round(bal, 2),
-                # Probability
-                "win_rate_estimate": round(win_rate * 100, 1),
-                "expected_value"   : ev,
-                # Indicators
-                "rsi_fast"         : round(rsi_fast, 1) if rsi_fast else None,
-                "rsi_slow"         : round(rsi_slow, 1) if rsi_slow else None,
-                "rsi_confirm"      : round(rsi_confirm, 1) if rsi_confirm else None,
-                "rsi_fast_period"  : ta.fast,
-                "rsi_confirm_period": ta.confirm,
-                "ema_trend"        : "Bullish" if ema_trend == 1 else "Bearish",
-                "vol_surge"        : vs,
-                "momentum"         : round(mom5, 2) if mom5 else None,
-                "atr_pct"          : round(float(last.get("atr_pct",0) or 0)*100, 2),
-                "pattern"          : pattern,
-                "last_sh"          : round(last_sh, 4) if last_sh else None,
-                "last_sl"          : round(last_sl_s, 4) if last_sl_s else None,
-                # Active signals
-                "active_signals"   : [s["label"] for s in ALL_SIGNALS if active.get(s["key"]) and
-                                       s["dir"] in (missing_dir, "both")],
-                "inactive_signals" : [s["label"] for s in inactive_signals],
-                "needed_to_trade"  : [{"label":s["label"],"pts":s["pts"]} for s in needed_combos],
-                "bars_to_rsi"      : bars_to_rsi_trigger,
-                "reasons"          : sig.get("reasons", []),
-            })
+                predictions.append({
+                    "symbol"           : sym,
+                    "price"            : round(px, 6),
+                    "pct_change"       : pct_chg,
+                    "direction"        : primary_dir,
+                    "current_score"    : current_score,
+                    "min_conf"         : min_conf,
+                    "gap_to_threshold" : gap_to_threshold,
+                    "tier"             : tier,
+                    "meets_threshold"  : current_score >= min_conf,
+                    "in_open_trade"    : any(t["symbol"]==sym for t in (_TM.open_trades if _TM else [])),
+                    # Trade parameters
+                    "entry"            : round(px, 6),
+                    "sl"               : sl_price,
+                    "tp"               : tp_price,
+                    "sl_pct"           : sl_pct,
+                    "tp_pct"           : tp_pct,
+                    "rr_ratio"         : rr_actual,
+                    "synced_with_bot"  : signal_synced,
+                    "signal_age_s"     : signal_age_s,
+                    # Position & risk
+                    "position_size"    : pos_size,
+                    "position_value"   : pos_value,
+                    "max_loss_usd"     : max_loss,
+                    "max_gain_usd"     : max_gain,
+                    "risk_amount"      : round(risk_amt, 2),
+                    "account_balance"  : round(bal, 2),
+                    # Probability
+                    "win_rate_estimate": round(win_rate * 100, 1),
+                    "expected_value"   : ev,
+                    # Indicators
+                    "rsi_fast"         : round(rsi_fast, 1) if rsi_fast else None,
+                    "rsi_slow"         : round(rsi_slow, 1) if rsi_slow else None,
+                    "rsi_confirm"      : round(rsi_confirm, 1) if rsi_confirm else None,
+                    "rsi_fast_period"  : ta.fast,
+                    "rsi_confirm_period": ta.confirm,
+                    "ema_trend"        : "Bullish" if ema_trend == 1 else "Bearish",
+                    "vol_surge"        : vs,
+                    "momentum"         : round(mom5, 2) if mom5 else None,
+                    "atr_pct"          : round(float(last.get("atr_pct",0) or 0)*100, 2),
+                    "pattern"          : pattern,
+                    "last_sh"          : round(last_sh, 4) if last_sh else None,
+                    "last_sl"          : round(last_sl_s, 4) if last_sl_s else None,
+                    # Active signals
+                    "active_signals"   : [s["label"] for s in ALL_SIGNALS if active.get(s["key"]) and
+                                           s["dir"] in (missing_dir, "both")],
+                    "inactive_signals" : [s["label"] for s in inactive_signals],
+                    "needed_to_trade"  : [{"label":s["label"],"pts":s["pts"]} for s in needed_combos],
+                    "bars_to_rsi"      : bars_to_rsi_trigger,
+                    "reasons"          : sig.get("reasons", []),
+                })
 
-        except Exception as e:
-            logger.error(f"Prediction error for {sym}: {e}")
-            errors.append({"symbol": sym, "error": str(e)})
+            except Exception as e:
+                logger.error(f"Prediction error for {sym}: {e}")
+                errors.append({"symbol": sym, "error": str(e)})
 
     # Sort: meets threshold first, then by score desc
     predictions.sort(key=lambda x: (-int(x["meets_threshold"]), -x["current_score"]))
 
     return jsonify({
         "ts"          : ts,
-        "mode"        : mode,
-        "timeframe"   : tf,
+        "mode"        : active_markets[0]["mode"],   # legacy single-mode field — first active market, kept for older frontend compatibility
+        "timeframe"   : active_markets[0]["tf"],
+        "active_markets": [{"mode": m["mode"], "timeframe": m["tf"], "symbols": m["symbols"]} for m in active_markets],
         "exchange"    : CONFIG.get("crypto_exchange",""),
         "min_conf"    : min_conf,
         "sl_pct"      : round(sl_floor * 100, 2),
@@ -3860,200 +4057,193 @@ def api_analysis():
     returns per-symbol indicator data, BOT-RL score, signal, S/R levels,
     and a comparison table for all strategies.  Used by market_analysis.html.
     """
-    mode    = CONFIG["market_mode"]
-    if mode == "CRYPTO":
-        symbols = CONFIG.get("crypto_symbols", [])
-        tf = CONFIG.get("crypto_timeframe", "15m")
-    elif mode == "STOCK":
-        symbols = CONFIG.get("stock_symbols", [])
-        tf = CONFIG.get("stock_timeframe", "15m")
-    elif mode == "FOREX":
-        symbols = CONFIG.get("forex_symbols", [])
-        tf = CONFIG.get("forex_timeframe", "15m")
-    else:
-        symbols = CONFIG.get("crypto_symbols", []) + CONFIG.get("stock_symbols", [])
-        tf = CONFIG.get("crypto_timeframe", "15m")
     min_conf = CONFIG["min_confidence_to_trade"]
     sl_pct   = CONFIG["stop_loss_pct"]
     tp_pct   = CONFIG["take_profit_pct"]
 
-    # Reuse the live data provider if bot is running, else create a fresh one
-    data_provider = (_BOT.data if _BOT and _BOT.data else MarketDataProvider(mode))
     ta = TechnicalAnalysis()
 
     results = []
     errors  = []
     ts      = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    for sym in symbols:
-        try:
-            # Pull live OHLCV (returns None if exchange is unreachable)
-            df = data_provider.get_ohlcv(sym, tf, limit=200)
-            if df is None or len(df) < 50:
-                errors.append({"symbol": sym, "error": data_provider.last_error or "insufficient data"})
-                continue
+    active_markets = _resolve_active_markets()
+    for _mctx in active_markets:
+        mode    = _mctx["mode"]
+        symbols = _mctx["symbols"]
+        tf      = _mctx["tf"]
+        _bot_ctx = _BOT.markets_by_mode.get(mode) if (_BOT and getattr(_BOT, "markets_by_mode", None)) else None
+        data_provider = _bot_ctx["data"] if _bot_ctx else MarketDataProvider(mode)
+        for sym in symbols:
+            try:
+                # Pull live OHLCV (returns None if exchange is unreachable)
+                df = data_provider.get_ohlcv(sym, tf, limit=200)
+                if df is None or len(df) < 50:
+                    errors.append({"symbol": sym, "error": data_provider.last_error or "insufficient data"})
+                    continue
 
-            df  = ta.compute(df)
-            sig = ta.signal(df)
+                df  = ta.compute(df)
+                sig = ta.signal(df)
 
-            # If the bot is actually running, prefer whatever it last
-            # computed for this symbol over the signal we just computed
-            # above — those two computations happen at slightly different
-            # moments in a moving market and CAN legitimately disagree even
-            # though they run the exact same formula. Using the bot's own
-            # cached result guarantees this page always shows precisely
-            # what the live engine saw/acted on, not a fresher-but-different
-            # snapshot.
-            signal_synced = False
-            signal_age_s  = None
-            if _BOT and _BOT.running and sym in _BOT.last_signals:
-                cached = _BOT.last_signals[sym]
-                try:
-                    age = (datetime.utcnow() - datetime.fromisoformat(cached["ts"])).total_seconds()
-                except Exception:
-                    age = None
-                # Only trust the cache while it's still within one scan
-                # cycle old — a stale cache (bot stuck, symbol removed from
-                # config, etc.) should fall back to the fresh computation
-                # rather than show something the engine won't reconsider
-                # for a while.
-                if age is not None and age <= max(_BOT.scan_interval_seconds * 2, 120):
-                    sig = cached
-                    signal_synced = True
-                    signal_age_s = round(age, 1)
+                # If the bot is actually running, prefer whatever it last
+                # computed for this symbol over the signal we just computed
+                # above — those two computations happen at slightly different
+                # moments in a moving market and CAN legitimately disagree even
+                # though they run the exact same formula. Using the bot's own
+                # cached result guarantees this page always shows precisely
+                # what the live engine saw/acted on, not a fresher-but-different
+                # snapshot.
+                signal_synced = False
+                signal_age_s  = None
+                if _BOT and _BOT.running and sym in _BOT.last_signals:
+                    cached = _BOT.last_signals[sym]
+                    try:
+                        age = (datetime.utcnow() - datetime.fromisoformat(cached["ts"])).total_seconds()
+                    except Exception:
+                        age = None
+                    # Only trust the cache while it's still within one scan
+                    # cycle old — a stale cache (bot stuck, symbol removed from
+                    # config, etc.) should fall back to the fresh computation
+                    # rather than show something the engine won't reconsider
+                    # for a while.
+                    if age is not None and age <= max(_BOT.scan_interval_seconds * 2, 120):
+                        sig = cached
+                        signal_synced = True
+                        signal_age_s = round(age, 1)
 
-            last  = df.iloc[-1]
-            prev  = df.iloc[-2]
-            px    = float(last["close"])
-            high  = float(df["high"].tail(20).max())
-            low   = float(df["low"].tail(20).min())
+                last  = df.iloc[-1]
+                prev  = df.iloc[-2]
+                px    = float(last["close"])
+                high  = float(df["high"].tail(20).max())
+                low   = float(df["low"].tail(20).min())
 
-            # Safe float extraction
-            def sf(v):
-                try:
-                    f = float(v)
-                    return None if (f != f or abs(f) == float("inf")) else round(f, 6)
-                except Exception:
-                    return None
+                # Safe float extraction
+                def sf(v):
+                    try:
+                        f = float(v)
+                        return None if (f != f or abs(f) == float("inf")) else round(f, 6)
+                    except Exception:
+                        return None
 
-            rsi_fast  = sf(last.get(f"rsi_{ta.fast}"))
-            rsi_slow  = sf(last.get(f"rsi_{ta.slow}"))
-            rsi_confirm = sf(last.get(f"rsi_{ta.confirm}"))
-            ema_21    = sf(last.get("ema_21"))
-            ema_50    = sf(last.get("ema_50"))
-            ema_200   = sf(last.get("ema_200"))
-            atr       = sf(last.get("atr"))
-            atr_pct   = sf(last.get("atr_pct"))
-            vol_surge = bool(last.get("vol_surge", False))
-            mom5      = sf(last.get("mom5"))
-            last_sh   = sf(last.get("last_sh"))
-            last_sl   = sf(last.get("last_sl"))
-            obv_now   = sf(last.get("obv"))
-            obv_prev  = sf(prev.get("obv"))
+                rsi_fast  = sf(last.get(f"rsi_{ta.fast}"))
+                rsi_slow  = sf(last.get(f"rsi_{ta.slow}"))
+                rsi_confirm = sf(last.get(f"rsi_{ta.confirm}"))
+                ema_21    = sf(last.get("ema_21"))
+                ema_50    = sf(last.get("ema_50"))
+                ema_200   = sf(last.get("ema_200"))
+                atr       = sf(last.get("atr"))
+                atr_pct   = sf(last.get("atr_pct"))
+                vol_surge = bool(last.get("vol_surge", False))
+                mom5      = sf(last.get("mom5"))
+                last_sh   = sf(last.get("last_sh"))
+                last_sl   = sf(last.get("last_sl"))
+                obv_now   = sf(last.get("obv"))
+                obv_prev  = sf(prev.get("obv"))
 
-            ema_trend    = "Bullish" if last.get("ema_trend", -1) == 1 else "Bearish"
-            obv_trending = ("Rising" if obv_now and obv_prev and obv_now > obv_prev
-                            else "Falling" if obv_now and obv_prev else "N/A")
+                ema_trend    = "Bullish" if last.get("ema_trend", -1) == 1 else "Bearish"
+                obv_trending = ("Rising" if obv_now and obv_prev and obv_now > obv_prev
+                                else "Falling" if obv_now and obv_prev else "N/A")
 
-            # BOT-RL score breakdown (mirrors TechnicalAnalysis.signal exactly)
-            score_breakdown = {}
-            thr = CONFIG["rsi_signal_threshold"]
-            rsi_div  = float(last.get("rsi_div", 0) or 0)
-            rsi_pdiv = float(prev.get("rsi_div", 0) or 0)
-            buy = 0; sell = 0
+                # BOT-RL score breakdown (mirrors TechnicalAnalysis.signal exactly)
+                score_breakdown = {}
+                thr = CONFIG["rsi_signal_threshold"]
+                rsi_div  = float(last.get("rsi_div", 0) or 0)
+                rsi_pdiv = float(prev.get("rsi_div", 0) or 0)
+                buy = 0; sell = 0
 
-            score_breakdown["rsi_oversold"]  = 25 if (rsi_fast and rsi_fast < CONFIG["rsi_oversold"])  else 0
-            score_breakdown["rsi_overbought"]= 25 if (rsi_fast and rsi_fast > CONFIG["rsi_overbought"]) else 0
-            score_breakdown["rsi_cross_buy"] = 20 if (rsi_div > thr and rsi_pdiv <= thr)  else 0
-            score_breakdown["rsi_cross_sell"]= 20 if (rsi_div < -thr and rsi_pdiv >= -thr) else 0
-            score_breakdown["swing_low"]     = 20 if (last_sl and abs(px-last_sl)/px < 0.012) else 0
-            score_breakdown["swing_high"]    = 20 if (last_sh and abs(px-last_sh)/px < 0.012) else 0
-            score_breakdown["ema_bullish"]   = 15 if last.get("ema_trend", -1) == 1 else 0
-            score_breakdown["ema_bearish"]   = 15 if last.get("ema_trend", -1) != 1 else 0
-            score_breakdown["vol_surge"]     = 10 if vol_surge else 0
-            score_breakdown["momentum"]      = 10 if (mom5 and abs(mom5) > 0.5) else 0
+                score_breakdown["rsi_oversold"]  = 25 if (rsi_fast and rsi_fast < CONFIG["rsi_oversold"])  else 0
+                score_breakdown["rsi_overbought"]= 25 if (rsi_fast and rsi_fast > CONFIG["rsi_overbought"]) else 0
+                score_breakdown["rsi_cross_buy"] = 20 if (rsi_div > thr and rsi_pdiv <= thr)  else 0
+                score_breakdown["rsi_cross_sell"]= 20 if (rsi_div < -thr and rsi_pdiv >= -thr) else 0
+                score_breakdown["swing_low"]     = 20 if (last_sl and abs(px-last_sl)/px < 0.012) else 0
+                score_breakdown["swing_high"]    = 20 if (last_sh and abs(px-last_sh)/px < 0.012) else 0
+                score_breakdown["ema_bullish"]   = 15 if last.get("ema_trend", -1) == 1 else 0
+                score_breakdown["ema_bearish"]   = 15 if last.get("ema_trend", -1) != 1 else 0
+                score_breakdown["vol_surge"]     = 10 if vol_surge else 0
+                score_breakdown["momentum"]      = 10 if (mom5 and abs(mom5) > 0.5) else 0
 
-            # Support / resistance levels from recent swing pivots
-            swing_highs = df["sw_h"].dropna().tail(3).tolist()
-            swing_lows  = df["sw_l"].dropna().tail(3).tolist()
+                # Support / resistance levels from recent swing pivots
+                swing_highs = df["sw_h"].dropna().tail(3).tolist()
+                swing_lows  = df["sw_l"].dropna().tail(3).tolist()
 
-            # Price change vs previous close
-            prev_close = float(df["close"].iloc[-2]) if len(df) >= 2 else px
-            pct_change = round((px - prev_close) / prev_close * 100, 3) if prev_close else 0
+                # Price change vs previous close
+                prev_close = float(df["close"].iloc[-2]) if len(df) >= 2 else px
+                pct_change = round((px - prev_close) / prev_close * 100, 3) if prev_close else 0
 
-            # Candlestick pattern hints (simple heuristics)
-            body   = abs(px - float(last["open"]))
-            candle = float(last["high"]) - float(last["low"])
-            wick_r = (float(last["high"]) - max(px, float(last["open"]))) / candle if candle else 0
-            wick_l = (min(px, float(last["open"])) - float(last["low"])) / candle if candle else 0
-            # A zero-range candle (high == low) would otherwise divide by
-            # zero here; treat it as a Doji instead of crashing.
-            pattern = "Doji" if (candle == 0 or body/candle < 0.1) else (
-                      "Hammer" if wick_l > 0.6 else (
-                      "Shooting Star" if wick_r > 0.6 else (
-                      "Bullish" if px > float(last["open"]) else "Bearish")))
+                # Candlestick pattern hints (simple heuristics)
+                body   = abs(px - float(last["open"]))
+                candle = float(last["high"]) - float(last["low"])
+                wick_r = (float(last["high"]) - max(px, float(last["open"]))) / candle if candle else 0
+                wick_l = (min(px, float(last["open"])) - float(last["low"])) / candle if candle else 0
+                # A zero-range candle (high == low) would otherwise divide by
+                # zero here; treat it as a Doji instead of crashing.
+                pattern = "Doji" if (candle == 0 or body/candle < 0.1) else (
+                          "Hammer" if wick_l > 0.6 else (
+                          "Shooting Star" if wick_r > 0.6 else (
+                          "Bullish" if px > float(last["open"]) else "Bearish")))
 
-            # True reward:risk for THIS signal, computed from its actual
-            # sl/tp/price — not from raw config percentages. Deriving it
-            # from config (tp_pct / sl_pct) is what produced the nonsensical
-            # "1000:1" badge when take_profit_pct was misconfigured; this
-            # is accurate regardless of config and always reflects reality.
-            actual_rr = None
-            if sig.get("sl") is not None and sig.get("tp") is not None and sig.get("price"):
-                risk   = abs(sig["price"] - sig["sl"])
-                reward = abs(sig["tp"] - sig["price"])
-                if risk > 0:
-                    actual_rr = round(reward / risk, 1)
+                # True reward:risk for THIS signal, computed from its actual
+                # sl/tp/price — not from raw config percentages. Deriving it
+                # from config (tp_pct / sl_pct) is what produced the nonsensical
+                # "1000:1" badge when take_profit_pct was misconfigured; this
+                # is accurate regardless of config and always reflects reality.
+                actual_rr = None
+                if sig.get("sl") is not None and sig.get("tp") is not None and sig.get("price"):
+                    risk   = abs(sig["price"] - sig["sl"])
+                    reward = abs(sig["tp"] - sig["price"])
+                    if risk > 0:
+                        actual_rr = round(reward / risk, 1)
 
-            results.append({
-                "symbol"       : sym,
-                "price"        : round(px, 6),
-                "pct_change"   : pct_change,
-                "signal"       : sig["side"],
-                "confidence"   : round(sig.get("confidence", 0), 1),
-                "min_conf"     : min_conf,
-                "reasons"      : sig.get("reasons", []),
-                "sl"           : sig.get("sl"),
-                "tp"           : sig.get("tp"),
-                "sl_pct"       : round(sl_pct * 100, 2),
-                "tp_pct"       : round(tp_pct * 100, 2),
-                "rr_ratio"     : actual_rr,
-                "synced_with_bot": signal_synced,
-                "signal_age_s"    : signal_age_s,
-                "rsi_fast"     : round(rsi_fast, 1) if rsi_fast else None,
-                "rsi_slow"     : round(rsi_slow, 1) if rsi_slow else None,
-                "rsi_confirm"  : round(rsi_confirm, 1) if rsi_confirm else None,
-                "rsi_fast_period": ta.fast,
-                "rsi_slow_period": ta.slow,
-                "rsi_confirm_period": ta.confirm,
-                "ema_21"       : round(ema_21, 4) if ema_21 else None,
-                "ema_50"       : round(ema_50, 4) if ema_50 else None,
-                "ema_200"      : round(ema_200, 4) if ema_200 else None,
-                "ema_trend"    : ema_trend,
-                "atr"          : round(atr, 4) if atr else None,
-                "atr_pct"      : round(atr_pct * 100, 2) if atr_pct else None,
-                "vol_surge"    : vol_surge,
-                "momentum"     : round(mom5, 2) if mom5 else None,
-                "obv_trend"    : obv_trending,
-                "last_sh"      : round(last_sh, 4) if last_sh else None,
-                "last_sl"      : round(last_sl, 4) if last_sl else None,
-                "swing_highs"  : [round(v, 4) for v in swing_highs],
-                "swing_lows"   : [round(v, 4) for v in swing_lows],
-                "recent_high"  : round(high, 4),
-                "recent_low"   : round(low, 4),
-                "pattern"      : pattern,
-                "score_breakdown": score_breakdown,
-                "in_open_trade": any(t["symbol"]==sym for t in (_TM.open_trades if _TM else [])),
-            })
+                results.append({
+                    "symbol"       : sym,
+                    "price"        : round(px, 6),
+                    "pct_change"   : pct_change,
+                    "signal"       : sig["side"],
+                    "confidence"   : round(sig.get("confidence", 0), 1),
+                    "min_conf"     : min_conf,
+                    "reasons"      : sig.get("reasons", []),
+                    "sl"           : sig.get("sl"),
+                    "tp"           : sig.get("tp"),
+                    "sl_pct"       : round(sl_pct * 100, 2),
+                    "tp_pct"       : round(tp_pct * 100, 2),
+                    "rr_ratio"     : actual_rr,
+                    "synced_with_bot": signal_synced,
+                    "signal_age_s"    : signal_age_s,
+                    "rsi_fast"     : round(rsi_fast, 1) if rsi_fast else None,
+                    "rsi_slow"     : round(rsi_slow, 1) if rsi_slow else None,
+                    "rsi_confirm"  : round(rsi_confirm, 1) if rsi_confirm else None,
+                    "rsi_fast_period": ta.fast,
+                    "rsi_slow_period": ta.slow,
+                    "rsi_confirm_period": ta.confirm,
+                    "ema_21"       : round(ema_21, 4) if ema_21 else None,
+                    "ema_50"       : round(ema_50, 4) if ema_50 else None,
+                    "ema_200"      : round(ema_200, 4) if ema_200 else None,
+                    "ema_trend"    : ema_trend,
+                    "atr"          : round(atr, 4) if atr else None,
+                    "atr_pct"      : round(atr_pct * 100, 2) if atr_pct else None,
+                    "vol_surge"    : vol_surge,
+                    "momentum"     : round(mom5, 2) if mom5 else None,
+                    "obv_trend"    : obv_trending,
+                    "last_sh"      : round(last_sh, 4) if last_sh else None,
+                    "last_sl"      : round(last_sl, 4) if last_sl else None,
+                    "swing_highs"  : [round(v, 4) for v in swing_highs],
+                    "swing_lows"   : [round(v, 4) for v in swing_lows],
+                    "recent_high"  : round(high, 4),
+                    "recent_low"   : round(low, 4),
+                    "pattern"      : pattern,
+                    "score_breakdown": score_breakdown,
+                    "in_open_trade": any(t["symbol"]==sym for t in (_TM.open_trades if _TM else [])),
+                })
 
-        except Exception as e:
-            logger.error(f"Analysis error for {sym}: {e}")
-            errors.append({"symbol": sym, "error": str(e)})
+            except Exception as e:
+                logger.error(f"Analysis error for {sym}: {e}")
+                errors.append({"symbol": sym, "error": str(e)})
 
     return jsonify({
         "ts"          : ts,
-        "mode"        : mode,
-        "timeframe"   : tf,
+        "mode"        : active_markets[0]["mode"],   # legacy single-mode field — first active market, kept for older frontend compatibility
+        "timeframe"   : active_markets[0]["tf"],
+        "active_markets": [{"mode": m["mode"], "timeframe": m["tf"], "symbols": m["symbols"]} for m in active_markets],
         "exchange"    : CONFIG.get("crypto_exchange",""),
         "min_conf"    : min_conf,
         "results"     : results,
@@ -4112,8 +4302,11 @@ def api_state():
 @_login_required
 def api_config():
     data    = request.json or {}
-    allowed = ["market_mode","crypto_symbols","stock_symbols","forex_symbols","crypto_timeframe",
-               "stock_timeframe","forex_timeframe","crypto_exchange","rsi_fast_period","rsi_slow_period",
+    allowed = ["market_mode","active_markets",
+               "crypto_symbols","stock_symbols","forex_symbols","futures_symbols","crypto_timeframe",
+               "stock_timeframe","forex_timeframe","futures_timeframe","crypto_exchange","futures_exchange",
+               "futures_leverage","futures_margin_mode","futures_settle_currency",
+               "rsi_fast_period","rsi_slow_period",
                "rsi_confirm_period",
                "rsi_overbought","rsi_oversold","rsi_signal_threshold","stop_loss_pct",
                "take_profit_pct","min_confidence_to_trade",
@@ -4166,6 +4359,7 @@ def api_config():
         "db_retention_days":         (7, 730, "7 – 730 days"),
         "db_max_size_mb":            (10, 2000, "10 – 2000 MB"),
         "db_prune_interval_hours":   (1, 168, "1 – 168 hours"),
+        "futures_leverage":          (1, 50, "1 – 50x"),
     }
     errors = []
     for k, (lo, hi, hint) in NUMERIC_BOUNDS.items():
@@ -4207,6 +4401,16 @@ def api_config():
 
     updated = [k for k in allowed if k in data and (CONFIG.__setitem__(k,data[k]) or True)]
     _elog(f"Config updated: {', '.join(updated)}", "INFO")
+    # If market-related keys changed, apply to running bot so changes take
+    # effect immediately without requiring a manual restart.
+    market_keys = {"active_markets","crypto_symbols","stock_symbols","forex_symbols","futures_symbols",
+                   "crypto_timeframe","stock_timeframe","forex_timeframe","futures_timeframe",
+                   "crypto_exchange","futures_exchange"}
+    if any(k in market_keys for k in updated):
+        try:
+            _apply_runtime_config_to_bot()
+        except Exception:
+            logger.exception("Applying runtime config failed")
     return jsonify({"ok":True, "updated":updated})
 
 # ── Bot control ───────────────────────────────────────────────
