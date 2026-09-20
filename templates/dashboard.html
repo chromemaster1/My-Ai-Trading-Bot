@@ -402,12 +402,10 @@
       <div class="alert alert-err" id="storage-err"></div>
 
       <div style="margin-top:14px;font-size:11px;color:var(--m);line-height:1.7">
-        The database is pruned automatically once a day (rows older than the configured retention window
-        are removed — the full history remains in the log file, since everything written to the database
-        is also written there). The active log file rotates automatically once it reaches its size cap, and
-        force-resets on a fixed schedule even if it never reaches that cap, so a quiet deployment doesn't
-        run on one ever-growing file indefinitely. Tune both under Risk & SL/TP → these settings aren't
-        currently exposed as a separate form here — ask if you'd like that added.
+        Storage protects disk usage; it does not by itself control process RAM. Runtime RAM is now monitored separately
+        by the bot and the trading loop is stopped before the Render Free memory ceiling is reached. The database
+        is pruned automatically, the active log rotates at its size cap, and this page shows both disk storage and
+        current process memory so the two problems are not confused.
       </div>
     </div>
 
@@ -418,6 +416,9 @@
 {% block scripts %}
 <script>
 let S={};
+let stateFetchBusy=false;
+let signalFetchBusy=false;
+let storageFetchBusy=false;
 
 /* ── sidebar sub-nav ── */
 function nav(id, el){
@@ -431,11 +432,14 @@ function nav(id, el){
 
 /* ── fetch ── */
 async function fetchState(){
+  if(stateFetchBusy) return;
+  stateFetchBusy=true;
   try{
     const r=await fetch('/api/state');
     S=await r.json();
     render();
   }catch(e){console.error(e)}
+  finally{stateFetchBusy=false;}
 }
 
 function render(){
@@ -682,6 +686,8 @@ async function saveRisk(){
 let STORAGE_INTERVAL=null;
 
 async function fetchStorageStatus(){
+  if(storageFetchBusy) return;
+  storageFetchBusy=true;
   try{
     const r=await fetch('/api/admin/storage');
     const d=await r.json();
@@ -698,6 +704,7 @@ async function fetchStorageStatus(){
       }, 30000);
     }
   }catch(e){console.error(e)}
+  finally{storageFetchBusy=false;}
 }
 
 function renderStorage(d){
@@ -709,15 +716,18 @@ function renderStorage(d){
     ? `Last database prune: ${new Date(db.last_pruned_at).toLocaleString()}`
     : 'No prune has run yet this session';
 
+  const mem=d.memory||{};
+  const memSoft=Number(mem.soft_limit_mb||350), memHard=Number(mem.hard_limit_mb||410), memRss=Number(mem.rss_mb||0);
   $('storage-stats').innerHTML=[
+    {l:'Process RAM',v:`${memRss.toFixed(1)} MB`,s:`soft ${memSoft} / hard ${memHard} MB`,c:memRss>=memHard?'red':memRss>=memSoft?'':'green'},
     {l:'Database Size',v:`${db.size_mb} MB`,s:`of ${db.max_mb} MB cap`,c:dbPct>80?'red':dbPct>50?'':'green'},
     {l:'Log File Size',v:`${log.active_size_mb} MB`,s:`of ${log.max_mb} MB cap`,c:logPct>80?'red':logPct>50?'':'green'},
     {l:'Activity Rows',v:(db.row_counts.admin_activity||0).toLocaleString(),s:`${db.retention_days}-day retention`,c:'blue'},
-    {l:'Log Backups',v:log.backups.length,s:`of ${log.backup_count} max`,c:''},
   ].map(x=>`<div class="stat ${x.c}"><div class="sl">${x.l}</div>
     <div class="sv">${x.v}</div><div class="ss">${x.s}</div></div>`).join('');
 
   $('storage-db-detail').innerHTML=`
+    <div>Runtime RAM: <strong style="color:var(--t)">${memRss.toFixed(1)} MB</strong> / ${memHard} MB safety stop</div>
     <div>Size: <strong style="color:var(--t)">${db.size_mb} MB</strong> / ${db.max_mb} MB hard cap</div>
     <div>Retention window: <strong style="color:var(--t)">${db.retention_days} days</strong> — older rows are pruned automatically, full detail remains in the log file</div>
     <div>admin_activity rows: <strong style="color:var(--t)">${(db.row_counts.admin_activity||0).toLocaleString()}</strong></div>
@@ -764,6 +774,8 @@ async function pruneStorageNow(){
 let MT_OPTIONS=[];
 
 async function fetchTradeableSignals(){
+  if(signalFetchBusy) return;
+  signalFetchBusy=true;
   try{
     const r=await fetch('/api/signals/tradeable');
     const d=await r.json();
@@ -778,6 +790,7 @@ async function fetchTradeableSignals(){
       MT_OPTIONS.map((o,i)=>`<option value="${i}">${escHtml(o.label)}</option>`).join('');
     if(prevValue && MT_OPTIONS[+prevValue]) sel.value=prevValue;
   }catch(e){console.error(e)}
+  finally{signalFetchBusy=false;}
 }
 
 function mtSourceChanged(){
@@ -835,8 +848,8 @@ async function openManualTrade(){
 }
 
 fetchState();
-setInterval(fetchState,8000);
+setInterval(fetchState,15000);
 fetchTradeableSignals();
-setInterval(fetchTradeableSignals,15000);
+setInterval(fetchTradeableSignals,30000);
 </script>
 {% endblock %}

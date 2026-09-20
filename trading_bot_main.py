@@ -36,10 +36,23 @@ try:
 except ImportError:
     CCXT_AVAILABLE = False
 
-try:
-    import yfinance as yf; YF_AVAILABLE = True
-except ImportError:
-    YF_AVAILABLE = False
+# yfinance is lazy-loaded so crypto-only Render deployments do not import
+# its large dependency tree or allocate its module state at startup.
+yf = None
+YF_AVAILABLE = None
+
+def _ensure_yfinance():
+    global yf, YF_AVAILABLE
+    if YF_AVAILABLE is True:
+        return True
+    try:
+        import yfinance as _yf
+        yf = _yf
+        YF_AVAILABLE = True
+        return True
+    except ImportError:
+        YF_AVAILABLE = False
+        return False
 
 colorama.init(autoreset=True)
 
@@ -98,6 +111,8 @@ CONFIG = {
     "min_confidence_to_trade": 85,       # only open trades with >=85% combined confidence
     "max_risk_per_trade"     : 0.01,
     "max_open_trades"        : 3,
+    "max_closed_trades_memory": 500,
+    "max_wallet_ledger_memory": 200,
     "account_balance"        : 10000.0,
     "anthropic_api_key"      : os.environ.get("ANTHROPIC_API_KEY", ""),
     "ai_model"               : "claude-sonnet-4-6",
@@ -173,8 +188,8 @@ CONFIG = {
     # could otherwise run for years on one small file — the time reset
     # guarantees a bound either way). Historical data lives in the rotated
     # backups, not in memory or the database — see db_retention_days below.
-    "log_max_size_mb"        : 500,
-    "log_backup_count"       : 5,
+    "log_max_size_mb"        : 50,
+    "log_backup_count"       : 2,
     "log_reset_months"       : 4,   # within the requested 3-6 month range
     # Database retention: admin_activity/admin_sessions grow with every
     # scan, trade, and login and have no natural cap — left alone they
@@ -186,8 +201,11 @@ CONFIG = {
     # it just moves from "fast structured lookup" to "archived in a log
     # backup" once it's no longer operationally relevant.
     "db_retention_days"      : 90,
-    "db_max_size_mb"         : 500,
+    "db_max_size_mb"         : 100,
     "db_prune_interval_hours": 24,
+    "memory_soft_limit_mb"  : 350,
+    "memory_hard_limit_mb"  : 410,
+    "memory_guard_enabled"  : True,
     # Flag as a likely stale/cached data source if the SAME OHLCV data
     # persists across this many consecutive scan intervals — see
     # MarketDataProvider._check_stale_repeat().
@@ -412,15 +430,17 @@ def prune_database(force: bool = False) -> dict:
                     if db_size_mb <= CONFIG["db_max_size_mb"]:
                         break
 
-        # VACUUM must run outside any active transaction — use its own
-        # autocommit connection rather than the transactional one above.
-        try:
-            vconn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
-            vconn.execute("VACUUM")
-            vconn.close()
-            db_size_mb = Path(DATABASE_PATH).stat().st_size / (1024 * 1024) if Path(DATABASE_PATH).exists() else db_size_mb
-        except Exception as ve:
-            logger.warning(f"VACUUM after prune failed (non-fatal): {ve}")
+        # VACUUM only after real pruning or when the DB is already sizeable;
+        # do not rewrite the entire SQLite file every day for no reason.
+        if (deleted["admin_activity"] or deleted["admin_sessions"] or
+                db_size_mb > float(CONFIG.get("db_max_size_mb", 100)) * 0.5):
+            try:
+                vconn = sqlite3.connect(DATABASE_PATH, isolation_level=None)
+                vconn.execute("VACUUM")
+                vconn.close()
+                db_size_mb = Path(DATABASE_PATH).stat().st_size / (1024 * 1024) if Path(DATABASE_PATH).exists() else db_size_mb
+            except Exception as ve:
+                logger.warning(f"VACUUM after prune failed (non-fatal): {ve}")
 
         _LAST_DB_PRUNE_AT = now
         if deleted["admin_activity"] or deleted["admin_sessions"]:
@@ -882,6 +902,10 @@ def build_exchange_dashboard_payload(market: str = "CRYPTO", force_refresh: bool
             _sync_alias_live_account()
         with _EXCHANGE_CACHE_LOCK:
             _EXCHANGE_CACHE[market_key] = {"ts": time.time(), "payload": payload}
+        try:
+            exchange.close()
+        except Exception:
+            pass
         return payload
     except Exception as exc:
         msg = str(exc)
@@ -904,6 +928,10 @@ def build_exchange_dashboard_payload(market: str = "CRYPTO", force_refresh: bool
             _sync_alias_live_account()
         with _EXCHANGE_CACHE_LOCK:
             _EXCHANGE_CACHE[market_key] = {"ts": time.time(), "payload": payload}
+        try:
+            exchange.close()
+        except Exception:
+            pass
         return payload
 
 
@@ -945,6 +973,86 @@ ADMIN_STORE = {
         },
     }
 }
+
+# ── Low-memory runtime guard ─────────────────────────────────
+try:
+    import resource as _resource
+except ImportError:  # pragma: no cover
+    _resource = None
+
+def _process_rss_mb() -> float:
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
+    if _resource is not None:
+        try:
+            value = float(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss)
+            return value / (1024.0 if value > 1024 * 1024 else (1024.0 * 1024.0))
+        except Exception:
+            pass
+    return 0.0
+
+def _trim_process_memory() -> float:
+    try:
+        import gc
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        import ctypes
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
+    except Exception:
+        pass
+    return _process_rss_mb()
+
+def _memory_guard(stage: str = "runtime", stop_bot: bool = False) -> bool:
+    """Keep the process lean without ever stopping the trading loop for RAM.
+
+    This is deliberately a cleanup guard, not an OOM shutdown guard.  The bot
+    must continue scanning/trading; when memory rises, temporary Python
+    objects are collected and glibc is asked to return unused heap pages to the
+    OS.  The hard limit is retained only as a diagnostic threshold so the log
+    makes a sustained high-RSS condition visible.
+    """
+    if not CONFIG.get("memory_guard_enabled", True):
+        return True
+    rss = _process_rss_mb()
+    soft = float(CONFIG.get("memory_soft_limit_mb", 350))
+    hard = float(CONFIG.get("memory_hard_limit_mb", 410))
+    if rss <= soft:
+        return True
+
+    after = _trim_process_memory()
+    if after <= soft:
+        logger.info(f"🧹 Memory cleanup at {stage}: RSS {rss:.1f} MB → {after:.1f} MB")
+    elif after >= hard:
+        logger.warning(f"🧹 Memory cleanup at {stage}: RSS {rss:.1f} MB → {after:.1f} MB "
+                       f"(still above diagnostic threshold {hard:.0f} MB; continuing trading)")
+    else:
+        logger.warning(f"🧹 Memory cleanup at {stage}: RSS {rss:.1f} MB → {after:.1f} MB "
+                       f"(soft {soft:.0f} MB)")
+    return True
+
+def _cleanup_cycle_memory(stage: str = "cycle") -> float:
+    """Explicit end-of-cycle cleanup for scans and open-trade monitoring.
+
+    Keeping this separate from the memory guard makes cleanup deterministic:
+    every completed scan/monitor cycle asks Python to release temporary
+    objects, then asks libc to return unused heap memory to the OS.
+    """
+    if not CONFIG.get("memory_guard_enabled", True):
+        return _process_rss_mb()
+    before = _process_rss_mb()
+    after = _trim_process_memory()
+    if before > 0 and after < before:
+        logger.debug(f"🧹 Cycle memory cleanup [{stage}]: {before:.1f} MB → {after:.1f} MB")
+    return after
+
 
 # Shared runtime objects (set once bot starts)
 _BOT         = None
@@ -1475,7 +1583,7 @@ class MarketDataProvider:
                 return
             self._connect_crypto()
         elif mode == "STOCK" or mode == "FOREX":
-            if not YF_AVAILABLE:
+            if not _ensure_yfinance():
                 self.last_error = "yfinance not installed — run: pip install yfinance"
                 logger.error(f"❌ {self.last_error}")
                 return
@@ -1483,7 +1591,7 @@ class MarketDataProvider:
             logger.info("✅ Yahoo Finance data source ready")
         else:
             # fallback to Yahoo for any other non-crypto markets
-            if not YF_AVAILABLE:
+            if not _ensure_yfinance():
                 self.last_error = "yfinance not installed — run: pip install yfinance"
                 logger.error(f"❌ {self.last_error}")
                 return
@@ -1615,7 +1723,7 @@ class MarketDataProvider:
         self.last_error = self.fatal_network_message or "No live crypto exchange could be reached"
         logger.error(f"❌ No crypto exchange could be reached: {self.last_error}")
 
-    def get_ohlcv(self, symbol: str, tf: str = "15m", limit: int = 200) -> Optional[pd.DataFrame]:
+    def get_ohlcv(self, symbol: str, tf: str = "15m", limit: int = 120) -> Optional[pd.DataFrame]:
         """Fetch LIVE OHLCV. Crypto symbols fail over per-symbol; rejected/stale data is never used."""
         if self.mode not in ("CRYPTO", "FUTURES"):
             try:
@@ -1806,7 +1914,7 @@ class MarketDataProvider:
 
     def _stock(self, symbol, tf, limit):
         symbol = normalize_market_symbol(symbol, "STOCK")
-        if not YF_AVAILABLE:
+        if not _ensure_yfinance():
             raise DataSourceError("yfinance not installed")
         imap = {"1m":"1m","5m":"5m","15m":"15m","30m":"30m",
                 "1h":"1h","4h":"1h","1d":"1d"}
@@ -1826,7 +1934,7 @@ class MarketDataProvider:
 
     def _forex(self, symbol, tf, limit):
         symbol = normalize_market_symbol(symbol, "FOREX")
-        if not YF_AVAILABLE:
+        if not _ensure_yfinance():
             raise DataSourceError("yfinance not installed")
         # Yahoo forex tickers like EURUSD=X are expected
         iv = self._map_tf(tf)
@@ -1874,7 +1982,7 @@ class MarketDataProvider:
                 if px is None:
                     raise DataSourceError(f"No last price in ticker for {symbol}")
                 return float(px)
-            if self.mode in ("STOCK", "FOREX") and YF_AVAILABLE:
+            if self.mode in ("STOCK", "FOREX") and _ensure_yfinance():
                 return float(yf.Ticker(symbol).fast_info.last_price)
         except Exception as e:
             if self.mode in ("CRYPTO", "FUTURES") and self._is_rate_limit_error(e) and self.exchange_id:
@@ -2445,6 +2553,8 @@ class TradeManager:
                     self.balance += pnl
                     self.open_trades.remove(t)
                     self.closed_trades.append(t)
+                    if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
+                        del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
                     msg = f"MANUAL CLOSE {t['symbol']} | PnL=${pnl:.2f}"
                     _elog(f"🔴 {msg}", "WARN")
                     record_admin_activity("admin", "trade", msg, details={"trade": t})
@@ -2485,6 +2595,8 @@ class TradeManager:
                     self.balance += pnl
                     self.open_trades.remove(t)
                     self.closed_trades.append(t)
+                    if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
+                        del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
                     msg = f"SIGNAL EXIT {t['symbol']} | {reason} | PnL=${pnl:.2f}"
                     c = Fore.GREEN if pnl > 0 else Fore.RED
                     print(c + f"  ↩️  {msg}" + Style.RESET_ALL)
@@ -2546,6 +2658,8 @@ class TradeManager:
             self.balance += pnl
             self.open_trades.remove(trade)
             self.closed_trades.append(trade)
+            if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
+                del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
             msg = (f"DATA SAFETY EXIT {trade['symbol']} | {reason} | "
                    f"Fill=${fill_px:.6f}" if fill_px is not None else
                    f"DATA SAFETY EXIT {trade['symbol']} | {reason} | Fill=exchange-confirmed")
@@ -2656,6 +2770,8 @@ class TradeManager:
                     self.balance += pnl
                     self.open_trades.remove(t)
                     self.closed_trades.append(t)
+                    if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
+                        del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
                     closed.append(t)
                     c = Fore.GREEN if pnl > 0 else Fore.RED
                     print(c + f"  {'🎯' if hit_tp else '🛑'} {msg}" + Style.RESET_ALL)
@@ -2814,20 +2930,23 @@ class TradingBot:
         self.last_signals = {}
 
     def scan_once(self):
-        """One full pass over EVERY active market. self.mode/data/tf/symbols
-        are pointed at each market's context in turn before calling
-        _scan_one_market() — the per-symbol scan logic below is unchanged
-        and unaware multiple markets exist; it just always operates on
-        whichever market is currently assigned to those attributes."""
-        for ctx in self.markets:
-            self.mode    = ctx["mode"]
-            self.data    = ctx["data"]
-            self.tf      = ctx["tf"]
-            self.symbols = ctx["symbols"]
-            self._scan_one_market()
+        """One full pass over EVERY active market, followed by RAM cleanup."""
+        try:
+            for ctx in self.markets:
+                self.mode    = ctx["mode"]
+                self.data    = ctx["data"]
+                self.tf      = ctx["tf"]
+                self.symbols = ctx["symbols"]
+                self._scan_one_market()
+        finally:
+            # Release DataFrames, indicator arrays and other temporary objects
+            # from the completed scan before the next scan starts.
+            _cleanup_cycle_memory("scan_cycle")
 
     def _scan_one_market(self):
         global _PRICE_CACHE
+        if not _memory_guard(f"before_scan:{self.mode}"):
+            return
         self.scan_count += 1
         ts = datetime.utcnow().strftime("%H:%M:%S")
         _section(f"🔍 SCAN #{self.scan_count}  [{ts} UTC]  {self.mode}")
@@ -2852,6 +2971,8 @@ class TradingBot:
 
         for sym in self.symbols:
             try:
+                if not _memory_guard(f"before_symbol:{sym}"):
+                    return
                 # ── Already in a trade for this pair? Re-check whether the
                 # setup still holds — never re-enter it (that would be a
                 # second position / double AI call), but DO re-evaluate the
@@ -2865,7 +2986,7 @@ class TradingBot:
                 #     holds, so close it now instead of waiting for SL/TP.
                 if sym in open_symbols:
                     trade = next((t for t in self.tm.open_trades if t["symbol"] == sym), None)
-                    df_open = self.data.get_ohlcv(sym, self.tf, limit=200)
+                    df_open = self.data.get_ohlcv(sym, self.tf, limit=120)
                     if df_open is None or len(df_open) < 50:
                         # A live position must never make a signal-based exit
                         # decision from a stale/missing OHLCV candle.  If live
@@ -3030,7 +3151,7 @@ class TradingBot:
                           f"{sig_open.get('confidence',0):.0f}%), monitoring only (price=${px_live:.4f})")
                     continue
 
-                df = self.data.get_ohlcv(sym, self.tf, limit=200)
+                df = self.data.get_ohlcv(sym, self.tf, limit=120)
                 if df is None:
                     # Live data fetch failed — NEVER fall back to fake/simulated
                     # data. Skip this symbol entirely for this scan.
@@ -3294,12 +3415,18 @@ class TradingBot:
         try:
             while self.running and not _STOP_EVENT.is_set():
                 try:
+                    if not _memory_guard("run_loop"):
+                        self.running = False
+                        break
                     self.scan_once()
                     # Both checks are cheap no-ops most cycles (internal
                     # "has it been long enough" guards) — safe to call every
                     # scan rather than needing a separate maintenance thread.
                     maybe_rotate_log_for_age(logger)
                     prune_database()
+                    # Always clean up after the complete scan/maintenance
+                    # cycle. This does NOT stop the bot for memory pressure.
+                    _cleanup_cycle_memory("post_scan_cycle")
                 except KeyboardInterrupt:
                     raise
                 except NetworkUnavailableError as e:
@@ -3327,6 +3454,11 @@ class TradingBot:
                     try:
                         self.monitor_open_trades()
                         self._sync_live_balance()   # keeps wallet current
+                        # Open-trade monitoring can create temporary market
+                        # data/indicator objects too. Clean them up after every
+                        # monitor cycle instead of allowing them to accumulate
+                        # into the next scan.
+                        _cleanup_cycle_memory("open_trade_cycle")
                     except Exception as e:
                         logger.error(f"Monitor error: {e}")
                         _elog(f"Monitor error: {e}", "ERROR")
@@ -3410,6 +3542,7 @@ def predictions_page():
 @app.route("/api/predictions")
 @_login_required
 def api_predictions():
+    _memory_guard("api_predictions", stop_bot=False)
     """
     For every configured symbol, compute:
       - Current technical score & distance from the 85% threshold
@@ -3491,7 +3624,7 @@ def api_predictions():
         data_provider = _bot_ctx["data"] if _bot_ctx else MarketDataProvider(mode)
         for sym in symbols:
             try:
-                df = data_provider.get_ohlcv(sym, tf, limit=200)
+                df = data_provider.get_ohlcv(sym, tf, limit=120)
                 if df is None or len(df) < 50:
                     errors.append({"symbol": sym, "error": data_provider.last_error or "No data"})
                     continue
@@ -3875,6 +4008,9 @@ def api_wallet_withdraw():
     }
     with _WALLET_LOCK:
         _WALLET_LEDGER.append(record)
+    max_ledger = int(CONFIG.get("max_wallet_ledger_memory", 200))
+    if len(_WALLET_LEDGER) > max_ledger:
+        del _WALLET_LEDGER[:-max_ledger]
 
     _elog(f"Withdrawal {status}: ${amount:.2f} USDT → {address[:10]}… [{req_id}]",
           "INFO" if status == "SUBMITTED" else "WARN")
@@ -4052,6 +4188,7 @@ def api_exchange_status():
 @app.route("/api/analysis")
 @_login_required
 def api_analysis():
+    _memory_guard("api_analysis", stop_bot=False)
     """
     Runs TechnicalAnalysis on every symbol currently configured in the bot,
     returns per-symbol indicator data, BOT-RL score, signal, S/R levels,
@@ -4077,7 +4214,7 @@ def api_analysis():
         for sym in symbols:
             try:
                 # Pull live OHLCV (returns None if exchange is unreachable)
-                df = data_provider.get_ohlcv(sym, tf, limit=200)
+                df = data_provider.get_ohlcv(sym, tf, limit=120)
                 if df is None or len(df) < 50:
                     errors.append({"symbol": sym, "error": data_provider.last_error or "insufficient data"})
                     continue
@@ -4262,6 +4399,7 @@ def api_activity():
 @app.route("/api/state")
 @_login_required
 def api_state():
+    _memory_guard("api_state", stop_bot=False)
     tm  = _TM
     st  = tm.stats() if tm else {
         "balance":CONFIG["account_balance"],"equity":CONFIG["account_balance"],
@@ -4286,6 +4424,12 @@ def api_state():
         "symbols"      : (CONFIG.get("crypto_symbols") if CONFIG.get("market_mode")=="CRYPTO"
                   else CONFIG.get("stock_symbols")),
         "stats"        : st,
+        "runtime_memory": {
+            "rss_mb": round(_process_rss_mb(), 1),
+            "soft_limit_mb": CONFIG.get("memory_soft_limit_mb", 350),
+            "hard_limit_mb": CONFIG.get("memory_hard_limit_mb", 410),
+            "guard_enabled": bool(CONFIG.get("memory_guard_enabled", True)),
+        },
         "open_trades"  : ot,
         "closed_trades": ct,
         "live_prices"  : _PRICE_CACHE,
@@ -4475,6 +4619,7 @@ def api_execute_trade():
 @app.route("/api/signals/tradeable")
 @_login_required
 def api_signals_tradeable():
+    _memory_guard("api_signals_tradeable", stop_bot=False)
     """Feeds the manual-trade dropdown: live BUY/SELL signals from the
     bot's own last-scan cache (the same numbers it actually acted/would
     act on — see the single-source-of-truth note on last_signals),
@@ -4797,6 +4942,12 @@ def api_admin_storage():
         pass
     return jsonify({
         "ok": True,
+        "memory": {
+            "rss_mb": round(_process_rss_mb(), 1),
+            "soft_limit_mb": CONFIG.get("memory_soft_limit_mb", 350),
+            "hard_limit_mb": CONFIG.get("memory_hard_limit_mb", 410),
+            "guard_enabled": bool(CONFIG.get("memory_guard_enabled", True)),
+        },
         "database": {"size_mb": round(db_size_mb, 2), "max_mb": CONFIG["db_max_size_mb"],
                      "retention_days": CONFIG["db_retention_days"], "row_counts": row_counts,
                      "last_pruned_at": _LAST_DB_PRUNE_AT.isoformat() if _LAST_DB_PRUNE_AT else None},
