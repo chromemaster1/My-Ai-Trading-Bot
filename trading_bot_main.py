@@ -114,7 +114,7 @@ CONFIG = {
     # mathematically bounded score so a clean continuation can reach the same
     # 85% entry bar without pretending that a pullback signal exists.
     "trend_continuation_enabled": True,
-    "trend_continuation_min_confidence": 85,
+    "trend_continuation_min_confidence": 85,  # legacy alias; unified threshold is min_confidence_to_trade
     "trend_continuation_min_efficiency_ratio": 0.30,
     "trend_continuation_min_momentum_pct": 0.25,
     "trend_continuation_max_extension_atr": 1.50,
@@ -2274,7 +2274,7 @@ class TechnicalAnalysis:
             max_ext = float(CONFIG.get("trend_continuation_max_extension_atr", 1.50))
             min_rsi = float(CONFIG.get("trend_continuation_min_rsi_fast", 50.0))
             max_rsi = float(CONFIG.get("trend_continuation_max_rsi_fast", 75.0))
-            cont_min = float(CONFIG.get("trend_continuation_min_confidence", 85))
+            cont_min = float(min_conf)  # one entry threshold for all strategy paths
 
             # Use directional RSI, momentum, EMA slope and price/EMA alignment
             # rather than requiring oversold/overbought. This is what makes a
@@ -2377,12 +2377,22 @@ class TechnicalAnalysis:
                 and trend_strength >= 0.50
             )
 
-            if continuation_buy_ready and buy < min_conf:
-                buy = continuation_buy
-                reasons_buy = continuation_buy_reasons + ["⚡ TREND CONTINUATION entry — no pullback required"]
-            if continuation_sell_ready and sell < min_conf:
-                sell = continuation_sell
-                reasons_sell = continuation_sell_reasons + ["⚡ TREND CONTINUATION entry — no pullback required"]
+        # UNIFIED ENTRY SCORING: one final directional confidence and one
+        # min_confidence_to_trade threshold for pullbacks and continuations.
+        # Strategy-specific component scores are diagnostic evidence, never
+        # independent entry thresholds. A continuation cannot contribute an
+        # entry-level score unless its directional/extension safety gates pass.
+        pullback_buy, pullback_sell = buy, sell
+        eligible_cont_buy = continuation_buy if continuation_buy_ready else min(continuation_buy, min_conf - 1)
+        eligible_cont_sell = continuation_sell if continuation_sell_ready else min(continuation_sell, min_conf - 1)
+        buy = max(pullback_buy, eligible_cont_buy)
+        sell = max(pullback_sell, eligible_cont_sell)
+        buy_path = "TREND" if continuation_buy_ready and eligible_cont_buy > pullback_buy else "PULLBACK"
+        sell_path = "TREND" if continuation_sell_ready and eligible_cont_sell > pullback_sell else "PULLBACK"
+        if buy_path == "TREND":
+            reasons_buy = continuation_buy_reasons + ["⚡ TREND CONTINUATION — unified entry score"]
+        if sell_path == "TREND":
+            reasons_sell = continuation_sell_reasons + ["⚡ TREND CONTINUATION — unified entry score"]
 
         # One canonical diagnostic payload shared with both dashboard APIs.
         diagnostics = {
@@ -2393,7 +2403,12 @@ class TechnicalAnalysis:
             "continuation_buy_ready": bool(continuation_buy_ready),
             "continuation_sell_ready": bool(continuation_sell_ready),
             "continuation_enabled": bool(CONFIG.get("trend_continuation_enabled", True)),
-            "continuation_min_conf": float(CONFIG.get("trend_continuation_min_confidence", 85)),
+            "continuation_min_conf": float(min_conf),
+            "entry_threshold": float(min_conf),
+            "unified_buy_score": round(buy, 1),
+            "unified_sell_score": round(sell, 1),
+            "buy_entry_path": buy_path,
+            "sell_entry_path": sell_path,
             "continuation_buy_reasons": continuation_buy_reasons,
             "continuation_sell_reasons": continuation_sell_reasons,
             "efficiency_ratio": round(efficiency_ratio, 3),
@@ -2423,7 +2438,7 @@ class TechnicalAnalysis:
                 and buy >= min_conf + 10 and (buy - sell) >= 15
             )
             trade_mode, rr_target = _mode_for_side(buy, sell, et == 1, et == -1, strong_confirmation)
-            if continuation_buy_ready and buy == continuation_buy:
+            if buy_path == "TREND":
                 trade_mode = "TREND"
                 rr_target = max(fast_min_rr, fast_target_rr)
                 reasons_buy.append("Trend mode: lock breakeven at 1R, then trail/ride while trend remains valid")
@@ -2464,7 +2479,7 @@ class TechnicalAnalysis:
                 and sell >= min_conf + 10 and (sell - buy) >= 15
             )
             trade_mode, rr_target = _mode_for_side(sell, buy, et == 1, et == -1, strong_confirmation)
-            if continuation_sell_ready and sell == continuation_sell:
+            if sell_path == "TREND":
                 trade_mode = "TREND"
                 rr_target = max(fast_min_rr, fast_target_rr)
                 reasons_sell.append("Trend mode: lock breakeven at 1R, then trail/ride while trend remains valid")
@@ -3978,8 +3993,11 @@ def api_predictions():
                     "pullback_buy_score": sig.get("pullback_buy_score"),
                     "pullback_sell_score": sig.get("pullback_sell_score"),
                     "continuation_score": cont_score,
-                    "continuation_threshold": cont_min,
+                    "continuation_threshold": min_conf,
                     "continuation_gap": continuation_gap,
+                    "unified_buy_score": sig.get("unified_buy_score"),
+                    "unified_sell_score": sig.get("unified_sell_score"),
+                    "entry_threshold": min_conf,
                     "continuation_ready": cont_ready,
                     "continuation_reasons": continuation_reasons,
                     "continuation_enabled": sig.get("continuation_enabled", True),
