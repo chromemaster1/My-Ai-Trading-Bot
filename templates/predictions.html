@@ -46,7 +46,7 @@
     <button class="tier-btn" onclick="setTier('EARLY',this)">⚪ Early</button>
     <select class="sort-sel" id="sort-sel" onchange="renderCards()">
       <option value="score">Score ↓</option>
-      <option value="ev">Exp. Value ↓</option>
+      <option value="ev">Continuation ↓</option>
       <option value="gap">Gap ↑ (closest)</option>
       <option value="symbol">Symbol A–Z</option>
     </select>
@@ -57,12 +57,10 @@
   </div>
 
   <p style="font-size:11px;color:var(--m2);margin-top:8px;line-height:1.7">
-    Predictions are computed live from exchange OHLCV data using the same RSI(<span id="foot-rsi"></span>),
-    swing-pivot, EMA, volume and momentum engine as the bot. Scores reflect current candle alignment only —
-    the market can move before the bot's next scan. Win-rate estimates are based on published backtests of
-    RSI + swing confluence strategies; they are <em>estimates, not guarantees</em>.
-    Expected value assumes the configured 4:1 reward:risk ratio and is mathematical — not a profit promise.
-    Trading involves substantial risk of loss.
+    Predictions use the bot’s pullback and trend-continuation scoring on fresh OHLCV data with RSI(<span id="foot-rsi"></span>),
+         swing-pivot, EMA, volume and momentum engine. Continuation entries do not require oversold RSI or swing pullbacks.
+     Scores are technical confluence, not calibrated win probabilities. Trade execution also depends on live-data,
+     position, exchange, and risk checks. Levels for HOLD signals are illustrative, not orders.
   </p>
 </div>
 {% endblock %}
@@ -140,8 +138,8 @@ function renderSummary(){
     {l:'Buy signals',  v:buys,                                    s:'Bullish direction',c:'g'},
     {l:'Sell signals', v:sells,                                   s:'Bearish direction',c:'r'},
     {l:'Avg Score',    v:avgScore+'%',                            s:'Across all pairs', c:''},
-    {l:'Best EV',      v:(bestEV===(-Infinity)?'—':'$'+fmt(bestEV)),s:'Per trade',     c:bestEV>0?'g':'r'},
-    {l:'Portfolio EV', v:'$'+fmt(totalEV),                        s:'If all triggered',c:totalEV>0?'g':'r'},
+    {l:'Trend entries', v:trends, s:'Confirmed continuation',c:'g'},
+    {l:'Trend watch',v:contWatch,s:'Near continuation score',c:'y'},
   ].map(x=>`<div class="sr-card ${x.c}">
     <div class="sr-lbl">${x.l}</div>
     <div class="sr-val">${esc(String(x.v))}</div>
@@ -166,7 +164,7 @@ function renderCards(){
   let ps=[...(D.predictions||[])];
   if(_tier!=='ALL') ps=ps.filter(p=>p.tier===_tier);
   if(sort==='score') ps.sort((a,b)=>b.current_score-a.current_score);
-  else if(sort==='ev')  ps.sort((a,b)=>b.expected_value-a.expected_value);
+  else if(sort==='ev')  ps.sort((a,b)=>(b.continuation_score||0)-(a.continuation_score||0));
   else if(sort==='gap') ps.sort((a,b)=>a.gap_to_threshold-b.gap_to_threshold);
   else ps.sort((a,b)=>a.symbol.localeCompare(b.symbol));
 
@@ -193,12 +191,12 @@ function predCard(p){
   const pxFmt    = px>999?px.toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2})
                    :px>1?px.toFixed(4):px.toFixed(6);
   const chgCls   = p.pct_change>0?'up':p.pct_change<0?'dn':'';
-  const ev       = p.expected_value||0;
-  const wr       = p.win_rate_estimate||0;
+  const contScore=p.continuation_score||0;
+  const contMin=p.continuation_threshold||85;
 
   // Score gap badge
   const gapBadge = gap===0
-    ?`<span class="gap-badge gap-zero">✅ Trade ready</span>`
+    ?`<span class="gap-badge gap-zero">${p.meets_threshold?'Signal ready':'Score reached; gates pending'}</span>`
     :gap<=15
     ?`<span class="gap-badge gap-small">+${gap}pts needed</span>`
     :`<span class="gap-badge gap-large">${gap}pts away</span>`;
@@ -209,7 +207,7 @@ function predCard(p){
   const tp     = p.tp  || (p.direction==='BUY'?px*(1+0.02):px*(1-0.02));
   const risk$  = p.max_loss_usd  || 0;
   const gain$  = p.max_gain_usd  || 0;
-  const rr     = p.rr_ratio || 4;
+  const rr     = p.rr_ratio || (p.meets_threshold?2:4);
 
   // Level visualisation — price position between SL and TP
   const rangeLow  = Math.min(sl, tp, px);
@@ -237,7 +235,7 @@ function predCard(p){
       <div class="ch-chg ${chgCls}">${p.pct_change>=0?'+':''}${p.pct_change}%</div>
     </div>
     <div class="ch-right">
-      <span class="dir-badge dir-${p.direction.toLowerCase()}">${p.direction}</span>
+      <span class="dir-badge dir-${p.direction.toLowerCase()}">${p.signal==='HOLD'?'WATCH '+p.direction:p.direction}</span>
       <span class="tier-badge t-${p.tier}">${tierLabel(p.tier)}</span>
       ${p.pattern?`<span style="font-size:10px;color:var(--m)">${esc(p.pattern)}</span>`:''}
     </div>
@@ -257,25 +255,20 @@ function predCard(p){
       <div class="threshold-line" style="left:${threshX}"></div>
     </div>
     <div class="score-meta">
-      <span>${score>=thresh?'Qualifies for trade':'Below threshold'}</span>
+      <span>${p.meets_threshold?'Actionable signal':p.signal==='HOLD'?'HOLD — entry gates pending':'Below threshold'}</span>
       ${gapBadge}
     </div>
-    <!-- EV + Win Rate mini rows -->
     <div class="ev-row" style="margin-top:10px">
-      <span class="ev-lbl">Win rate est.</span>
-      <div class="ev-track"><div class="ev-fill" style="width:${wr}%;background:var(--blue)"></div></div>
-      <span class="ev-val" style="color:var(--blue)">${wr}%</span>
+      <span class="ev-lbl">Trend continuation</span>
+      <div class="ev-track"><div class="ev-fill" style="width:${Math.min(contScore,100)}%;background:var(--blue)"></div></div>
+      <span class="ev-val">${contScore}/${contMin}</span>
     </div>
-    <div class="ev-row">
-      <span class="ev-lbl">Expected value</span>
-      <div class="ev-track"><div class="ev-fill" style="width:${Math.min(Math.abs(ev)/Math.max(gain$,1)*100,100)}%;background:${ev>=0?'var(--a)':'var(--red)'}"></div></div>
-      <span class="ev-val" style="color:${ev>=0?'var(--a)':'var(--red)'}">${ev>=0?'+':''}$${fmt(ev)}</span>
-    </div>
+    <div style="font-size:11px;color:var(--m);margin-top:6px">${esc(p.entry_path||'WATCH')} · ${p.continuation_ready?'Continuation conditions confirmed':'Continuation conditions still forming'} · ER ${p.efficiency_ratio??'—'} · EMA distance ${p.extension_atr??'—'} ATR</div>
   </div>
 
   <!-- TRADE SCENARIO -->
   <div class="scenario-sec">
-    <div class="sec-title">Trade scenario (4:1 R:R · ${p.sl_pct}% SL locked)</div>
+    <div class="sec-title">${p.meets_threshold?"Trade levels":"Illustrative levels"} (${rr}:1 R:R · ${p.sl_pct}% SL)</div>
     <div class="scenario-grid">
       <div class="sc-item entry"><div class="sc-lbl">Entry</div>
         <div class="sc-val">$${fmtPx(entry)}</div></div>
@@ -289,10 +282,9 @@ function predCard(p){
         <div class="sc-val">+$${fmt(gain$)}</div></div>
       <div class="sc-item rr"><div class="sc-lbl">R:R Actual</div>
         <div class="sc-val">${rr}:1</div></div>
-      <div class="sc-item ${ev>=0?'ev-pos':'ev-neg'}"><div class="sc-lbl">Exp. Value</div>
-        <div class="sc-val">${ev>=0?'+':''}$${fmt(ev)}</div></div>
-      <div class="sc-item wr"><div class="sc-lbl">Win Rate</div>
-        <div class="sc-val">${wr}%</div></div>
+      <div class="sc-item"><div class="sc-lbl">Entry path</div><div class="sc-val">${esc(p.entry_path||'WATCH')}</div></div>
+      <div class="sc-item"><div class="sc-lbl">Profit lock</div><div class="sc-val">${p.profit_lock_r??1}R → breakeven</div></div>
+      <div class="sc-item"><div class="sc-lbl">Trail starts</div><div class="sc-val">${p.trailing_activation_r??1.5}R</div></div>
       <div class="sc-item"><div class="sc-lbl">Pos. Size</div>
         <div class="sc-val">${(p.position_size||0).toFixed(4)}</div></div>
     </div>
@@ -328,7 +320,7 @@ function predCard(p){
 
   <!-- ROADMAP TO TRADE -->
   <div class="roadmap-sec">
-    <div class="roadmap-title">${gap===0?'✅ All conditions met — bot will open on next scan':'🗺 What needs to happen to open this trade'}</div>
+    <div class="roadmap-title">${p.meets_threshold?'✅ Signal confirmed — execution subject to risk/data checks':'🗺 Pullback or continuation requirements'}</div>
     ${roadmapSteps}
   </div>
 </div>`;
@@ -339,14 +331,20 @@ function buildRoadmap(p, needed){
   const gap = p.gap_to_threshold||0;
   const active = p.active_signals||[];
 
-  if(gap===0){
+  if(p.meets_threshold){
     return `<div class="roadmap-item">
       <div class="roadmap-step step-done">✓</div>
-      <div><div class="roadmap-text">All required signals are aligned. Bot will open a ${p.direction} trade on the next scan cycle.</div>
+      <div><div class="roadmap-text">${p.entry_path} ${p.direction} signal is aligned; execution still requires fresh prices and passing risk/exchange checks.</div>
         <div class="roadmap-pts" style="color:var(--a)">Score: ${p.current_score}/${p.min_conf} ✅</div>
       </div></div>`;
   }
 
+  if(p.continuation_enabled){
+    steps.push({done:!!p.continuation_ready,
+      text:`Alternative: ${p.direction} trend continuation — ${p.continuation_score||0}/${p.continuation_threshold||85} pts; no oversold RSI or swing pullback required`,
+      pts:`ER ${p.efficiency_ratio??'—'} · EMA extension ${p.extension_atr??'—'} ATR`});
+    (p.continuation_reasons||[]).slice(0,3).forEach(x=>steps.push({done:true,text:x,pts:'Trend confirmation'}));
+  }
   // Step 1: already active
   if(active.length){
     steps.push({done:true, text:`${active.length} signal${active.length>1?'s':''} already confirmed: ${active.slice(0,2).join(', ')}`,
@@ -363,7 +361,7 @@ function buildRoadmap(p, needed){
 
   // Final step
   steps.push({done:false,
-    text:`Reach ${p.min_conf}% threshold → bot opens ${p.direction} @ $${fmtPx(p.entry)}`,
+    text:`Reach pullback threshold or satisfy continuation score AND entry gates; risk checks still apply`,
     pts:`Target: ${p.min_conf} pts`});
 
   return steps.map((s,i)=>`
@@ -378,14 +376,14 @@ function buildRoadmap(p, needed){
 
 function triggerHint(label, p){
   const l = label.toLowerCase();
-  if(l.includes('oversold'))   return `RSI(${p.rsi_fast_period||6}) needs to drop below ${p.min_conf?30:30} — currently ${p.rsi_fast||'?'}`;
+  if(l.includes('oversold'))   return `Pullback path only: RSI(${p.rsi_fast_period||6}) oversold; continuation does not require it`;
   if(l.includes('overbought')) return `RSI(${p.rsi_fast_period||6}) needs to rise above 70 — currently ${p.rsi_fast||'?'}`;
   if(l.includes('cross'))      return 'Needs RSI fast to cross slow on next candle close';
   if(l.includes('swing low'))  return `Price needs to pull back to ${p.last_sl?'$'+fmtPx(p.last_sl):'nearby swing low'}`;
   if(l.includes('swing high')) return `Price needs to push up to ${p.last_sh?'$'+fmtPx(p.last_sh):'nearby swing high'}`;
   if(l.includes('ema'))        return 'EMA21 needs to cross above/below EMA50';
   if(l.includes('volume'))     return 'Volume needs to surge > 1.5× its 20-bar average';
-  if(l.includes('momentum'))   return 'Price needs 5-bar momentum > 0.5%';
+  if(l.includes('momentum'))   return 'Pullback scoring uses 0.5%; continuation uses configured directional momentum threshold';
   return '';
 }
 

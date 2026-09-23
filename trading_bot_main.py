@@ -108,7 +108,18 @@ CONFIG = {
     "confirmed_trade_min_rr" : 4.0,      # full ride-out mode: only the strongest setups keep the original 4:1 reward:risk profile
     "fast_trade_min_rr"      : 1.0,      # quick trades can open on a 1R or 2R target and exit fast once that objective is reached
     "fast_trade_target_rr"   : 2.0,      # default fast-trade target; weaker but valid setups can trade on a 2:1 path instead of waiting for 4:1
-    "min_confidence_to_trade": 85,       # only open trades with >=85% combined confidence
+    "min_confidence_to_trade": 85,       # normal entry threshold
+    # Trend-continuation entry: the bot is designed to catch confirmed trends,
+    # not wait for an oversold/overbought pullback.  This is a separate,
+    # mathematically bounded score so a clean continuation can reach the same
+    # 85% entry bar without pretending that a pullback signal exists.
+    "trend_continuation_enabled": True,
+    "trend_continuation_min_confidence": 85,
+    "trend_continuation_min_efficiency_ratio": 0.30,
+    "trend_continuation_min_momentum_pct": 0.25,
+    "trend_continuation_max_extension_atr": 1.50,
+    "trend_continuation_min_rsi_fast": 50.0,
+    "trend_continuation_max_rsi_fast": 75.0,
     "max_risk_per_trade"     : 0.01,
     "max_open_trades"        : 3,
     "max_closed_trades_memory": 500,
@@ -2230,6 +2241,166 @@ class TechnicalAnalysis:
                     sell = min(sell, cap)
                     reasons_sell.append(f"⚠️ Capped — choppy market (ER={efficiency_ratio:.2f} "
                                          f"< {CONFIG['chop_min_efficiency_ratio']:.2f}), full confluence not met")
+        # ── Trend-continuation entry path ────────────────────────────────
+        # The original score is intentionally pullback-heavy (oversold +
+        # swing-low points). That made a healthy established uptrend sit at
+        # HOLD even when EMA, RSI, momentum and directional efficiency all
+        # agreed.  Build a separate 0-100 continuation score instead.
+        #
+        # Score components (max 100):
+        #   EMA direction/alignment       20
+        #   price on correct EMA side     10
+        #   RSI-24 trend confirmation     10
+        #   RSI6 vs RSI12 directional gap 10
+        #   momentum                      15
+        #   efficiency ratio              10
+        #   volume confirmation            5
+        #   EMA21 slope                    5
+        #   healthy RSI/ATR extension     10
+        #   established EMA separation     5
+        # This path is deliberately symmetric for BUY/SELL and does not
+        # weaken SL/TP, exit, chop, data-freshness, or risk controls.
+        pullback_buy, pullback_sell = buy, sell
+        continuation_buy = 0.0
+        continuation_sell = 0.0
+        continuation_buy_reasons = []
+        continuation_sell_reasons = []
+        continuation_buy_ready = False
+        continuation_sell_ready = False
+
+        if CONFIG.get("trend_continuation_enabled", True):
+            min_er = float(CONFIG.get("trend_continuation_min_efficiency_ratio", 0.30))
+            min_mom = float(CONFIG.get("trend_continuation_min_momentum_pct", 0.25))
+            max_ext = float(CONFIG.get("trend_continuation_max_extension_atr", 1.50))
+            min_rsi = float(CONFIG.get("trend_continuation_min_rsi_fast", 50.0))
+            max_rsi = float(CONFIG.get("trend_continuation_max_rsi_fast", 75.0))
+            cont_min = float(CONFIG.get("trend_continuation_min_confidence", 85))
+
+            # Use directional RSI, momentum, EMA slope and price/EMA alignment
+            # rather than requiring oversold/overbought. This is what makes a
+            # confirmed continuation an entry in its own right.
+            buy_rsi_directional = rf > rs
+            sell_rsi_directional = rf < rs
+            ema21_slope_up = ema21 > float(prev["ema_21"])
+            ema21_slope_down = ema21 < float(prev["ema_21"])
+            extension_atr = abs(px - ema21) / atr if atr > 0 else 999.0
+
+            # BUY continuation — max 100 points.
+            if et == 1:
+                continuation_buy += 20
+                continuation_buy_reasons.append("Confirmed EMA21>EMA50 uptrend")
+            if px > ema21:
+                continuation_buy += 10
+                continuation_buy_reasons.append("Price above EMA21")
+            if rc > 52:
+                continuation_buy += 10
+                continuation_buy_reasons.append(f"RSI({self.confirm})={rc:.1f} bullish trend confirmation")
+            if buy_rsi_directional:
+                continuation_buy += 10
+                continuation_buy_reasons.append(f"RSI6>RSI12 ({rf:.1f}>{rs:.1f})")
+            if mom > min_mom:
+                continuation_buy += 15
+                continuation_buy_reasons.append(f"Positive momentum +{mom:.2f}%")
+            if efficiency_ratio >= min_er:
+                continuation_buy += 10
+                continuation_buy_reasons.append(f"Efficient directional movement ER={efficiency_ratio:.2f}")
+            if vs:
+                continuation_buy += 5
+                continuation_buy_reasons.append("Volume confirms continuation")
+            if trend_strength >= 0.50:
+                continuation_buy += 5
+                continuation_buy_reasons.append(f"Established EMA separation {ema_sep_pct*100:.2f}%")
+            if ema21_slope_up:
+                continuation_buy += 5
+                continuation_buy_reasons.append("EMA21 rising")
+            if et == 1 and min_rsi <= rf <= max_rsi and extension_atr <= max_ext:
+                continuation_buy += 10
+                continuation_buy_reasons.append(f"Healthy continuation zone: RSI6={rf:.1f}, {extension_atr:.2f} ATR from EMA21")
+
+            # SELL continuation — exact mirror of BUY.
+            if et == -1:
+                continuation_sell += 20
+                continuation_sell_reasons.append("Confirmed EMA21<EMA50 downtrend")
+            if px < ema21:
+                continuation_sell += 10
+                continuation_sell_reasons.append("Price below EMA21")
+            if rc < 48:
+                continuation_sell += 10
+                continuation_sell_reasons.append(f"RSI({self.confirm})={rc:.1f} bearish trend confirmation")
+            if sell_rsi_directional:
+                continuation_sell += 10
+                continuation_sell_reasons.append(f"RSI6<RSI12 ({rf:.1f}<{rs:.1f})")
+            if mom < -min_mom:
+                continuation_sell += 15
+                continuation_sell_reasons.append(f"Negative momentum {mom:.2f}%")
+            if efficiency_ratio >= min_er:
+                continuation_sell += 10
+                continuation_sell_reasons.append(f"Efficient directional movement ER={efficiency_ratio:.2f}")
+            if vs:
+                continuation_sell += 5
+                continuation_sell_reasons.append("Volume confirms continuation")
+            if trend_strength >= 0.50:
+                continuation_sell += 5
+                continuation_sell_reasons.append(f"Established EMA separation {ema_sep_pct*100:.2f}%")
+            if ema21_slope_down:
+                continuation_sell += 5
+                continuation_sell_reasons.append("EMA21 falling")
+            if et == -1 and (100.0 - max_rsi) <= rf <= (100.0 - min_rsi) and extension_atr <= max_ext:
+                continuation_sell += 10
+                continuation_sell_reasons.append(f"Healthy continuation zone: RSI6={rf:.1f}, {extension_atr:.2f} ATR from EMA21")
+
+            continuation_buy = min(100.0, continuation_buy)
+            continuation_sell = min(100.0, continuation_sell)
+
+            continuation_buy_ready = (
+                et == 1
+                and continuation_buy >= cont_min
+                and continuation_buy > continuation_sell
+                and efficiency_ratio >= min_er
+                and min_rsi <= rf <= max_rsi
+                and mom > min_mom
+                and px > ema21
+                and ema21_slope_up
+                and extension_atr <= max_ext
+                and trend_strength >= 0.50
+            )
+            continuation_sell_ready = (
+                et == -1
+                and continuation_sell >= cont_min
+                and continuation_sell > continuation_buy
+                and efficiency_ratio >= min_er
+                and (100.0 - max_rsi) <= rf <= (100.0 - min_rsi)
+                and mom < -min_mom
+                and px < ema21
+                and ema21_slope_down
+                and extension_atr <= max_ext
+                and trend_strength >= 0.50
+            )
+
+            if continuation_buy_ready and buy < min_conf:
+                buy = continuation_buy
+                reasons_buy = continuation_buy_reasons + ["⚡ TREND CONTINUATION entry — no pullback required"]
+            if continuation_sell_ready and sell < min_conf:
+                sell = continuation_sell
+                reasons_sell = continuation_sell_reasons + ["⚡ TREND CONTINUATION entry — no pullback required"]
+
+        # One canonical diagnostic payload shared with both dashboard APIs.
+        diagnostics = {
+            "pullback_buy_score": round(pullback_buy, 1),
+            "pullback_sell_score": round(pullback_sell, 1),
+            "continuation_buy_score": round(continuation_buy, 1),
+            "continuation_sell_score": round(continuation_sell, 1),
+            "continuation_buy_ready": bool(continuation_buy_ready),
+            "continuation_sell_ready": bool(continuation_sell_ready),
+            "continuation_enabled": bool(CONFIG.get("trend_continuation_enabled", True)),
+            "continuation_min_conf": float(CONFIG.get("trend_continuation_min_confidence", 85)),
+            "continuation_buy_reasons": continuation_buy_reasons,
+            "continuation_sell_reasons": continuation_sell_reasons,
+            "efficiency_ratio": round(efficiency_ratio, 3),
+            "extension_atr": round(extension_atr, 3) if CONFIG.get("trend_continuation_enabled", True) else None,
+            "trend_strength": round(trend_strength, 3),
+        }
+
         sl_floor = CONFIG["stop_loss_pct"]
         tp_floor = CONFIG["take_profit_pct"]
         confirmed_rr = float(CONFIG.get("confirmed_trade_min_rr", 4.0))
@@ -2252,6 +2423,10 @@ class TechnicalAnalysis:
                 and buy >= min_conf + 10 and (buy - sell) >= 15
             )
             trade_mode, rr_target = _mode_for_side(buy, sell, et == 1, et == -1, strong_confirmation)
+            if continuation_buy_ready and buy == continuation_buy:
+                trade_mode = "TREND"
+                rr_target = max(fast_min_rr, fast_target_rr)
+                reasons_buy.append("Trend mode: lock breakeven at 1R, then trail/ride while trend remains valid")
             # WIDER of the two candidates, not tighter: a stop placed at
             # whichever distance gives the trade more room survives normal
             # price noise. Picking the tighter one (the previous behaviour)
@@ -2280,7 +2455,7 @@ class TechnicalAnalysis:
             return {"side":"BUY","confidence":conf,"reasons":reasons_buy,
                     "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
                     "trade_mode":trade_mode,"rr_target":rr_target,
-                    "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh}
+                    "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh, **diagnostics}
 
         if sell > buy and sell >= min_conf:
             conf  = min(float(sell), 99.0)
@@ -2289,6 +2464,10 @@ class TechnicalAnalysis:
                 and sell >= min_conf + 10 and (sell - buy) >= 15
             )
             trade_mode, rr_target = _mode_for_side(sell, buy, et == 1, et == -1, strong_confirmation)
+            if continuation_sell_ready and sell == continuation_sell:
+                trade_mode = "TREND"
+                rr_target = max(fast_min_rr, fast_target_rr)
+                reasons_sell.append("Trend mode: lock breakeven at 1R, then trail/ride while trend remains valid")
             # Same fix as BUY, mirrored: WIDER of the two candidates.
             sl_p  = max(round(px*(1+sl_floor), 6), round(px+atr*1.2, 6))
             risk_dist = sl_p - px
@@ -2307,11 +2486,11 @@ class TechnicalAnalysis:
             return {"side":"SELL","confidence":conf,"reasons":reasons_sell,
                     "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
                     "trade_mode":trade_mode,"rr_target":rr_target,
-                    "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh}
+                    "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh, **diagnostics}
 
         return {"side":"HOLD","confidence":max(buy,sell),
                 "reasons":reasons_buy if buy>=sell else reasons_sell,"price":px,"is_chop":is_chop,
-                "trade_mode":"FAST","rr_target":fast_min_rr}
+                "trade_mode":"FAST","rr_target":fast_min_rr, **diagnostics}
 
 # ════════════════════════════════════════════════════════════
 #  AI ANALYZER
@@ -3565,26 +3744,8 @@ def api_predictions():
     errors      = []
     ts          = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    # Historical win-rate baseline per signal count (empirical estimates for
-    # RSI + swing + EMA confluence strategies from published backtests)
-    WIN_RATE_BY_SCORE = {
-        (0,  40): 0.38,
-        (40, 55): 0.47,
-        (55, 70): 0.55,
-        (70, 80): 0.62,
-        (80, 90): 0.71,
-        (90,100): 0.79,
-    }
-
-    def estimate_win_rate(score: float) -> float:
-        for (lo, hi), wr in WIN_RATE_BY_SCORE.items():
-            if lo <= score < hi:
-                return wr
-        return 0.79
-
-    def expected_value(win_rate: float, risk: float) -> float:
-        reward = risk * min_rr
-        return round(win_rate * reward - (1 - win_rate) * risk, 2)
+    # Confidence is a technical confluence score, NOT a calibrated win probability.
+    # No invented win-rate or dollar expected-value estimates are emitted.
 
     MAX_SCORE = 100
     # All signal components and their point values
@@ -3710,6 +3871,16 @@ def api_predictions():
                 current_score = round(sig.get("confidence", 0), 1)
                 gap_to_threshold = max(0, min_conf - current_score)
 
+                cont_buy = float(sig.get("continuation_buy_score", 0))
+                cont_sell = float(sig.get("continuation_sell_score", 0))
+                cont_score = cont_buy if primary_dir == "BUY" else cont_sell
+                cont_min = float(sig.get("continuation_min_conf", CONFIG.get("trend_continuation_min_confidence", 85)))
+                cont_ready = bool(sig.get("continuation_buy_ready" if primary_dir == "BUY" else "continuation_sell_ready", False))
+                continuation_reasons = sig.get("continuation_buy_reasons" if primary_dir == "BUY" else "continuation_sell_reasons", [])
+                # A close continuation score is informative even while the actual signal remains HOLD.
+                continuation_gap = max(0, cont_min - cont_score)
+                actual_ready = sig.get("side") in ("BUY", "SELL") and current_score >= min_conf
+
                 # SL/TP: use the canonical signal's own sl/tp when it has them
                 # (BUY/SELL case — this is what the bot would actually use).
                 # Only fall back to a fresh projection for the HOLD case, purely
@@ -3739,8 +3910,8 @@ def api_predictions():
                 pos_value = round(pos_size * px, 2)
                 max_loss  = round(risk_dist * pos_size, 2)
                 max_gain  = round(max_loss * min_rr, 2)
-                win_rate  = estimate_win_rate(current_score)
-                ev        = expected_value(win_rate, max_loss)
+                win_rate  = None  # requires out-of-sample trade-history calibration
+                ev        = None
 
                 # Signals still needed to reach threshold
                 missing_dir = "buy" if primary_dir == "BUY" else "sell"
@@ -3780,7 +3951,7 @@ def api_predictions():
                            "Bullish" if px > float(last["open"]) else "Bearish")
 
                 # Readiness tier
-                if current_score >= min_conf:
+                if actual_ready:
                     tier = "TRADE_NOW"
                 elif current_score >= min_conf * 0.82:
                     tier = "VERY_CLOSE"
@@ -3800,7 +3971,23 @@ def api_predictions():
                     "min_conf"         : min_conf,
                     "gap_to_threshold" : gap_to_threshold,
                     "tier"             : tier,
-                    "meets_threshold"  : current_score >= min_conf,
+                    "meets_threshold"  : actual_ready,
+                    "signal"           : sig.get("side", "HOLD"),
+                    "trade_mode"       : sig.get("trade_mode", "FAST"),
+                    "entry_path"       : "TREND" if sig.get("trade_mode") == "TREND" else ("PULLBACK" if actual_ready else "WATCH"),
+                    "pullback_buy_score": sig.get("pullback_buy_score"),
+                    "pullback_sell_score": sig.get("pullback_sell_score"),
+                    "continuation_score": cont_score,
+                    "continuation_threshold": cont_min,
+                    "continuation_gap": continuation_gap,
+                    "continuation_ready": cont_ready,
+                    "continuation_reasons": continuation_reasons,
+                    "continuation_enabled": sig.get("continuation_enabled", True),
+                    "efficiency_ratio": sig.get("efficiency_ratio"),
+                    "extension_atr": sig.get("extension_atr"),
+                    "trend_strength": sig.get("trend_strength"),
+                    "profit_lock_r": CONFIG.get("profit_lock_r_multiple", 1.0),
+                    "trailing_activation_r": CONFIG.get("trailing_stop_activation_r", 1.5),
                     "in_open_trade"    : any(t["symbol"]==sym for t in (_TM.open_trades if _TM else [])),
                     # Trade parameters
                     "entry"            : round(px, 6),
@@ -3819,7 +4006,7 @@ def api_predictions():
                     "risk_amount"      : round(risk_amt, 2),
                     "account_balance"  : round(bal, 2),
                     # Probability
-                    "win_rate_estimate": round(win_rate * 100, 1),
+                    "win_rate_estimate": None,
                     "expected_value"   : ev,
                     # Indicators
                     "rsi_fast"         : round(rsi_fast, 1) if rsi_fast else None,
@@ -3859,7 +4046,7 @@ def api_predictions():
         "min_conf"    : min_conf,
         "sl_pct"      : round(sl_floor * 100, 2),
         "tp_pct"      : round(tp_floor * 100, 2),
-        "rr_ratio"    : min_rr,
+        "rr_ratio"    : None,
         "account_balance": round(bal, 2),
         "predictions" : predictions,
         "errors"      : errors,
@@ -4288,16 +4475,20 @@ def api_analysis():
                 rsi_pdiv = float(prev.get("rsi_div", 0) or 0)
                 buy = 0; sell = 0
 
-                score_breakdown["rsi_oversold"]  = 25 if (rsi_fast and rsi_fast < CONFIG["rsi_oversold"])  else 0
-                score_breakdown["rsi_overbought"]= 25 if (rsi_fast and rsi_fast > CONFIG["rsi_overbought"]) else 0
-                score_breakdown["rsi_cross_buy"] = 20 if (rsi_div > thr and rsi_pdiv <= thr)  else 0
-                score_breakdown["rsi_cross_sell"]= 20 if (rsi_div < -thr and rsi_pdiv >= -thr) else 0
-                score_breakdown["swing_low"]     = 20 if (last_sl and abs(px-last_sl)/px < 0.012) else 0
-                score_breakdown["swing_high"]    = 20 if (last_sh and abs(px-last_sh)/px < 0.012) else 0
-                score_breakdown["ema_bullish"]   = 15 if last.get("ema_trend", -1) == 1 else 0
-                score_breakdown["ema_bearish"]   = 15 if last.get("ema_trend", -1) != 1 else 0
-                score_breakdown["vol_surge"]     = 10 if vol_surge else 0
-                score_breakdown["momentum"]      = 10 if (mom5 and abs(mom5) > 0.5) else 0
+                # Legacy pullback component breakdown; continuation uses the
+                # canonical score and reason list returned by signal().
+                score_breakdown["rsi_oversold"] = 20 if (rsi_fast is not None and rsi_fast < CONFIG["rsi_oversold"]) else 0
+                score_breakdown["rsi_overbought"] = 20 if (rsi_fast is not None and rsi_fast > CONFIG["rsi_overbought"]) else 0
+                score_breakdown["rsi_cross_buy"] = 15 if (rsi_div > thr and rsi_pdiv <= thr) else 0
+                score_breakdown["rsi_cross_sell"] = 15 if (rsi_div < -thr and rsi_pdiv >= -thr) else 0
+                score_breakdown["swing_low"] = 20 if (last_sl is not None and px > 0 and abs(px-last_sl)/px < 0.012) else 0
+                score_breakdown["swing_high"] = 20 if (last_sh is not None and px > 0 and abs(px-last_sh)/px < 0.012) else 0
+                score_breakdown["ema_bullish"] = 15 if last.get("ema_trend", -1) == 1 else 0
+                score_breakdown["ema_bearish"] = 15 if last.get("ema_trend", -1) == -1 else 0
+                score_breakdown["vol_surge"] = 10 if vol_surge else 0
+                score_breakdown["momentum"] = 10 if (mom5 is not None and abs(mom5) > 0.5) else 0
+                score_breakdown["rsi24_bullish"] = 10 if (rsi_confirm is not None and rsi_confirm > 52) else 0
+                score_breakdown["rsi24_bearish"] = 10 if (rsi_confirm is not None and rsi_confirm < 48) else 0
 
                 # Support / resistance levels from recent swing pivots
                 swing_highs = df["sw_h"].dropna().tail(3).tolist()
@@ -4368,7 +4559,23 @@ def api_analysis():
                     "recent_high"  : round(high, 4),
                     "recent_low"   : round(low, 4),
                     "pattern"      : pattern,
+                    "recent_closes": [round(float(v), 6) for v in df["close"].tail(30).tolist()],
                     "score_breakdown": score_breakdown,
+                    "trade_mode": sig.get("trade_mode", "FAST"),
+                    "entry_path": "TREND" if sig.get("trade_mode") == "TREND" else ("PULLBACK" if sig["side"] in ("BUY", "SELL") else "WATCH"),
+                    "pullback_buy_score": sig.get("pullback_buy_score"),
+                    "pullback_sell_score": sig.get("pullback_sell_score"),
+                    "continuation_buy_score": sig.get("continuation_buy_score", 0),
+                    "continuation_sell_score": sig.get("continuation_sell_score", 0),
+                    "continuation_buy_ready": sig.get("continuation_buy_ready", False),
+                    "continuation_sell_ready": sig.get("continuation_sell_ready", False),
+                    "continuation_threshold": sig.get("continuation_min_conf", CONFIG.get("trend_continuation_min_confidence", 85)),
+                    "continuation_enabled": sig.get("continuation_enabled", True),
+                    "efficiency_ratio": sig.get("efficiency_ratio"),
+                    "extension_atr": sig.get("extension_atr"),
+                    "trend_strength": sig.get("trend_strength"),
+                    "profit_lock_r": CONFIG.get("profit_lock_r_multiple", 1.0),
+                    "trailing_activation_r": CONFIG.get("trailing_stop_activation_r", 1.5),
                     "in_open_trade": any(t["symbol"]==sym for t in (_TM.open_trades if _TM else [])),
                 })
 
@@ -4454,6 +4661,10 @@ def api_config():
                "rsi_confirm_period",
                "rsi_overbought","rsi_oversold","rsi_signal_threshold","stop_loss_pct",
                "take_profit_pct","min_confidence_to_trade",
+               "trend_continuation_enabled","trend_continuation_min_confidence",
+               "trend_continuation_min_efficiency_ratio","trend_continuation_min_momentum_pct",
+               "trend_continuation_max_extension_atr","trend_continuation_min_rsi_fast",
+               "trend_continuation_max_rsi_fast",
                "max_risk_per_trade","max_open_trades","account_balance",
                "scan_interval_seconds","max_execution_slippage_pct","signal_exit_confirmations",
                "hold_requires_entry_confidence",
@@ -4479,6 +4690,12 @@ def api_config():
         "take_profit_pct":         (0.001,  0.50,  "0.1% – 50% (e.g. 0.02 = 2%)"),
         "max_risk_per_trade":      (0.001,  0.25,  "0.1% – 25% (e.g. 0.01 = 1%)"),
         "min_confidence_to_trade": (1,      99,    "1 – 99"),
+        "trend_continuation_min_confidence": (70, 99, "70 – 99"),
+        "trend_continuation_min_efficiency_ratio": (0.05, 1.0, "0.05 – 1.0"),
+        "trend_continuation_min_momentum_pct": (0.05, 10.0, "0.05% – 10%"),
+        "trend_continuation_max_extension_atr": (0.25, 5.0, "0.25 – 5 ATR"),
+        "trend_continuation_min_rsi_fast": (40.0, 65.0, "40 – 65"),
+        "trend_continuation_max_rsi_fast": (60.0, 90.0, "60 – 90"),
         "rsi_fast_period":         (2,      50,    "2 – 50"),
         "rsi_slow_period":         (2,      100,   "2 – 100"),
         "rsi_confirm_period":      (10,     200,   "10 – 200"),

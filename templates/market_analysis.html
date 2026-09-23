@@ -59,10 +59,10 @@
         <thead>
           <tr>
             <th>Strategy</th>
-            <th>Est. win rate</th>
+            <th>Measured win rate</th>
             <th>R:R ratio</th>
             <th>How it reads this market</th>
-            <th>Fit</th>
+            <th>Status</th>
           </tr>
         </thead>
         <tbody id="strat-body"></tbody>
@@ -74,7 +74,7 @@
     Analysis uses the same technical engine as the bot (RSI <span id="foot-periods"></span>,
     EMA 21/50/200, ATR, OBV, swing pivots). Scores are calculated live against every configured
     symbol. A trade is only opened by the bot when the score reaches the configured minimum
-    confidence threshold. Not financial advice — trading involves substantial risk of loss.
+    confidence threshold AND all entry/risk/data gates pass. Trend continuation can enter without an RSI oversold/overbought pullback. Scores are not win probabilities.
   </p>
 </div>
 {% endblock %}
@@ -132,7 +132,7 @@ function renderSummary(){
   const buys=res.filter(r=>r.signal==='BUY').length;
   const sells=res.filter(r=>r.signal==='SELL').length;
   const holds=res.filter(r=>r.signal==='HOLD').length;
-  const ready=res.filter(r=>r.confidence>=r.min_conf).length;
+  const ready=res.filter(r=>['BUY','SELL'].includes(r.signal)&&r.confidence>=r.min_conf).length;
   const top=res.slice().sort((a,b)=>b.confidence-a.confidence)[0];
   const avgConf=res.length?Math.round(res.reduce((s,r)=>s+r.confidence,0)/res.length):0;
   $('summary-strip').innerHTML=[
@@ -142,7 +142,7 @@ function renderSummary(){
     {l:'Hold',v:holds,c:'neu'},
     {l:'Meets threshold',v:ready,c:ready>0?'bull':''},
     {l:'Avg confidence',v:avgConf+'%',c:''},
-    {l:'Top pick',v:top?top.symbol:'—',c:top&&top.confidence>=top.min_conf?'bull':''},
+    {l:'Trend entries',v:res.filter(r=>r.entry_path==='TREND').length,c:'bull'},
   ].map(x=>`<div class="sum-card ${x.c}">
     <div class="sum-label">${x.l}</div>
     <div class="sum-val">${x.v}</div>
@@ -186,7 +186,7 @@ function renderCards(){
 
 /* ── Per-symbol card ── */
 function symbolCard(r){
-  const meetsThresh = r.confidence >= r.min_conf;
+  const meetsThresh = ['BUY','SELL'].includes(r.signal) && r.confidence >= r.min_conf;
   const cardClass   = r.in_open_trade?'card-open':(r.signal==='BUY'&&meetsThresh?'card-buy':r.signal==='SELL'&&meetsThresh?'card-sell':'');
   const verdictClass= r.signal==='BUY'?'v-buy':r.signal==='SELL'?'v-sell':'v-hold';
   const verdictLabel= r.signal==='BUY'?'BUY':r.signal==='SELL'?'SELL':'HOLD';
@@ -195,28 +195,30 @@ function symbolCard(r){
                       :r.price>1?r.price.toFixed(4):r.price.toFixed(6);
 
   /* Confidence fill colour */
-  const confColor = r.confidence>=r.min_conf?'#00ff88':r.confidence>=r.min_conf*0.7?'#ffd32a':'#ff4757';
+  const confColor = meetsThresh?'#00ff88':r.confidence>=r.min_conf*0.7?'#ffd32a':'#ff4757';
 
   /* Score breakdown */
   const bd=r.score_breakdown||{};
   const bdItems=[
-    {k:'rsi_oversold',  l:`RSI<${r.rsi_fast_period||6} Oversold`, pts:25, dir:'buy'},
-    {k:'rsi_overbought',l:`RSI<${r.rsi_fast_period||6} Overbought`,pts:25, dir:'sell'},
-    {k:'rsi_cross_buy', l:'RSI Fast Cross ↑', pts:20, dir:'buy'},
-    {k:'rsi_cross_sell',l:'RSI Fast Cross ↓', pts:20, dir:'sell'},
+    {k:'rsi_oversold',  l:`RSI<${r.rsi_fast_period||6} Oversold`, pts:20, dir:'buy'},
+    {k:'rsi_overbought',l:`RSI<${r.rsi_fast_period||6} Overbought`,pts:20, dir:'sell'},
+    {k:'rsi_cross_buy', l:'RSI Fast Cross ↑', pts:15, dir:'buy'},
+    {k:'rsi_cross_sell',l:'RSI Fast Cross ↓', pts:15, dir:'sell'},
     {k:'swing_low',     l:'Near Swing Low',   pts:20, dir:'buy'},
     {k:'swing_high',    l:'Near Swing High',  pts:20, dir:'sell'},
     {k:'ema_bullish',   l:'EMA Uptrend',      pts:15, dir:'buy'},
     {k:'ema_bearish',   l:'EMA Downtrend',    pts:15, dir:'sell'},
     {k:'vol_surge',     l:'Volume Surge',     pts:10, dir:'both'},
     {k:'momentum',      l:'Momentum',         pts:10, dir:'both'},
+    {k:'rsi24_bullish',l:'RSI24 Bullish',pts:10,dir:'buy'},
+    {k:'rsi24_bearish',l:'RSI24 Bearish',pts:10,dir:'sell'},
   ].filter(x=>bd[x.k]>0||x.dir===r.signal.toLowerCase()||x.dir==='both');
 
   const bdHtml=bdItems.slice(0,6).map(x=>{
     const hit=bd[x.k]>0;
     return `<div class="bd-item">
       <span class="bd-lbl">${x.l}</span>
-      <span class="bd-pts ${hit?'bd-hit':'bd-miss'}">${hit?'+'+x.pts:'—'}</span>
+      <span class="bd-pts ${hit?'bd-hit':'bd-miss'}">${hit?'+'+bd[x.k]:'—'}</span>
     </div>`;
   }).join('');
 
@@ -244,7 +246,7 @@ function symbolCard(r){
     actionHint='<span class="open-badge">IN OPEN TRADE — monitoring</span>';
   } else if(meetsThresh){
     actionHint=`<span class="open-badge" style="background:var(--ad);color:var(--a);border-color:var(--aw)">
-      ✅ Bot will trade · SL ${r.sl_pct}% TP ${r.tp_pct}%</span>`;
+      ${escHtml(r.entry_path||"SIGNAL")} signal · execution subject to risk/data checks</span>`;
   } else {
     const gap=Math.round(r.min_conf-r.confidence);
     actionHint=`<span class="open-badge" style="color:var(--m)">+${gap}pts needed to trade</span>`;
@@ -268,13 +270,15 @@ function symbolCard(r){
 
   <div class="conf-section">
     <div class="conf-header">
-      <span class="conf-title">BOT-RL confidence score</span>
+      <span class="conf-title">BOT-RL confidence · ${escHtml(r.entry_path||"WATCH")}</span>
       <span class="conf-score" style="color:${confColor}">${r.confidence.toFixed(0)}<span style="font-size:13px;color:var(--m)">/${r.min_conf} min</span></span>
     </div>
     <div class="conf-track">
       <div class="conf-fill" style="width:${Math.min(r.confidence,100)}%;background:${confColor}"></div>
     </div>
-    <div class="conf-threshold">Threshold: ${r.min_conf}% · ${r.confidence>=r.min_conf?'✅ Qualifies for trade':'⏳ Below threshold'}</div>
+    <div class="conf-threshold">Threshold: ${r.min_conf}% · ${meetsThresh?'Signal ready (subject to execution checks)':'Waiting for entry gates'}</div>
+    <div style="font-size:12px;color:var(--m);margin:9px 0">Pullback BUY/SELL: ${r.pullback_buy_score??'—'}/${r.pullback_sell_score??'—'} · Continuation BUY/SELL: ${r.continuation_buy_score??0}/${r.continuation_sell_score??0} (min ${r.continuation_threshold??85})</div>
+    <div style="font-size:11px;color:var(--m)">Continuation gates: ${r.continuation_buy_ready?'BUY confirmed':r.continuation_sell_ready?'SELL confirmed':'pending'} · ER ${r.efficiency_ratio??'—'} · EMA extension ${r.extension_atr??'—'} ATR · BE ${r.profit_lock_r??1}R · trail ${r.trailing_activation_r??1.5}R</div>
     ${bdHtml?`<div class="breakdown-grid" style="margin-top:10px">${bdHtml}</div>`:''}
   </div>
 
@@ -357,6 +361,8 @@ function buildLevels(r){
 
 /* ── SVG Sparkline ── */
 function buildSparkline(r){
+  // Never fabricate historical prices: only plot real closes when provided.
+  if(!Array.isArray(r.recent_closes)||r.recent_closes.length<2) return '';
   // We don't have full OHLCV series in the API response, so we synthesise a
   // representative sparkline from the price + momentum + ATR we DO have.
   // This is clearly labelled "Price trend" and is indicative only.
@@ -368,10 +374,7 @@ function buildSparkline(r){
     const seed=Math.abs(Math.round(px*1000));
     // deterministic pseudo-random so it doesn't jump on re-render
     function rand(i){let x=(seed*1103515245+i*12345)&0x7fffffff;return(x/0x7fffffff)*2-1;}
-    const pts=[];
-    let cur=px*(1-mom*0.005);
-    for(let i=0;i<n;i++){pts.push(cur);cur+=rand(i)*atr*0.6+mom*px*0.0002;}
-    pts.push(px);
+    const pts=r.recent_closes.map(Number).filter(Number.isFinite);
 
     const mn=Math.min(...pts), mx=Math.max(...pts);
     const rng=mx-mn||1;
@@ -397,62 +400,13 @@ function renderStrategies(){
   const res=DATA.results||[];
   const buys=res.filter(r=>r.signal==='BUY').length;
   const sells=res.filter(r=>r.signal==='SELL').length;
-  const ready=res.filter(r=>r.confidence>=r.min_conf).length;
+  const ready=res.filter(r=>['BUY','SELL'].includes(r.signal)&&r.confidence>=r.min_conf).length;
   const minConf=DATA.min_conf||85;
   const mode=DATA.mode;
 
   const strats=[
-    {
-      name:'BOT-RL (RSI 6/12 + Swing + 4:1 R:R)',
-      sub:`${minConf}% threshold, 0.5% SL locked`,
-      wr:'55–65%',
-      rr:'4:1 locked',
-      reading: ready>0?`${ready} signal(s) meet the ${minConf}% threshold — bot will trade`:
-                buys+sells>0?`${buys+sells} signal(s) found but below ${minConf}% threshold — correctly waiting`:
-                'No actionable signals this scan — capital preserved',
-      fit:'best',
-      winner:true
-    },
-    {
-      name:'RSI(14) Mean Reversion',
-      sub:'Buy <30, sell >70, standard period',
-      wr:'50–58%',
-      rr:'~1.5:1',
-      reading:`Would trigger on ${res.filter(r=>r.rsi_fast!=null&&r.rsi_fast<30).length} symbol(s) with RSI<30. Weak R:R dilutes expected value`,
-      fit:'partial'
-    },
-    {
-      name:'EMA 21/50 Crossover',
-      sub:'Enter on bullish crossover',
-      wr:'45–55%',
-      rr:'~2:1',
-      reading:`${res.filter(r=>r.ema_trend==='Bullish').length}/${res.length} symbols in bullish EMA trend. Lags price — entries are later than RSI method`,
-      fit: res.filter(r=>r.ema_trend==='Bullish').length>0?'partial':'neutral'
-    },
-    {
-      name:'Trend Following (MA stack)',
-      sub:'Ride prevailing daily trend only',
-      wr:'55–65%',
-      rr:'~3:1',
-      reading:`${res.filter(r=>r.ema_trend==='Bearish').length}/${res.length} symbols in downtrend. Valid for shorting; requires futures/margin`,
-      fit:'partial'
-    },
-    {
-      name:'Volume + Breakout',
-      sub:'Enter on volume-confirmed range break',
-      wr:'48–58%',
-      rr:'~2.5:1',
-      reading:`${res.filter(r=>r.vol_surge).length} symbol(s) showing volume surge. Need range breakout confirmation alongside volume`,
-      fit: res.filter(r=>r.vol_surge).length>0?'partial':'neutral'
-    },
-    {
-      name:'Scalp / Grid Bot',
-      sub:'Small fast trades in tight range',
-      wr:'40–50%',
-      rr:'~0.8:1',
-      reading:`ATR% avg ${(res.reduce((s,r)=>s+(r.atr_pct||0),0)/Math.max(res.length,1)).toFixed(2)}%. Elevated volatility blows through tight grids — dangerous`,
-      fit:'poor'
-    },
+    {name:'BOT-RL pullback',sub:'RSI + swing + EMA confluence',wr:'Not calibrated',rr:'Signal-specific',reading:`${res.filter(r=>r.entry_path==='PULLBACK').length} pullback entries confirmed`,fit:'neutral'},
+    {name:'BOT-RL trend continuation',sub:'EMA direction + slope + RSI + momentum + efficiency + ATR extension',wr:'Not calibrated',rr:'Signal-specific',reading:`${res.filter(r=>r.entry_path==='TREND').length} continuation entries confirmed; ${res.filter(r=>r.continuation_buy_ready||r.continuation_sell_ready).length} meet continuation gates`,fit:'neutral'},
   ];
 
   $('strat-body').innerHTML=strats.map(s=>`
@@ -461,7 +415,7 @@ function renderStrategies(){
   <td><span class="badge ${s.wr.startsWith('55')||s.wr.startsWith('6')?'b-green':'b-yellow'}">${s.wr}</span></td>
   <td>${s.winner?`<span class="badge b-winner">${escHtml(s.rr)}</span>`:escHtml(s.rr)}</td>
   <td style="font-size:12px;color:var(--m)">${escHtml(s.reading)}</td>
-  <td>${fitBadge(s.fit,s.winner)}</td>
+  <td><span class="badge b-blue">${escHtml(s.fit)}</span></td>
 </tr>`).join('');
 }
 
