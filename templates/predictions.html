@@ -112,7 +112,7 @@ function renderConfig(){
     {l:'Min Conf.',   v:D.min_conf+'%',                  cls:'highlight'},
     {l:'Stop Loss',   v:D.sl_pct+'%',                    cls:''},
     {l:'Take Profit', v:D.tp_pct+'%',                    cls:''},
-    {l:'R:R Ratio',   v:D.rr_ratio+':1',                 cls:'highlight'},
+    {l:'R:R Ratio',   v:(D.rr_ratio ?? 4)+':1',                 cls:'highlight'},
     {l:'Mode',        v:D.mode,                           cls:''},
     {l:'Exchange',    v:D.exchange||'—',                  cls:''},
     {l:'Timeframe',   v:D.timeframe,                      cls:''},
