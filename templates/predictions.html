@@ -131,6 +131,14 @@ function renderSummary(){
   const totalEV = ps.reduce((s,p)=>s+(p.expected_value||0),0);
   const buys    = ps.filter(p=>p.direction==='BUY').length;
   const sells   = ps.filter(p=>p.direction==='SELL').length;
+  // Count confirmed continuation entries and near-ready continuation setups.
+  const trends = ps.filter(p => p.continuation_ready === true && p.meets_threshold === true).length;
+  const contWatch = ps.filter(p =>
+    p.continuation_enabled === true &&
+    p.continuation_ready !== true &&
+    Number(p.continuation_score || 0) >= Number(p.continuation_threshold ?? 85) - 15 &&
+    Number(p.continuation_score || 0) < Number(p.continuation_threshold ?? 85)
+  ).length;
   $('sum-row').innerHTML=[
     {l:'Scanned',      v:ps.length,                               s:'Total pairs',     c:''},
     {l:'Trade Now',    v:ready,                                   s:'Meet ≥'+D.min_conf+'%',c:'g'},
