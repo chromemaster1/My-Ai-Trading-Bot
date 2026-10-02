@@ -131,7 +131,12 @@ CONFIG = {
     "scan_interval_seconds"  : 60,
     "max_execution_slippage_pct": 0.003,  # 0.3% — refuse to execute if price moved more than this since signal detection
     "signal_exit_confirmations": 2,  # consecutive scans required before closing a trade on confidence/direction loss (SL/TP unaffected — always instant)
-    "hold_requires_entry_confidence": True,  # a trade must maintain its OWN opening confidence to stay valid, not just the generic minimum — early warning for weakening conviction
+    "hold_requires_entry_confidence": False, # entry probability is NOT a hold condition; open trades use trend structure
+    "trend_hold_min_score"      : 60,    # directional structure required to keep an un-locked trade alive
+    "probability_prior_strength": 20,    # Bayesian prior weight until completed comparable trades accumulate
+    "probability_bucket_width" : 5,     # completed trades within +/- this raw-score range calibrate probability
+    "probability_min_samples"  : 20,    # below this, probability is explicitly marked provisional
+    "reentry_reset_required"   : True,  # losing autonomous setup cannot recycle until its setup fingerprint changes
     # Ride-winners mechanism: lets a trade that's genuinely working keep
     # running toward its take-profit target instead of getting cut short
     # by the same strict confidence checks that (correctly) protect a
@@ -2022,6 +2027,55 @@ def _tf_to_seconds(tf: str) -> int:
 #  TECHNICAL ANALYSIS
 # ════════════════════════════════════════════════════════════
 
+def _estimated_win_probability(raw_score: float, side: str, setup_type: str) -> tuple[float, int, bool]:
+    """Estimate win probability from raw model quality + completed comparable trades.
+
+    The raw strategy score supplies the Bayesian prior. Closed autonomous trades
+    with the same direction/setup family and a nearby score update that prior.
+    This is a calibrated estimate, never a guarantee of an individual outcome.
+    """
+    raw = max(1.0, min(99.0, float(raw_score)))
+    prior_n = max(1.0, float(CONFIG.get("probability_prior_strength", 20)))
+    width = max(1.0, float(CONFIG.get("probability_bucket_width", 5)))
+    wins = 0.0
+    n = 0
+    try:
+        trades = list((_TM.closed_trades if _TM else []) or [])
+    except Exception:
+        trades = []
+    for t in trades:
+        if str(t.get("opened_by", "bot")) != "bot":
+            continue
+        if str(t.get("side", "")).upper() != str(side).upper():
+            continue
+        if str(t.get("setup_type", "PULLBACK")).upper() != str(setup_type).upper():
+            continue
+        t_raw = float(t.get("raw_score", t.get("confidence", 0)) or 0)
+        if abs(t_raw - raw) > width:
+            continue
+        pnl = t.get("pnl")
+        if pnl is None:
+            continue
+        n += 1
+        if float(pnl) > 0:
+            wins += 1.0
+    alpha = (raw / 100.0) * prior_n + wins
+    beta = (1.0 - raw / 100.0) * prior_n + (n - wins)
+    prob = 100.0 * alpha / max(alpha + beta, 1e-9)
+    min_samples = int(CONFIG.get("probability_min_samples", 20))
+    return round(max(1.0, min(99.0, prob)), 1), n, n >= min_samples
+
+
+def _setup_fingerprint(side: str, setup_type: str, swing_low: float, swing_high: float, ema_trend: int, price: float) -> str:
+    """Stable setup identity used to prevent immediate recycling of a failed setup."""
+    anchor = swing_low if str(side).upper() == "BUY" else swing_high
+    # 0.25% price buckets absorb harmless ticker noise while requiring a real
+    # structural change (new swing/EMA regime/setup family) before re-entry.
+    bucket_size = max(abs(float(price)) * 0.0025, 1e-9)
+    anchor_bucket = int(round(float(anchor) / bucket_size)) if anchor else 0
+    return f"{str(side).upper()}:{str(setup_type).upper()}:EMA{int(ema_trend)}:SW{anchor_bucket}"
+
+
 class TechnicalAnalysis:
     def __init__(self):
         self.fast = CONFIG["rsi_fast_period"]
@@ -2394,6 +2448,42 @@ class TechnicalAnalysis:
         if sell_path == "TREND":
             reasons_sell = continuation_sell_reasons + ["⚡ TREND CONTINUATION — unified entry score"]
 
+        # Open-position validity is intentionally different from entry validity.
+        # A successful trade naturally moves away from its pullback/swing trigger,
+        # so HOLD uses durable trend structure rather than demanding the entry setup
+        # remain present. Continuation evidence is ideal for this purpose.
+        trend_hold_buy = 0.0
+        trend_hold_sell = 0.0
+        if et == 1:
+            trend_hold_buy += 30
+        else:
+            trend_hold_sell += 30
+        if px >= ema21:
+            trend_hold_buy += 15
+        else:
+            trend_hold_sell += 15
+        if rc >= 52:
+            trend_hold_buy += 15
+        elif rc <= 48:
+            trend_hold_sell += 15
+        if mom > 0:
+            trend_hold_buy += 15
+        elif mom < 0:
+            trend_hold_sell += 15
+        if efficiency_ratio >= float(CONFIG.get("chop_min_efficiency_ratio", 0.30)):
+            if et == 1:
+                trend_hold_buy += 10
+            else:
+                trend_hold_sell += 10
+        ema21_slope_now = ema21 - float(prev["ema_21"])
+        ema50_slope_now = ema50 - float(prev["ema_50"])
+        if ema21_slope_now > 0 and ema50_slope_now >= 0:
+            trend_hold_buy += 15
+        elif ema21_slope_now < 0 and ema50_slope_now <= 0:
+            trend_hold_sell += 15
+        trend_hold_buy = min(100.0, trend_hold_buy)
+        trend_hold_sell = min(100.0, trend_hold_sell)
+
         # One canonical diagnostic payload shared with both dashboard APIs.
         diagnostics = {
             "pullback_buy_score": round(pullback_buy, 1),
@@ -2414,6 +2504,9 @@ class TechnicalAnalysis:
             "efficiency_ratio": round(efficiency_ratio, 3),
             "extension_atr": round(extension_atr, 3) if CONFIG.get("trend_continuation_enabled", True) else None,
             "trend_strength": round(trend_strength, 3),
+            "trend_hold_buy_score": round(trend_hold_buy, 1),
+            "trend_hold_sell_score": round(trend_hold_sell, 1),
+            "trend_hold_min_score": float(CONFIG.get("trend_hold_min_score", 60)),
         }
 
         sl_floor = CONFIG["stop_loss_pct"]
@@ -2432,7 +2525,14 @@ class TechnicalAnalysis:
             return "FAST", max(fast_min_rr, min(fast_target_rr, 2.0))
 
         if buy > sell and buy >= min_conf:
-            conf  = min(float(buy), 99.0)
+            raw_score = min(float(buy), 99.0)
+            setup_type = "CONTINUATION" if buy_path == "TREND" else "PULLBACK"
+            conf, probability_samples, probability_calibrated = _estimated_win_probability(raw_score, "BUY", setup_type)
+            if conf < min_conf:
+                return {"side":"HOLD","confidence":conf,"raw_score":raw_score,
+                        "reasons":reasons_buy + [f"Estimated win probability {conf:.1f}% below {min_conf}% entry threshold"],
+                        "price":px,"is_chop":is_chop, "setup_type":setup_type,
+                        "probability_samples":probability_samples,"probability_calibrated":probability_calibrated, **diagnostics}
             strong_confirmation = (
                 rc > 60 and et == 1 and vs and abs(px - sl) / px < 0.012
                 and buy >= min_conf + 10 and (buy - sell) >= 15
@@ -2440,7 +2540,7 @@ class TechnicalAnalysis:
             trade_mode, rr_target = _mode_for_side(buy, sell, et == 1, et == -1, strong_confirmation)
             if buy_path == "TREND":
                 trade_mode = "TREND"
-                rr_target = max(fast_min_rr, fast_target_rr)
+                rr_target = max(confirmed_rr, fast_target_rr)
                 reasons_buy.append("Trend mode: lock breakeven at 1R, then trail/ride while trend remains valid")
             # WIDER of the two candidates, not tighter: a stop placed at
             # whichever distance gives the trade more room survives normal
@@ -2467,13 +2567,23 @@ class TechnicalAnalysis:
                       f"take_profit_pct in Risk settings", "ERROR")
                 return {"side":"HOLD","confidence":0,
                         "reasons":["Rejected: invalid SL/TP configuration"],"price":px,"is_chop":is_chop}
-            return {"side":"BUY","confidence":conf,"reasons":reasons_buy,
+            fingerprint = _setup_fingerprint("BUY", setup_type, sl, sh, et, px)
+            return {"side":"BUY","confidence":conf,"raw_score":raw_score,"reasons":reasons_buy,
                     "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
-                    "trade_mode":trade_mode,"rr_target":rr_target,
+                    "trade_mode":trade_mode,"rr_target":rr_target,"setup_type":setup_type,
+                    "setup_fingerprint":fingerprint,"estimated_win_probability":conf,
+                    "probability_samples":probability_samples,"probability_calibrated":probability_calibrated,
                     "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh, **diagnostics}
 
         if sell > buy and sell >= min_conf:
-            conf  = min(float(sell), 99.0)
+            raw_score = min(float(sell), 99.0)
+            setup_type = "CONTINUATION" if sell_path == "TREND" else "PULLBACK"
+            conf, probability_samples, probability_calibrated = _estimated_win_probability(raw_score, "SELL", setup_type)
+            if conf < min_conf:
+                return {"side":"HOLD","confidence":conf,"raw_score":raw_score,
+                        "reasons":reasons_sell + [f"Estimated win probability {conf:.1f}% below {min_conf}% entry threshold"],
+                        "price":px,"is_chop":is_chop, "setup_type":setup_type,
+                        "probability_samples":probability_samples,"probability_calibrated":probability_calibrated, **diagnostics}
             strong_confirmation = (
                 rc < 40 and et == -1 and vs and abs(px - sh) / px < 0.012
                 and sell >= min_conf + 10 and (sell - buy) >= 15
@@ -2481,7 +2591,7 @@ class TechnicalAnalysis:
             trade_mode, rr_target = _mode_for_side(sell, buy, et == 1, et == -1, strong_confirmation)
             if sell_path == "TREND":
                 trade_mode = "TREND"
-                rr_target = max(fast_min_rr, fast_target_rr)
+                rr_target = max(confirmed_rr, fast_target_rr)
                 reasons_sell.append("Trend mode: lock breakeven at 1R, then trail/ride while trend remains valid")
             # Same fix as BUY, mirrored: WIDER of the two candidates.
             sl_p  = max(round(px*(1+sl_floor), 6), round(px+atr*1.2, 6))
@@ -2498,9 +2608,12 @@ class TechnicalAnalysis:
                       f"take_profit_pct in Risk settings", "ERROR")
                 return {"side":"HOLD","confidence":0,
                         "reasons":["Rejected: invalid SL/TP configuration"],"price":px,"is_chop":is_chop}
-            return {"side":"SELL","confidence":conf,"reasons":reasons_sell,
+            fingerprint = _setup_fingerprint("SELL", setup_type, sl, sh, et, px)
+            return {"side":"SELL","confidence":conf,"raw_score":raw_score,"reasons":reasons_sell,
                     "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
-                    "trade_mode":trade_mode,"rr_target":rr_target,
+                    "trade_mode":trade_mode,"rr_target":rr_target,"setup_type":setup_type,
+                    "setup_fingerprint":fingerprint,"estimated_win_probability":conf,
+                    "probability_samples":probability_samples,"probability_calibrated":probability_calibrated,
                     "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh, **diagnostics}
 
         return {"side":"HOLD","confidence":max(buy,sell),
@@ -2593,6 +2706,7 @@ class TradeManager:
         self.balance        = CONFIG["account_balance"]
         self.initial_balance= CONFIG["account_balance"]
         self._lock          = threading.Lock()
+        self._failed_setups : dict[tuple[str, str, str], str] = {}
 
     @property
     def equity(self):
@@ -2601,6 +2715,32 @@ class TradeManager:
 
     def can_open(self):
         return len(self.open_trades) < CONFIG["max_open_trades"]
+
+    def _reentry_key(self, symbol: str, side: str, market: Optional[str] = None):
+        return ((market or CONFIG.get("market_mode") or "CRYPTO").strip().upper(), symbol, side.upper())
+
+    def _same_failed_setup_blocked(self, symbol: str, sig: dict, market: Optional[str] = None) -> bool:
+        if not CONFIG.get("reentry_reset_required", True):
+            return False
+        fp = str(sig.get("setup_fingerprint") or "")
+        if not fp:
+            return False
+        key = self._reentry_key(symbol, sig.get("side", ""), market)
+        failed_fp = self._failed_setups.get(key)
+        if failed_fp and failed_fp == fp:
+            return True
+        if failed_fp and failed_fp != fp:
+            self._failed_setups.pop(key, None)
+            _elog(f"🔓 {symbol} {sig.get('side')}: setup materially reset — re-entry unlocked", "INFO")
+        return False
+
+    def _remember_failed_setup(self, trade: dict) -> None:
+        if trade.get("opened_by", "bot") != "bot" or float(trade.get("pnl") or 0) >= 0:
+            return
+        fp = str(trade.get("setup_fingerprint") or "")
+        if fp:
+            key = self._reentry_key(trade.get("symbol", ""), trade.get("side", ""), trade.get("market"))
+            self._failed_setups[key] = fp
 
     def open_trade(self, symbol: str, sig: dict, ai: dict, market: Optional[str] = None,
                    allow_duplicate: bool = False, override_size: Optional[float] = None,
@@ -2614,6 +2754,9 @@ class TradeManager:
             # human decision, so they're allowed to opt out of it.
             if not allow_duplicate and any(t["symbol"]==symbol for t in self.open_trades):
                 _elog(f"Already in {symbol} — skip", "WARN"); return None
+            if opened_by == "bot" and self._same_failed_setup_blocked(symbol, sig, market):
+                _elog(f"🔒 {symbol} {sig.get('side')}: same failed {sig.get('setup_type','setup')} fingerprint — waiting for a genuinely new setup", "WARN")
+                return None
 
             px      = sig["price"]
             sl_dist = abs(px - sig["sl"])
@@ -2624,7 +2767,10 @@ class TradeManager:
                 risk    = self.balance * CONFIG["max_risk_per_trade"]
                 sz      = min(risk / sl_dist, self.balance * 0.5 / px)
             cost    = sz * px
-            conf    = min(sig["confidence"] + ai.get("confidence_adjustment",0), 99)
+            # Confidence is the strategy's estimated win probability. AI may
+            # confirm/reject the setup but must never numerically manufacture
+            # a higher probability.
+            conf    = min(float(sig["confidence"]), 99.0)
 
             m = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
             trade = {
@@ -2643,6 +2789,12 @@ class TradeManager:
                 "size"         : sz,
                 "cost"         : cost,
                 "confidence"   : conf,
+                "estimated_win_probability": conf,
+                "raw_score"    : float(sig.get("raw_score", conf)),
+                "probability_samples": int(sig.get("probability_samples", 0) or 0),
+                "probability_calibrated": bool(sig.get("probability_calibrated", False)),
+                "setup_type"   : sig.get("setup_type", "PULLBACK"),
+                "setup_fingerprint": sig.get("setup_fingerprint", ""),
                 "ai_action"    : ai.get("action"),
                 "ai_analysis"  : ai.get("analysis",""),
                 "risk_level"   : ai.get("risk_level","MEDIUM"),
@@ -2746,6 +2898,7 @@ class TradeManager:
                             _elog(f"Live close skipped for {t['symbol']}: account disconnected", "WARN")
                     self.balance += pnl
                     self.open_trades.remove(t)
+                    self._remember_failed_setup(t)
                     self.closed_trades.append(t)
                     if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
                         del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
@@ -2788,6 +2941,7 @@ class TradeManager:
                             t["execution_error"] = "Live account disconnected"
                     self.balance += pnl
                     self.open_trades.remove(t)
+                    self._remember_failed_setup(t)
                     self.closed_trades.append(t)
                     if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
                         del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
@@ -2963,6 +3117,7 @@ class TradeManager:
                                 _elog(f"Live close exception {t['symbol']}: {exc}", "ERROR")
                     self.balance += pnl
                     self.open_trades.remove(t)
+                    self._remember_failed_setup(t)
                     self.closed_trades.append(t)
                     if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
                         del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
@@ -3245,41 +3400,25 @@ class TradingBot:
                     prices[sym] = px_live
 
                     min_conf   = CONFIG["min_confidence_to_trade"]
-                    # Use the trade's OWN opening confidence as the bar to
-                    # remain valid, not just the generic minimum threshold.
-                    # A trade that opened at 90% but has since drifted down
-                    # to 76% is still technically "tradeable" by the 75%
-                    # minimum, but its conviction is measurably weakening —
-                    # that's an early warning the setup is softening before
-                    # it fully reverses. Requiring it to hold its OWN entry
-                    # bar (not just the floor) starts the exit-confirmation
-                    # clock on that warning sign instead of waiting for a
-                    # full signal flip or a drop below the generic minimum.
                     entry_conf = trade.get("confidence", min_conf) if trade is not None else min_conf
-                    required_conf = (max(min_conf, entry_conf)
-                                      if CONFIG["hold_requires_entry_confidence"] else min_conf)
                     is_reversal = (trade is not None and sig_open["side"] != trade["side"]
                                     and sig_open["side"] != "HOLD")
+                    hold_score = (sig_open.get("trend_hold_buy_score", 0) if trade and trade["side"] == "BUY"
+                                  else sig_open.get("trend_hold_sell_score", 0))
+                    opposite_hold = (sig_open.get("trend_hold_sell_score", 0) if trade and trade["side"] == "BUY"
+                                     else sig_open.get("trend_hold_buy_score", 0))
+                    hold_min = float(CONFIG.get("trend_hold_min_score", 60))
+                    structure_valid = bool(trade is not None and hold_score >= hold_min and hold_score > opposite_hold)
 
                     if (trade is not None and trade.get("profit_locked")
                             and CONFIG["relax_exit_after_profit_lock"]):
-                        # Ride-winners mechanism, part 3: once a trade has
-                        # earned breakeven-or-better (see check_exits), stop
-                        # letting routine confidence/indicator wobble decide
-                        # its fate. From here only a genuine opposite-
-                        # direction signal counts as "no longer valid" — a
-                        # HOLD reading or a confidence dip means the setup is
-                        # uncertain, not that it's actually reversed, and the
-                        # trade is now structurally incapable of becoming a
-                        # loss anyway. This is the actual fix for winners
-                        # getting cut before reaching TP: they were being
-                        # judged by the same strict bar as a fresh, unproven
-                        # trade even after price had already validated them.
-                        still_valid = not is_reversal
+                        # At +1R the stop is already at breakeven. Ride the move
+                        # unless a genuine opposite signal/structure reversal occurs.
+                        still_valid = structure_valid and not is_reversal
                     else:
-                        still_valid = (trade is not None
-                                       and sig_open["side"] == trade["side"]
-                                       and sig_open.get("confidence", 0) >= required_conf)
+                        # Entry probability is deliberately NOT a hold threshold.
+                        # 95% -> 85% remains valid while directional structure holds.
+                        still_valid = structure_valid and not is_reversal
 
                     if trade is not None:
                         # Fast invalidation while this symbol is CURRENTLY
@@ -3301,20 +3440,13 @@ class TradingBot:
                         else:
                             trade["signal_loss_strikes"] = trade.get("signal_loss_strikes", 0) + 1
                             strikes = trade["signal_loss_strikes"]
-                            below_entry = (sig_open["side"] == trade["side"]
-                                           and sig_open.get("confidence", 0) < entry_conf
-                                           and sig_open.get("confidence", 0) >= min_conf)
                             if is_reversal:
                                 reason = f"signal flipped to {sig_open['side']}"
                                 if trade.get("profit_locked"):
-                                    reason += " (profit-locked trade — only a genuine reversal triggers this)"
-                            elif below_entry:
-                                reason = (f"confidence dropped to {sig_open.get('confidence',0):.0f}% — "
-                                          f"below the {entry_conf:.0f}% it opened at (still above the "
-                                          f"{min_conf}% floor, but conviction is weakening)")
+                                    reason += " (profit-locked trade — genuine reversal)"
                             else:
-                                reason = (f"confidence dropped to {sig_open.get('confidence',0):.0f}% "
-                                          f"(< {min_conf}% required)")
+                                reason = (f"trend structure invalidated: hold score {hold_score:.0f}/100 "
+                                          f"(< {hold_min:.0f} or weaker than opposite structure {opposite_hold:.0f})")
                             if in_chop_now:
                                 reason += f" [chop — fast {needed}-scan invalidation active]"
                             if strikes < needed:
@@ -3341,8 +3473,8 @@ class TradingBot:
                             continue
 
                     print(f"  {Fore.BLUE}{sym}{Style.RESET_ALL}  "
-                          f"— already in open trade, still valid ({sig_open['side']} "
-                          f"{sig_open.get('confidence',0):.0f}%), monitoring only (price=${px_live:.4f})")
+                          f"— already in open trade, structure valid (hold={hold_score:.0f}/100, "
+                          f"entry probability={entry_conf:.0f}%), monitoring only (price=${px_live:.4f})")
                     continue
 
                 df = self.data.get_ohlcv(sym, self.tf, limit=120)
@@ -3416,7 +3548,9 @@ class TradingBot:
                     ai_available = ai_res.get("ai_available", True) is not False
                     technical_only = not ai_available
                     if technical_only or ai_res.get("action") == "CONFIRM":
-                        adj = sig["confidence"] + (ai_res.get("confidence_adjustment",0) if ai_available else 0)
+                        # AI is a veto/confirmation layer, not a probability calculator.
+                        # The displayed/used probability comes only from the calibrated strategy.
+                        adj = float(sig["confidence"])
                         min_conf = CONFIG["min_confidence_to_trade"]
                         if adj >= min_conf:
                             # Re-anchor entry/SL/TP to the live ticker price
@@ -3477,7 +3611,8 @@ class TradingBot:
                             if opened:
                                 open_symbols.add(sym)  # never scan it again this cycle
                                 _elog(f"✅ Trade OPENED {sym} {sig['side']} | "
-                                      f"Final Conf={adj:.0f}% (signal {sig['confidence']:.0f}% + AI {ai_res.get('confidence_adjustment', 0):+.0f}%)", "INFO")
+                                      f"Estimated win probability={adj:.1f}% | raw setup score={sig.get('raw_score', sig['confidence']):.1f} | "
+                                      f"setup={sig.get('setup_type','PULLBACK')} | samples={sig.get('probability_samples',0)}", "INFO")
                         else:
                             msg = (f"Conf too low after AI ({adj:.1f}% < "
                                    f"{min_conf}% required) — skip {sym}")
