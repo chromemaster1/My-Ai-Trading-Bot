@@ -133,10 +133,15 @@ CONFIG = {
     "signal_exit_confirmations": 2,  # consecutive scans required before closing a trade on confidence/direction loss (SL/TP unaffected — always instant)
     "hold_requires_entry_confidence": False, # entry probability is NOT a hold condition; open trades use trend structure
     "trend_hold_min_score"      : 60,    # directional structure required to keep an un-locked trade alive
-    "probability_prior_strength": 20,    # Bayesian prior weight until completed comparable trades accumulate
+    "probability_prior_strength": 4,     # neutral Beta(2,2) prior; raw indicator score NEVER becomes a fake probability prior
     "probability_bucket_width" : 5,     # completed trades within +/- this raw-score range calibrate probability
-    "probability_min_samples"  : 20,    # below this, probability is explicitly marked provisional
+    "probability_min_samples"  : 20,    # probability is statistically calibrated only after this many comparable completed trades
+    "provisional_probability_cap": 84,  # uncalibrated setups can never masquerade as an 85-99% win-probability trade
     "reentry_reset_required"   : True,  # losing autonomous setup cannot recycle until its setup fingerprint changes
+    "early_adverse_exit_enabled": True, # fast monitor cuts entries that fail immediately instead of donating the entire 1R stop
+    "early_adverse_exit_r"     : 0.55,  # cut near -0.55R if the trade has never shown meaningful favorable progress
+    "early_adverse_min_favorable_r": 0.20, # once trade has first achieved +0.20R, ordinary SL/structure management resumes
+    "early_adverse_grace_seconds": 15, # allow execution noise/spread to settle before adverse-entry invalidation
     # Ride-winners mechanism: lets a trade that's genuinely working keep
     # running toward its take-profit target instead of getting cut short
     # by the same strict confidence checks that (correctly) protect a
@@ -2035,7 +2040,15 @@ def _estimated_win_probability(raw_score: float, side: str, setup_type: str) -> 
     This is a calibrated estimate, never a guarantee of an individual outcome.
     """
     raw = max(1.0, min(99.0, float(raw_score)))
-    prior_n = max(1.0, float(CONFIG.get("probability_prior_strength", 20)))
+    # IMPORTANT: raw confluence is an eligibility/quality score, NOT a win
+    # probability.  The previous implementation used raw/100 as the Bayesian
+    # prior mean, which allowed a brand-new 99-point setup to be displayed as
+    # ~99% probability before any evidence existed.  Use a neutral Beta prior
+    # instead; only completed comparable trades are allowed to create an
+    # 85-99% calibrated probability.
+    prior_n = max(2.0, float(CONFIG.get("probability_prior_strength", 4)))
+    prior_alpha = prior_n / 2.0
+    prior_beta = prior_n / 2.0
     width = max(1.0, float(CONFIG.get("probability_bucket_width", 5)))
     wins = 0.0
     n = 0
@@ -2059,11 +2072,19 @@ def _estimated_win_probability(raw_score: float, side: str, setup_type: str) -> 
         n += 1
         if float(pnl) > 0:
             wins += 1.0
-    alpha = (raw / 100.0) * prior_n + wins
-    beta = (1.0 - raw / 100.0) * prior_n + (n - wins)
-    prob = 100.0 * alpha / max(alpha + beta, 1e-9)
     min_samples = int(CONFIG.get("probability_min_samples", 20))
-    return round(max(1.0, min(99.0, prob)), 1), n, n >= min_samples
+    calibrated = n >= min_samples
+    if not calibrated:
+        # There is not enough evidence to call this an 85-99% probability.
+        # Return a deliberately sub-entry provisional value. Raw score remains
+        # available separately for diagnostics and bootstrap/backtest analysis.
+        cap = float(CONFIG.get("provisional_probability_cap", 84))
+        provisional = min(cap, 50.0 + max(0.0, raw - 50.0) * 0.50)
+        return round(max(1.0, provisional), 1), n, False
+    alpha = prior_alpha + wins
+    beta = prior_beta + (n - wins)
+    prob = 100.0 * alpha / max(alpha + beta, 1e-9)
+    return round(max(1.0, min(99.0, prob)), 1), n, True
 
 
 def _setup_fingerprint(side: str, setup_type: str, swing_low: float, swing_high: float, ema_trend: int, price: float) -> str:
@@ -2830,6 +2851,8 @@ class TradeManager:
                 "initial_sl"   : sig["sl"],
                 "initial_risk" : abs(px - sig["sl"]),
                 "best_price"   : px,
+                "best_r_multiple": 0.0,
+                "opened_monotonic": time.monotonic(),
                 "trade_mode"   : sig.get("trade_mode", "RIDE"),
                 "rr_target"    : float(sig.get("rr_target", CONFIG.get("confirmed_trade_min_rr", 4.0))),
                 "profit_locked": False,
@@ -3032,6 +3055,24 @@ class TradeManager:
                     r_multiple = (t["entry"] - px) / initial_risk
                     t["best_price"] = min(t.get("best_price", t["entry"]), px)
 
+                t["best_r_multiple"] = max(float(t.get("best_r_multiple", 0.0) or 0.0), float(r_multiple))
+
+                # ── Fast failed-entry invalidation ───────────────────────
+                # The full strategy scan may only run every ~60s, while price
+                # monitoring runs much faster. If a fresh entry immediately
+                # travels > half of its initial risk against us without first
+                # proving itself with meaningful favorable excursion, the entry
+                # thesis failed in real time. Cut it before the full 1R SL.
+                adverse_exit = False
+                if (CONFIG.get("early_adverse_exit_enabled", True)
+                        and not t.get("profit_locked")):
+                    age = max(0.0, time.monotonic() - float(t.get("opened_monotonic", time.monotonic())))
+                    adverse_r = abs(float(CONFIG.get("early_adverse_exit_r", 0.55)))
+                    favorable_needed = float(CONFIG.get("early_adverse_min_favorable_r", 0.20))
+                    adverse_exit = (age >= float(CONFIG.get("early_adverse_grace_seconds", 15))
+                                    and r_multiple <= -adverse_r
+                                    and float(t.get("best_r_multiple", 0.0) or 0.0) < favorable_needed)
+
                 # ── Ride-winners mechanism, part 1: breakeven lock ──
                 # Once a trade has moved in its favor by profit_lock_r_multiple
                 # (default 1R — i.e. it's now up by as much as it originally
@@ -3086,9 +3127,9 @@ class TradeManager:
                     hit_sl = px <= t["sl"]; hit_tp = px >= t["tp"] or fast_target_hit
                 else:
                     hit_sl = px >= t["sl"]; hit_tp = px <= t["tp"] or fast_target_hit
-                if hit_tp or hit_sl:
+                if hit_tp or hit_sl or adverse_exit:
                     pnl = t["unrealised_pnl"]
-                    lbl = "TP" if hit_tp else "SL"
+                    lbl = "EARLY_EXIT" if adverse_exit and not hit_sl and not hit_tp else ("TP" if hit_tp else "SL")
                     if fast_target_hit and not hit_sl:
                         lbl = "TP"
                     # CRITICAL: define msg BEFORE using it below
@@ -3096,7 +3137,8 @@ class TradeManager:
                     t.update({"pnl":pnl,"status":lbl,
                                "close_time":datetime.utcnow().isoformat(),
                                "close_price":px,"unrealised_pnl":0.0,
-                               "close_reason": "FAST_TARGET" if fast_target_hit and not hit_sl else ("TP" if hit_tp else "SL")})
+                               "close_reason": ("EARLY_ADVERSE_INVALIDATION" if lbl == "EARLY_EXIT" else
+                                                ("FAST_TARGET" if fast_target_hit and not hit_sl else ("TP" if hit_tp else "SL")))})
                     # Place live counter-order on exchange when running live
                     if not CONFIG.get("paper_trading", True) and CONFIG.get("live_trading_enabled"):
                         m = (t.get("market") or CONFIG.get("market_mode") or "CRYPTO").upper()
