@@ -120,6 +120,12 @@ CONFIG = {
     "trend_continuation_max_extension_atr": 1.50,
     "trend_continuation_min_rsi_fast": 50.0,
     "trend_continuation_max_rsi_fast": 75.0,
+    "late_momentum_enabled": True,
+    "late_momentum_min_confidence": 75,
+    "late_momentum_min_efficiency_ratio": 0.50,
+    "late_momentum_max_extension_atr": 2.50,
+    "late_momentum_min_rsi_fast": 15.0,
+    "late_momentum_max_rsi_fast": 45.0,
     "max_risk_per_trade"     : 0.01,
     "max_open_trades"        : 3,
     "max_closed_trades_memory": 500,
@@ -128,7 +134,7 @@ CONFIG = {
     "anthropic_api_key"      : os.environ.get("ANTHROPIC_API_KEY", ""),
     "ai_model"               : "claude-sonnet-4-6",
     "ai_confirmation_required": True,
-    "scan_interval_seconds"  : 60,
+    "scan_interval_seconds"  : 30,
     "max_execution_slippage_pct": 0.003,  # 0.3% — refuse to execute if price moved more than this since signal detection
     "signal_exit_confirmations": 2,  # consecutive scans required before closing a trade on confidence/direction loss (SL/TP unaffected — always instant)
     "hold_requires_entry_confidence": False, # entry probability is NOT a hold condition; open trades use trend structure
@@ -1977,21 +1983,19 @@ class MarketDataProvider:
         return imap.get(tf, "15m")
 
     def _validate_freshness(self, df: pd.DataFrame, symbol: str, tf: str):
-        """Guards against stale/cached data being mistaken for live data."""
+        """Reject OHLCV older than one candle interval plus a short grace period."""
         if df.empty:
             raise DataSourceError(f"{symbol}: empty dataframe")
-        last_ts = df.index[-1]
-        if last_ts.tzinfo is not None:
-            last_ts = last_ts.tz_localize(None)
-        age = datetime.utcnow() - last_ts
-        max_age = {"1m":timedelta(minutes=10),"5m":timedelta(minutes=30),
-                   "15m":timedelta(hours=2),"30m":timedelta(hours=4),
-                   "1h":timedelta(hours=8),"4h":timedelta(hours=24),
-                   "1d":timedelta(days=4)}.get(tf, timedelta(hours=6))
+        last_ts = pd.Timestamp(df.index[-1])
+        last_ts = (last_ts.tz_localize("UTC") if last_ts.tzinfo is None
+                   else last_ts.tz_convert("UTC"))
+        age = pd.Timestamp.now(tz="UTC") - last_ts
+        max_age = timedelta(seconds=_tf_to_seconds(tf) + 120)
         if self.mode in ("CRYPTO", "FUTURES") and age > max_age:
             raise DataSourceError(
-                f"{symbol}: latest candle is {age} old — exceeds freshness "
-                f"threshold of {max_age}. Data feed may be stale.")
+                f"{symbol}: latest {tf} candle timestamp {last_ts.isoformat()} is "
+                f"{age.total_seconds():.0f}s old — exceeds freshness limit "
+                f"{max_age.total_seconds():.0f}s. Data feed may be stale.")
 
     def get_price(self, symbol: str) -> Optional[float]:
         """Fetch a genuine live ticker. Rate-limited exchange returns None; host outage is fatal."""
@@ -2530,6 +2534,56 @@ class TechnicalAnalysis:
             "trend_hold_min_score": float(CONFIG.get("trend_hold_min_score", 60)),
         }
 
+        late_min_conf = float(CONFIG.get("late_momentum_min_confidence", 75))
+        late_min_er = float(CONFIG.get("late_momentum_min_efficiency_ratio", 0.50))
+        late_max_ext = float(CONFIG.get("late_momentum_max_extension_atr", 2.50))
+        late_min_rsi = float(CONFIG.get("late_momentum_min_rsi_fast", 15.0))
+        late_max_rsi = float(CONFIG.get("late_momentum_max_rsi_fast", 45.0))
+        late_buy_ready = bool(
+            CONFIG.get("late_momentum_enabled", True)
+            and CONFIG.get("trend_continuation_enabled", True)
+            and continuation_buy >= late_min_conf
+            and continuation_buy > continuation_sell
+            and et == 1 and px > ema21 and ema21 > float(prev["ema_21"])
+            and efficiency_ratio >= late_min_er
+            and (100.0 - late_max_rsi) <= rf <= (100.0 - late_min_rsi)
+            and mom > min_mom and extension_atr <= late_max_ext
+        )
+        late_sell_ready = bool(
+            CONFIG.get("late_momentum_enabled", True)
+            and CONFIG.get("trend_continuation_enabled", True)
+            and not continuation_sell_ready
+            and continuation_sell >= late_min_conf
+            and continuation_sell > continuation_buy
+            and et == -1 and px < ema21 and ema21 < float(prev["ema_21"])
+            and efficiency_ratio >= late_min_er
+            and late_min_rsi <= rf <= late_max_rsi
+            and mom < -min_mom and extension_atr <= late_max_ext
+        )
+
+        if late_buy_ready and not continuation_buy_ready:
+            buy_path = "LATE_MOMENTUM"
+            reasons_buy = continuation_buy_reasons + [
+                "LATE MOMENTUM: bounded extension entry; protective stop and trailing remain active"]
+        if late_sell_ready:
+            sell_path = "LATE_MOMENTUM"
+            reasons_sell = continuation_sell_reasons + [
+                "LATE MOMENTUM: bounded extension entry; protective stop and trailing remain active"]
+
+        buy_entry_threshold = late_min_conf if buy_path == "LATE_MOMENTUM" else min_conf
+        sell_entry_threshold = late_min_conf if sell_path == "LATE_MOMENTUM" else min_conf
+        diagnostics.update({
+            "late_momentum_enabled": bool(CONFIG.get("late_momentum_enabled", True)),
+            "late_momentum_min_confidence": late_min_conf,
+            "late_momentum_buy_ready": late_buy_ready,
+            "late_momentum_sell_ready": late_sell_ready,
+            "entry_threshold": buy_entry_threshold if buy_path == "LATE_MOMENTUM" else
+                               sell_entry_threshold if sell_path == "LATE_MOMENTUM" else min_conf,
+            "entry_path": buy_path if buy_path == "LATE_MOMENTUM" else
+                          sell_path if sell_path == "LATE_MOMENTUM" else
+                          ("TREND" if buy_path == "TREND" or sell_path == "TREND" else "PULLBACK"),
+        })
+
         sl_floor = CONFIG["stop_loss_pct"]
         tp_floor = CONFIG["take_profit_pct"]
         confirmed_rr = float(CONFIG.get("confirmed_trade_min_rr", 4.0))
@@ -2545,21 +2599,17 @@ class TechnicalAnalysis:
                 return "RIDE", confirmed_rr
             return "FAST", max(fast_min_rr, min(fast_target_rr, 2.0))
 
-        if buy > sell and buy >= min_conf:
+        if buy > sell and buy >= buy_entry_threshold:
             raw_score = min(float(buy), 99.0)
-            setup_type = "CONTINUATION" if buy_path == "TREND" else "PULLBACK"
-            conf, probability_samples, probability_calibrated = _estimated_win_probability(raw_score, "BUY", setup_type)
-            if conf < min_conf:
-                return {"side":"HOLD","confidence":conf,"raw_score":raw_score,
-                        "reasons":reasons_buy + [f"Estimated win probability {conf:.1f}% below {min_conf}% entry threshold"],
-                        "price":px,"is_chop":is_chop, "setup_type":setup_type,
-                        "probability_samples":probability_samples,"probability_calibrated":probability_calibrated, **diagnostics}
+            setup_type = ("LATE_MOMENTUM" if buy_path == "LATE_MOMENTUM" else
+                          "CONTINUATION" if buy_path == "TREND" else "PULLBACK")
+            estimated_probability, probability_samples, probability_calibrated = _estimated_win_probability(raw_score, "BUY", setup_type)
             strong_confirmation = (
                 rc > 60 and et == 1 and vs and abs(px - sl) / px < 0.012
                 and buy >= min_conf + 10 and (buy - sell) >= 15
             )
             trade_mode, rr_target = _mode_for_side(buy, sell, et == 1, et == -1, strong_confirmation)
-            if buy_path == "TREND":
+            if buy_path in ("TREND", "LATE_MOMENTUM"):
                 trade_mode = "TREND"
                 rr_target = max(confirmed_rr, fast_target_rr)
                 reasons_buy.append("Trend mode: lock breakeven at 1R, then trail/ride while trend remains valid")
@@ -2589,28 +2639,25 @@ class TechnicalAnalysis:
                 return {"side":"HOLD","confidence":0,
                         "reasons":["Rejected: invalid SL/TP configuration"],"price":px,"is_chop":is_chop}
             fingerprint = _setup_fingerprint("BUY", setup_type, sl, sh, et, px)
-            return {"side":"BUY","confidence":conf,"raw_score":raw_score,"reasons":reasons_buy,
+            return {"side":"BUY","confidence":raw_score,"raw_score":raw_score,"reasons":reasons_buy,
                     "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
                     "trade_mode":trade_mode,"rr_target":rr_target,"setup_type":setup_type,
-                    "setup_fingerprint":fingerprint,"estimated_win_probability":conf,
+                    "setup_fingerprint":fingerprint,"estimated_win_probability":estimated_probability,
+                    "entry_threshold":buy_entry_threshold,"entry_path":buy_path,
                     "probability_samples":probability_samples,"probability_calibrated":probability_calibrated,
                     "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh, **diagnostics}
 
-        if sell > buy and sell >= min_conf:
+        if sell > buy and sell >= sell_entry_threshold:
             raw_score = min(float(sell), 99.0)
-            setup_type = "CONTINUATION" if sell_path == "TREND" else "PULLBACK"
-            conf, probability_samples, probability_calibrated = _estimated_win_probability(raw_score, "SELL", setup_type)
-            if conf < min_conf:
-                return {"side":"HOLD","confidence":conf,"raw_score":raw_score,
-                        "reasons":reasons_sell + [f"Estimated win probability {conf:.1f}% below {min_conf}% entry threshold"],
-                        "price":px,"is_chop":is_chop, "setup_type":setup_type,
-                        "probability_samples":probability_samples,"probability_calibrated":probability_calibrated, **diagnostics}
+            setup_type = ("LATE_MOMENTUM" if sell_path == "LATE_MOMENTUM" else
+                          "CONTINUATION" if sell_path == "TREND" else "PULLBACK")
+            estimated_probability, probability_samples, probability_calibrated = _estimated_win_probability(raw_score, "SELL", setup_type)
             strong_confirmation = (
                 rc < 40 and et == -1 and vs and abs(px - sh) / px < 0.012
                 and sell >= min_conf + 10 and (sell - buy) >= 15
             )
             trade_mode, rr_target = _mode_for_side(sell, buy, et == 1, et == -1, strong_confirmation)
-            if sell_path == "TREND":
+            if sell_path in ("TREND", "LATE_MOMENTUM"):
                 trade_mode = "TREND"
                 rr_target = max(confirmed_rr, fast_target_rr)
                 reasons_sell.append("Trend mode: lock breakeven at 1R, then trail/ride while trend remains valid")
@@ -2630,10 +2677,11 @@ class TechnicalAnalysis:
                 return {"side":"HOLD","confidence":0,
                         "reasons":["Rejected: invalid SL/TP configuration"],"price":px,"is_chop":is_chop}
             fingerprint = _setup_fingerprint("SELL", setup_type, sl, sh, et, px)
-            return {"side":"SELL","confidence":conf,"raw_score":raw_score,"reasons":reasons_sell,
+            return {"side":"SELL","confidence":raw_score,"raw_score":raw_score,"reasons":reasons_sell,
                     "price":px,"sl":sl_p,"tp":tp_p,"is_chop":is_chop,"chop_override":chop_override,
                     "trade_mode":trade_mode,"rr_target":rr_target,"setup_type":setup_type,
-                    "setup_fingerprint":fingerprint,"estimated_win_probability":conf,
+                    "setup_fingerprint":fingerprint,"estimated_win_probability":estimated_probability,
+                    "entry_threshold":sell_entry_threshold,"entry_path":sell_path,
                     "probability_samples":probability_samples,"probability_calibrated":probability_calibrated,
                     "rsi_fast":rf,"rsi_slow":rs,"rsi_confirm":rc,"swing_low":sl,"swing_high":sh, **diagnostics}
 
@@ -4723,7 +4771,7 @@ def api_analysis():
                     "pct_change"   : pct_change,
                     "signal"       : sig["side"],
                     "confidence"   : round(sig.get("confidence", 0), 1),
-                    "min_conf"     : min_conf,
+                    "min_conf"     : sig.get("entry_threshold", min_conf),
                     "reasons"      : sig.get("reasons", []),
                     "sl"           : sig.get("sl"),
                     "tp"           : sig.get("tp"),
@@ -4757,7 +4805,9 @@ def api_analysis():
                     "recent_closes": [round(float(v), 6) for v in df["close"].tail(30).tolist()],
                     "score_breakdown": score_breakdown,
                     "trade_mode": sig.get("trade_mode", "FAST"),
-                    "entry_path": "TREND" if sig.get("trade_mode") == "TREND" else ("PULLBACK" if sig["side"] in ("BUY", "SELL") else "WATCH"),
+                    "entry_path": sig.get("entry_path", "TREND" if sig.get("trade_mode") == "TREND" else ("PULLBACK" if sig["side"] in ("BUY", "SELL") else "WATCH")),
+                    "entry_threshold": sig.get("entry_threshold", min_conf),
+                    "estimated_win_probability": sig.get("estimated_win_probability"),
                     "pullback_buy_score": sig.get("pullback_buy_score"),
                     "pullback_sell_score": sig.get("pullback_sell_score"),
                     "continuation_buy_score": sig.get("continuation_buy_score", 0),
@@ -4765,6 +4815,9 @@ def api_analysis():
                     "continuation_buy_ready": sig.get("continuation_buy_ready", False),
                     "continuation_sell_ready": sig.get("continuation_sell_ready", False),
                     "continuation_threshold": sig.get("continuation_min_conf", CONFIG.get("trend_continuation_min_confidence", 85)),
+                    "late_momentum_buy_ready": sig.get("late_momentum_buy_ready", False),
+                    "late_momentum_sell_ready": sig.get("late_momentum_sell_ready", False),
+                    "late_momentum_min_confidence": sig.get("late_momentum_min_confidence", CONFIG.get("late_momentum_min_confidence", 75)),
                     "continuation_enabled": sig.get("continuation_enabled", True),
                     "efficiency_ratio": sig.get("efficiency_ratio"),
                     "extension_atr": sig.get("extension_atr"),
