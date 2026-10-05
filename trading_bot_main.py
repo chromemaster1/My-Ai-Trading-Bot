@@ -120,8 +120,8 @@ CONFIG = {
     "trend_continuation_max_extension_atr": 1.50,
     "trend_continuation_min_rsi_fast": 50.0,
     "trend_continuation_max_rsi_fast": 75.0,
-    "late_momentum_enabled": True,
-    "late_momentum_min_confidence": 75,
+    "late_momentum_enabled": False,  # disabled: do not chase exhausted moves; wait for clean continuation/pullback
+    "late_momentum_min_confidence": 85,
     "late_momentum_min_efficiency_ratio": 0.50,
     "late_momentum_max_extension_atr": 2.50,
     "late_momentum_min_rsi_fast": 15.0,
@@ -2353,90 +2353,132 @@ class TechnicalAnalysis:
             max_ext = float(CONFIG.get("trend_continuation_max_extension_atr", 1.50))
             min_rsi = float(CONFIG.get("trend_continuation_min_rsi_fast", 50.0))
             max_rsi = float(CONFIG.get("trend_continuation_max_rsi_fast", 75.0))
-            cont_min = float(min_conf)  # one entry threshold for all strategy paths
+            cont_min = float(min_conf)
 
-            # Use directional RSI, momentum, EMA slope and price/EMA alignment
-            # rather than requiring oversold/overbought. This is what makes a
-            # confirmed continuation an entry in its own right.
+            # Continuation quality is intentionally NOT a pile of unrelated
+            # binary points.  It measures four things: direction, persistence,
+            # entry location and exhaustion risk.  This removes the old 84/85
+            # cliff where a fully aligned trend could miss one optional 5-point
+            # item (usually volume) and become untradeable.
             buy_rsi_directional = rf > rs
             sell_rsi_directional = rf < rs
-            ema21_slope_up = ema21 > float(prev["ema_21"])
-            ema21_slope_down = ema21 < float(prev["ema_21"])
+            ema21_slope = ema21 - float(prev["ema_21"])
+            ema50_slope = ema50 - float(prev["ema_50"])
+            ema21_slope_up = ema21_slope > 0
+            ema21_slope_down = ema21_slope < 0
             extension_atr = abs(px - ema21) / atr if atr > 0 else 999.0
 
-            # BUY continuation — max 100 points.
+            def _bounded_ratio(value: float, floor: float, full: float) -> float:
+                if value <= floor:
+                    return 0.0
+                if full <= floor:
+                    return 1.0
+                return max(0.0, min(1.0, (value - floor) / (full - floor)))
+
+            # Shared persistence measurements.  ER and EMA separation are
+            # continuous so 0.49 vs 0.50 cannot arbitrarily add/drop a block
+            # of confidence.  Volume is only a small confirmation bonus.
+            er_quality = max(0.0, min(1.0, efficiency_ratio / max(min_er * 2.0, 0.60)))
+            sep_quality = max(0.0, min(1.0, trend_strength))
+            mom_quality = max(0.0, min(1.0, abs(mom) / max(min_mom * 3.0, 0.75)))
+            extension_quality = max(0.0, min(1.0, 1.0 - max(0.0, extension_atr - 0.35) / max(max_ext - 0.35, 0.25)))
+
+            # BUY continuation: 100-point quality model.
             if et == 1:
-                continuation_buy += 20
+                continuation_buy += 22
                 continuation_buy_reasons.append("Confirmed EMA21>EMA50 uptrend")
             if px > ema21:
-                continuation_buy += 10
+                continuation_buy += 8
                 continuation_buy_reasons.append("Price above EMA21")
             if rc > 52:
                 continuation_buy += 10
                 continuation_buy_reasons.append(f"RSI({self.confirm})={rc:.1f} bullish trend confirmation")
             if buy_rsi_directional:
-                continuation_buy += 10
+                continuation_buy += 8
                 continuation_buy_reasons.append(f"RSI6>RSI12 ({rf:.1f}>{rs:.1f})")
-            if mom > min_mom:
-                continuation_buy += 15
+            if mom > 0:
+                continuation_buy += 12 * mom_quality
                 continuation_buy_reasons.append(f"Positive momentum +{mom:.2f}%")
             if efficiency_ratio >= min_er:
-                continuation_buy += 10
+                continuation_buy += 12 * er_quality
                 continuation_buy_reasons.append(f"Efficient directional movement ER={efficiency_ratio:.2f}")
-            if vs:
-                continuation_buy += 5
-                continuation_buy_reasons.append("Volume confirms continuation")
-            if trend_strength >= 0.50:
-                continuation_buy += 5
+            if trend_strength > 0:
+                continuation_buy += 10 * sep_quality
                 continuation_buy_reasons.append(f"Established EMA separation {ema_sep_pct*100:.2f}%")
-            if ema21_slope_up:
+            if ema21_slope_up and ema50_slope >= 0:
+                continuation_buy += 8
+                continuation_buy_reasons.append("EMA21/EMA50 slopes rising")
+            elif ema21_slope_up:
                 continuation_buy += 5
                 continuation_buy_reasons.append("EMA21 rising")
-            if et == 1 and min_rsi <= rf <= max_rsi and extension_atr <= max_ext:
-                continuation_buy += 10
-                continuation_buy_reasons.append(f"Healthy continuation zone: RSI6={rf:.1f}, {extension_atr:.2f} ATR from EMA21")
+            if extension_atr <= max_ext:
+                continuation_buy += 6 * extension_quality
+                continuation_buy_reasons.append(f"Entry location {extension_atr:.2f} ATR from EMA21")
+            if vs:
+                continuation_buy += 4
+                continuation_buy_reasons.append("Volume confirms continuation")
 
-            # SELL continuation — exact mirror of BUY.
+            # SELL continuation — exact mirror.
             if et == -1:
-                continuation_sell += 20
+                continuation_sell += 22
                 continuation_sell_reasons.append("Confirmed EMA21<EMA50 downtrend")
             if px < ema21:
-                continuation_sell += 10
+                continuation_sell += 8
                 continuation_sell_reasons.append("Price below EMA21")
             if rc < 48:
                 continuation_sell += 10
                 continuation_sell_reasons.append(f"RSI({self.confirm})={rc:.1f} bearish trend confirmation")
             if sell_rsi_directional:
-                continuation_sell += 10
+                continuation_sell += 8
                 continuation_sell_reasons.append(f"RSI6<RSI12 ({rf:.1f}<{rs:.1f})")
-            if mom < -min_mom:
-                continuation_sell += 15
+            if mom < 0:
+                continuation_sell += 12 * mom_quality
                 continuation_sell_reasons.append(f"Negative momentum {mom:.2f}%")
             if efficiency_ratio >= min_er:
-                continuation_sell += 10
+                continuation_sell += 12 * er_quality
                 continuation_sell_reasons.append(f"Efficient directional movement ER={efficiency_ratio:.2f}")
-            if vs:
-                continuation_sell += 5
-                continuation_sell_reasons.append("Volume confirms continuation")
-            if trend_strength >= 0.50:
-                continuation_sell += 5
+            if trend_strength > 0:
+                continuation_sell += 10 * sep_quality
                 continuation_sell_reasons.append(f"Established EMA separation {ema_sep_pct*100:.2f}%")
-            if ema21_slope_down:
+            if ema21_slope_down and ema50_slope <= 0:
+                continuation_sell += 8
+                continuation_sell_reasons.append("EMA21/EMA50 slopes falling")
+            elif ema21_slope_down:
                 continuation_sell += 5
                 continuation_sell_reasons.append("EMA21 falling")
-            if et == -1 and (100.0 - max_rsi) <= rf <= (100.0 - min_rsi) and extension_atr <= max_ext:
-                continuation_sell += 10
-                continuation_sell_reasons.append(f"Healthy continuation zone: RSI6={rf:.1f}, {extension_atr:.2f} ATR from EMA21")
+            if extension_atr <= max_ext:
+                continuation_sell += 6 * extension_quality
+                continuation_sell_reasons.append(f"Entry location {extension_atr:.2f} ATR from EMA21")
+            if vs:
+                continuation_sell += 4
+                continuation_sell_reasons.append("Volume confirms continuation")
 
-            continuation_buy = min(100.0, continuation_buy)
-            continuation_sell = min(100.0, continuation_sell)
+            # Exhaustion is an entry-quality penalty, not a denial that the
+            # underlying trend exists.  This prevents a very strong but already
+            # stretched move from receiving 95 merely because every trend
+            # indicator points the same way.
+            buy_exhaustion = 0.0
+            sell_exhaustion = 0.0
+            if rf > max_rsi:
+                buy_exhaustion += min(12.0, (rf - max_rsi) * 1.5)
+            if rf < (100.0 - max_rsi):
+                sell_exhaustion += min(12.0, ((100.0 - max_rsi) - rf) * 1.5)
+            if extension_atr > max_ext:
+                ext_penalty = min(15.0, (extension_atr - max_ext) * 10.0)
+                buy_exhaustion += ext_penalty
+                sell_exhaustion += ext_penalty
+            continuation_buy = max(0.0, min(100.0, continuation_buy - buy_exhaustion))
+            continuation_sell = max(0.0, min(100.0, continuation_sell - sell_exhaustion))
 
+            # Safety gates remain hard.  The score can be high only when the
+            # trend is real, but execution also requires a non-exhausted entry
+            # location.  The 85 threshold is unchanged.
             continuation_buy_ready = (
                 et == 1
                 and continuation_buy >= cont_min
                 and continuation_buy > continuation_sell
                 and efficiency_ratio >= min_er
-                and min_rsi <= rf <= max_rsi
+                and rf >= min_rsi and rf <= max_rsi + 2.0
                 and mom > min_mom
                 and px > ema21
                 and ema21_slope_up
@@ -2448,7 +2490,7 @@ class TechnicalAnalysis:
                 and continuation_sell >= cont_min
                 and continuation_sell > continuation_buy
                 and efficiency_ratio >= min_er
-                and (100.0 - max_rsi) <= rf <= (100.0 - min_rsi)
+                and rf <= (100.0 - min_rsi) and rf >= (100.0 - max_rsi) - 2.0
                 and mom < -min_mom
                 and px < ema21
                 and ema21_slope_down
@@ -2519,6 +2561,7 @@ class TechnicalAnalysis:
             "continuation_sell_ready": bool(continuation_sell_ready),
             "continuation_enabled": bool(CONFIG.get("trend_continuation_enabled", True)),
             "continuation_min_conf": float(min_conf),
+            "continuation_score_model": "direction+persistence+entry_quality-exhaustion",
             "entry_threshold": float(min_conf),
             "unified_buy_score": round(buy, 1),
             "unified_sell_score": round(sell, 1),
@@ -4008,8 +4051,8 @@ def api_predictions():
         {"key":"ema_bullish",    "label":"EMA21 > EMA50 Uptrend",        "pts":15, "dir":"buy"},
         {"key":"ema_bearish",    "label":"EMA21 < EMA50 Downtrend",      "pts":15, "dir":"sell"},
         {"key":"vol_surge",      "label":"Volume Surge Confirmation",    "pts":10, "dir":"both"},
-        {"key":"momentum_pos",   "label":"Positive Momentum 5-bar",      "pts":10, "dir":"buy"},
-        {"key":"momentum_neg",   "label":"Negative Momentum 5-bar",      "pts":10, "dir":"sell"},
+        {"key":"momentum_pos",   "label":"Positive Momentum 2-bar",      "pts":10, "dir":"buy"},
+        {"key":"momentum_neg",   "label":"Negative Momentum 3-bar",      "pts":10, "dir":"sell"},
         {"key":"rsi24_bullish",  "label":f"RSI({ta.confirm}) Confirms Bullish Bias", "pts":10, "dir":"buy"},
         {"key":"rsi24_bearish",  "label":f"RSI({ta.confirm}) Confirms Bearish Bias", "pts":10, "dir":"sell"},
     ]
