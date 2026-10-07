@@ -1,4 +1,4 @@
-"""""
+"""
 =============================================================
   AI TRADING BOT  — Crypto & Stock Market
   RSI(6-12) + Market Swing + Tight SL/TP + Claude AI
@@ -90,6 +90,11 @@ CONFIG = {
     "futures_leverage"       : 3,
     "futures_margin_mode"    : "isolated",   # "isolated" | "cross"
     "futures_settle_currency": "USDT",       # used to build ccxt's BASE/QUOTE:SETTLE perpetual symbol
+    # Exchange-side disaster stop (FUTURES, live only): a reduce-only stop-market
+    # order at the trade's INITIAL stop is placed on the exchange right after entry,
+    # so a bot crash / network loss cannot leave a position unprotected. The bot's own
+    # tighter ladder/trailing/fast exits still run in software; this stop does not ratchet.
+    "exchange_side_stop_enabled": True,
     "stock_symbols"          : ["AAPL", "TSLA", "NVDA", "AMZN", "XAGUSD=X", "XAUUSD=X"],
     "stock_timeframe"        : "15m",
     "forex_symbols"         : ["EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X"],
@@ -102,6 +107,21 @@ CONFIG = {
     "rsi_oversold"           : 30,
     "rsi_signal_threshold"   : 5,
     "swing_lookback"         : 20,
+    # Momentum gate used by the pullback-path momentum points AND the dashboard
+    # (single source of truth so the dashboard can never disagree with signal()).
+    # Applied to the 3-bar momentum trigger.
+    "momentum_pullback_threshold_pct": 0.5,   # fixed-% fallback (only used when momentum_gate_mode == "pct")
+    # Volatility-normalised momentum gates (default). A fixed % means very different things on
+    # different symbols (0.25% is ~0.8 ATR on SOL but ~2.2 ATR on XAUT), so the gates are expressed
+    # in ATR multiples of the last candle's ATR%:
+    #   trigger  = momentum_trigger_atr_mult  x ATR%  -> 3-bar move needed for a trend-continuation entry
+    #   pullback = momentum_pullback_atr_mult x ATR%  -> 3-bar move needed for the pullback-path momentum bonus
+    # Set momentum_gate_mode to "pct" to fall back to the fixed percentages
+    # (trend_continuation_min_momentum_pct / momentum_pullback_threshold_pct).
+    "momentum_gate_mode": "atr",
+    "momentum_trigger_atr_mult": 1.0,
+    "momentum_pullback_atr_mult": 1.5,
+    "momentum_gate_floor_pct": 0.05,          # never let an ATR gate drop below this % (ultra-quiet markets)
     "swing_pivot_strength"   : 3,
     "stop_loss_pct"          : 0.005,    # 0.5% — tight stop
     "take_profit_pct"        : 0.020,    # 2.0% default profit target; dynamic RR logic can override this for fast trades
@@ -133,11 +153,11 @@ CONFIG = {
     "account_balance"        : 10000.0,
     "anthropic_api_key"      : os.environ.get("ANTHROPIC_API_KEY", ""),
     "ai_model"               : "claude-sonnet-4-6",
-    "ai_confirmation_required": False,
+    "ai_confirmation_required": True,
     "scan_interval_seconds"  : 30,
     "max_execution_slippage_pct": 0.003,  # 0.3% — refuse to execute if price moved more than this since signal detection
     "signal_exit_confirmations": 2,  # consecutive scans required before closing a trade on confidence/direction loss (SL/TP unaffected — always instant)
-    "hold_requires_entry_confidence": True, # entry probability is NOT a hold condition; open trades use trend structure
+    "hold_requires_entry_confidence": False, # entry probability is NOT a hold condition; open trades use trend structure
     "trend_hold_min_score"      : 60,    # directional structure required to keep an un-locked trade alive
     "probability_prior_strength": 4,     # neutral Beta(2,2) prior; raw indicator score NEVER becomes a fake probability prior
     "probability_bucket_width" : 5,     # completed trades within +/- this raw-score range calibrate probability
@@ -145,7 +165,7 @@ CONFIG = {
     "provisional_probability_cap": 84,  # uncalibrated setups can never masquerade as an 85-99% win-probability trade
     "reentry_reset_required"   : True,  # losing autonomous setup cannot recycle until its setup fingerprint changes
     "early_adverse_exit_enabled": True, # fast monitor cuts entries that fail immediately instead of donating the entire 1R stop
-    "early_adverse_exit_r"     : 0.30,  # noise-tolerant fast invalidation: cut at -0.30R before the full 1R stop
+    "early_adverse_exit_r"     : 0.30,  # backup guard, kept equal to fast_wrong_way_exit_r (-0.30R)
     "early_adverse_min_favorable_r": 0.25, # +0.25R marks a proven trade and hands management to the profit-lock ladder
     "early_adverse_grace_seconds": 15, # allow execution noise/spread to settle before adverse-entry invalidation
     "progressive_profit_lock_enabled": True,
@@ -153,14 +173,14 @@ CONFIG = {
     "progressive_profit_lock_ladder": [(0.25, 0.02), (0.35, 0.05), (0.50, 0.15), (0.80, 0.35), (1.00, 0.50)],
     "proven_trade_r": 0.25,
     "fast_wrong_way_exit_enabled": True,
-    "fast_wrong_way_exit_r": 0.15,
+    "fast_wrong_way_exit_r": 0.30,   # -0.30R: tolerant of normal 15m wobble, still far inside the full 1R stop
     # Ride-winners mechanism: lets a trade that's genuinely working keep
     # running toward its take-profit target instead of getting cut short
     # by the same strict confidence checks that (correctly) protect a
     # fresh, unproven trade. See TradeManager.check_exits() and the
     # confidence re-check in scan_once().
     "profit_lock_enabled"       : True,   # move SL to breakeven once a trade earns profit_lock_r_multiple of its own risk
-    "profit_lock_r_multiple"    : 1.0,    # legacy fallback; progressive ladder now starts protecting from +0.25R
+    "profit_lock_r_multiple"    : 0.25,   # legacy fallback (only used if the ladder is disabled). Kept <= trailing_stop_activation_r so Settings saves pass validation
     "relax_exit_after_profit_lock": True, # once breakeven-locked, only a genuine signal reversal can trigger an exit — not routine confidence wobble
     "trailing_stop_enabled"     : True,   # keep trailing the stop behind price once profit-locked and still running
     "trailing_stop_activation_r": 0.25,   # begin evaluating the dynamic trail as soon as the trade proves itself at +0.25R
@@ -246,6 +266,25 @@ CONFIG = {
     "web_port"               : int(os.environ.get("PORT", 5000)),
     "web_host"               : "0.0.0.0",
 }
+
+def _momentum_gates(px, atr):
+    """Single source of truth for the 3-bar momentum gates, used by signal() AND
+    both dashboards so they can never disagree.
+
+    Returns (trigger_gate_pct, pullback_gate_pct, is_atr_mode)."""
+    try:
+        atr_pct = (float(atr) / float(px) * 100.0) if (atr and px) else 0.0
+        if str(CONFIG.get("momentum_gate_mode", "atr")).lower() == "atr" and atr_pct > 0:
+            floor = float(CONFIG.get("momentum_gate_floor_pct", 0.05))
+            return (max(float(CONFIG.get("momentum_trigger_atr_mult", 1.0)) * atr_pct, floor),
+                    max(float(CONFIG.get("momentum_pullback_atr_mult", 1.5)) * atr_pct, floor),
+                    True)
+    except (TypeError, ValueError, ZeroDivisionError):
+        pass
+    return (float(CONFIG.get("trend_continuation_min_momentum_pct", 0.25)),
+            float(CONFIG.get("momentum_pullback_threshold_pct", 0.5)),
+            False)
+
 
 STATE_FILE = os.environ.get(
     "TRADING_BOT_STATE_FILE",
@@ -1339,8 +1378,12 @@ def _apply_futures_leverage(exchange, sym: str) -> None:
 
 
 def execute_live_order(symbol: str, side: str, size: float,
-                       market: Optional[str] = None) -> dict:
-    """Place a market order. `size` = BASE CURRENCY quantity (e.g. 0.001 BTC)."""
+                       market: Optional[str] = None, reduce_only: bool = False) -> dict:
+    """Place a market order. `size` = BASE CURRENCY quantity (e.g. 0.001 BTC).
+
+    reduce_only=True is used for every CLOSING order on FUTURES so a close can
+    never open a fresh opposite position (e.g. if an exchange-side stop already
+    closed the position, the exchange rejects the reduce-only close instead)."""
     exchange, error = _get_live_exchange_client(market=market)
     if error or exchange is None:
         return {"ok": False, "error": error or "Live exchange client unavailable"}
@@ -1375,7 +1418,10 @@ def execute_live_order(symbol: str, side: str, size: float,
         qty = float(size)
         if qty <= 0:
             return {"ok": False, "error": f"Invalid order size: {qty}"}
-        order     = exchange.create_market_order(sym, side.lower(), qty)
+        if reduce_only and m == "FUTURES":
+            order = exchange.create_market_order(sym, side.lower(), qty, None, {"reduceOnly": True})
+        else:
+            order = exchange.create_market_order(sym, side.lower(), qty)
         raw_bal   = exchange.fetch_balance()
         free_usdt = _extract_free_usdt(raw_bal)
         acc = CONFIG.setdefault("live_accounts", {}).setdefault(m, {})
@@ -1395,6 +1441,83 @@ def execute_live_order(symbol: str, side: str, size: float,
         _save_persistent_state()
         _elog(f"Live order FAILED {side} {symbol}: {err}", "ERROR")
         return {"ok": False, "error": err}
+
+
+def _place_exchange_protective_stop(symbol: str, side: str, size: float,
+                                    stop_price: float, market: Optional[str] = None) -> dict:
+    """FUTURES only. Place a reduce-only stop-market order on the exchange at
+    `stop_price` as a disaster backstop. Never raises; returns {"ok": bool, ...}.
+    A failure here must NOT block the trade — software stops still protect it."""
+    m = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
+    if m != "FUTURES":
+        return {"ok": False, "error": f"exchange-side stop only supported for FUTURES (market={m})"}
+    try:
+        exchange, error = _get_live_exchange_client(market=m)
+        if error or exchange is None:
+            return {"ok": False, "error": error or "Live exchange client unavailable"}
+        sym = _resolve_futures_symbol(normalize_market_symbol(symbol, m), exchange)
+        if sym is None:
+            return {"ok": False, "error": f"no futures contract for {symbol}"}
+        close_side = "sell" if str(side).upper() == "BUY" else "buy"
+        qty = float(size)
+        px = float(stop_price)
+        try:
+            qty = float(exchange.amount_to_precision(sym, qty))
+            px = float(exchange.price_to_precision(sym, px))
+        except Exception:
+            pass
+        order = exchange.create_order(sym, "market", close_side, qty, None,
+                                      {"stopLossPrice": px, "reduceOnly": True})
+        return {"ok": True, "id": (order or {}).get("id"), "price": px, "symbol": sym}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
+def _cancel_exchange_protective_stop(trade: dict) -> None:
+    """Best-effort cancel of a trade's exchange-side stop after a confirmed close.
+    The stop is reduce-only, so a leftover can only reduce a position, never open one."""
+    oid = trade.get("exchange_stop_id")
+    if not oid:
+        return
+    m = (trade.get("market") or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
+    try:
+        exchange, error = _get_live_exchange_client(market=m)
+        if error or exchange is None:
+            raise RuntimeError(error or "Live exchange client unavailable")
+        sym = _resolve_futures_symbol(normalize_market_symbol(trade["symbol"], m), exchange)
+        try:
+            exchange.cancel_order(oid, sym, {"trigger": True})
+        except Exception:
+            exchange.cancel_order(oid, sym)
+        trade["exchange_stop_cancelled"] = True
+        _elog(f"🧹 {trade['symbol']}: exchange-side stop {oid} cancelled", "INFO")
+    except Exception as exc:
+        trade["exchange_stop_cancel_error"] = str(exc)
+        _elog(f"⚠️ {trade['symbol']}: could not cancel exchange-side stop {oid}: {exc} "
+              f"(it is reduce-only, so it cannot open a new position)", "WARN")
+
+
+def _live_position_is_flat(symbol: str, market: Optional[str] = None) -> Optional[bool]:
+    """FUTURES: True if the exchange reports no open contracts for the symbol,
+    False if a position is still open, None if it cannot be determined."""
+    m = (market or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
+    if m != "FUTURES":
+        return None
+    try:
+        exchange, error = _get_live_exchange_client(market=m)
+        if error or exchange is None:
+            return None
+        sym = _resolve_futures_symbol(normalize_market_symbol(symbol, m), exchange)
+        if sym is None:
+            return None
+        positions = exchange.fetch_positions([sym]) or []
+        total = 0.0
+        for p in positions:
+            if p.get("symbol") == sym:
+                total += abs(float(p.get("contracts") or 0))
+        return total == 0.0
+    except Exception:
+        return None
 
 # In-memory event log
 _EVENT_LOG  = []
@@ -2255,9 +2378,11 @@ class TechnicalAnalysis:
         if vs:
             if buy > sell: buy += 10; reasons_buy.append("Volume surge confirms move")
             else:          sell += 10; reasons_sell.append("Volume surge confirms move")
-        if mom > 0.5:
+        trig_gate, pb_gate, gate_is_atr = _momentum_gates(px, atr)
+        mom_thr = pb_gate
+        if mom > mom_thr:
             buy += 10; reasons_buy.append(f"Momentum +{mom:.2f}%")
-        elif mom < -0.5:
+        elif mom < -mom_thr:
             sell += 10; reasons_sell.append(f"Momentum {mom:.2f}%")
         # RSI(24): a slower period than the fast/slow pair above — used
         # purely as broader-trend confirmation (above 50 = bullish bias,
@@ -2362,7 +2487,7 @@ class TechnicalAnalysis:
 
         if CONFIG.get("trend_continuation_enabled", True):
             min_er = float(CONFIG.get("trend_continuation_min_efficiency_ratio", 0.30))
-            min_mom = float(CONFIG.get("trend_continuation_min_momentum_pct", 0.25))
+            min_mom = trig_gate
             max_ext = float(CONFIG.get("trend_continuation_max_extension_atr", 1.50))
             min_rsi = float(CONFIG.get("trend_continuation_min_rsi_fast", 50.0))
             max_rsi = float(CONFIG.get("trend_continuation_max_rsi_fast", 75.0))
@@ -2393,8 +2518,8 @@ class TechnicalAnalysis:
             # of confidence.  Volume is only a small confirmation bonus.
             er_quality = max(0.0, min(1.0, efficiency_ratio / max(min_er * 2.0, 0.60)))
             sep_quality = max(0.0, min(1.0, trend_strength))
-            fast_mom_quality = max(0.0, min(1.0, abs(mom3) / max(min_mom * 2.0, 0.50)))
-            slow_mom_quality = max(0.0, min(1.0, abs(mom5) / max(min_mom * 3.0, 0.75)))
+            fast_mom_quality = max(0.0, min(1.0, abs(mom3) / (min_mom * 2.0 if gate_is_atr else max(min_mom * 2.0, 0.50))))
+            slow_mom_quality = max(0.0, min(1.0, abs(mom5) / (min_mom * 3.0 if gate_is_atr else max(min_mom * 3.0, 0.75))))
             mom_quality = (0.70 * fast_mom_quality) + (0.30 * slow_mom_quality)
             extension_quality = max(0.0, min(1.0, 1.0 - max(0.0, extension_atr - 0.35) / max(max_ext - 0.35, 0.25)))
 
@@ -2590,6 +2715,11 @@ class TechnicalAnalysis:
             "trend_hold_buy_score": round(trend_hold_buy, 1),
             "trend_hold_sell_score": round(trend_hold_sell, 1),
             "trend_hold_min_score": float(CONFIG.get("trend_hold_min_score", 60)),
+            "momentum_gate_mode": "atr" if gate_is_atr else "pct",
+            "momentum_trigger_gate_pct": round(trig_gate, 4),
+            "momentum_pullback_gate_pct": round(pb_gate, 4),
+            "mom3": round(mom3, 4),
+            "mom5": round(mom5, 4),
         }
 
         late_min_conf = float(CONFIG.get("late_momentum_min_confidence", 75))
@@ -2977,6 +3107,16 @@ class TradeManager:
                     msg = (f"OPENED {symbol} {sig['side']} @ ${px:.4f} | "
                            f"SL=${sig['sl']:.4f} TP=${sig['tp']:.4f} | "
                            f"Conf={conf:.1f}% | LIVE ORDER{tag}")
+                    if m == "FUTURES" and CONFIG.get("exchange_side_stop_enabled", True):
+                        stop_res = _place_exchange_protective_stop(symbol, sig["side"], sz, sig["sl"], market=m)
+                        if stop_res.get("ok"):
+                            trade["exchange_stop_id"] = stop_res.get("id")
+                            trade["exchange_stop_price"] = stop_res.get("price")
+                            msg += f" | EXCHANGE STOP @ ${stop_res.get('price'):.4f}"
+                        else:
+                            trade["exchange_stop_error"] = stop_res.get("error", "unknown")
+                            _elog(f"⚠️ {symbol}: exchange-side stop NOT placed ({trade['exchange_stop_error']}) — "
+                                  f"software stops only", "WARN")
                 else:
                     # LIVE entry failed: explicitly fall back to the normal
                     # paper-trade lifecycle.  The failed exchange order must
@@ -3003,39 +3143,83 @@ class TradeManager:
             record_admin_activity("admin", "trade", msg, details={"trade": trade})
             return trade
 
+    def _live_close(self, t: dict, label: str, autonomous: bool = True):
+        """Close the EXCHANGE side of a trade. Call with self._lock held.
+
+        Returns (confirmed, fill_price_or_None, note).
+          • PAPER trades (including live-entry failures that fell back to paper)
+            never touch the exchange -> (True, None, "").
+          • LIVE trades are only reported closed when the exchange confirms the
+            reduce-only close, or reports the position already flat (e.g. the
+            exchange-side stop fired). On failure the trade MUST stay open and
+            the caller retries — never book a phantom close.
+        autonomous=True also requires the live-trading toggle (bot-initiated
+        exits). Manual closes only need credentials."""
+        if t.get("execution_mode") != "LIVE":
+            return True, None, ""
+        m = (t.get("market") or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
+        live_acc = CONFIG.get("live_accounts", {}).get(m, {})
+        creds_ok = bool(live_acc.get("api_key") and live_acc.get("api_secret"))
+        if not creds_ok or (autonomous and not CONFIG.get("live_trading_enabled", False)):
+            t["execution_error"] = "Live close required but live account/credentials unavailable"
+            _elog(f"Live close blocked {t['symbol']} ({label}): {t['execution_error']} — keeping trade OPEN", "ERROR")
+            return False, None, ""
+        close_side = "SELL" if t["side"] == "BUY" else "BUY"
+        try:
+            res = execute_live_order(t["symbol"], close_side, t["size"], market=m, reduce_only=True)
+        except Exception as exc:
+            res = {"ok": False, "error": str(exc)}
+        if res.get("ok"):
+            order = res.get("order") or {}
+            t["exchange_close_id"] = order.get("id", "")
+            live_acc["balance"] = res.get("balance", live_acc.get("balance", 0))
+            fill = order.get("average") or order.get("price")
+            try:
+                fill = float(fill) if fill is not None else None
+            except (TypeError, ValueError):
+                fill = None
+            if fill is not None and fill <= 0:
+                fill = None
+            _cancel_exchange_protective_stop(t)
+            return True, fill, " | LIVE close confirmed"
+        err = res.get("error", "unknown live close error")
+        t["execution_error"] = err
+        t["live_close_failures"] = int(t.get("live_close_failures", 0) or 0) + 1
+        if m == "FUTURES" and _live_position_is_flat(t["symbol"], m):
+            t["exchange_closed_externally"] = True
+            _elog(f"ℹ️ {t['symbol']}: close rejected ({err}) but the exchange reports the position is already "
+                  f"flat (exchange-side stop or manual close) — marking trade closed", "WARN")
+            _cancel_exchange_protective_stop(t)
+            return True, None, " | position already flat on exchange"
+        n = t["live_close_failures"]
+        if n <= 3 or n % 12 == 0:
+            _elog(f"Live close failed {t['symbol']} ({label}, attempt {n}): {err} — keeping trade OPEN, will retry", "ERROR")
+        return False, None, ""
+
     def force_close(self, trade_id: str, prices: dict) -> Optional[dict]:
         with self._lock:
             for t in list(self.open_trades):
                 if t["id"] == trade_id:
                     px  = prices.get(t["symbol"], t["entry"])
+                    confirmed, fill_px, note = self._live_close(t, "MANUAL", autonomous=False)
+                    if not confirmed:
+                        # Trade stays open; tell the caller why instead of "not found".
+                        return {"_close_failed": True, "id": trade_id,
+                                "error": t.get("execution_error", "live close failed")}
+                    if fill_px:
+                        px = fill_px
                     pnl = ((px - t["entry"]) if t["side"]=="BUY"
                            else (t["entry"] - px)) * t["size"]
                     t.update({"pnl":pnl, "status":"MANUAL",
                                "close_time":datetime.utcnow().isoformat(),
                                "close_price":px, "unrealised_pnl":0.0})
-                    if not CONFIG["paper_trading"] and CONFIG.get("live_trading_enabled", False):
-                        m = (t.get("market") or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
-                        live_acc = CONFIG.get("live_accounts", {}).get(m, {})
-                        close_side = "SELL" if t["side"] == "BUY" else "BUY"
-                        if live_acc.get("connected"):
-                            live_result = execute_live_order(t["symbol"], close_side, t["size"], market=m)
-                            if live_result.get("ok"):
-                                t["exchange_order_id"] = live_result.get("order", {}).get("id")
-                                t["execution_mode"] = "LIVE"
-                            else:
-                                t["execution_error"] = live_result.get("error", "unknown")
-                                _elog(f"Live close failed for {t['symbol']}: {t['execution_error']}", "WARN")
-                        else:
-                            t["execution_mode"] = "PAPER"
-                            t["execution_error"] = "Live account disconnected"
-                            _elog(f"Live close skipped for {t['symbol']}: account disconnected", "WARN")
                     self.balance += pnl
                     self.open_trades.remove(t)
                     self._remember_failed_setup(t)
                     self.closed_trades.append(t)
                     if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
                         del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
-                    msg = f"MANUAL CLOSE {t['symbol']} | PnL=${pnl:.2f}"
+                    msg = f"MANUAL CLOSE {t['symbol']} | PnL=${pnl:.2f}{note}"
                     _elog(f"🔴 {msg}", "WARN")
                     record_admin_activity("admin", "trade", msg, details={"trade": t})
                     return t
@@ -3043,42 +3227,32 @@ class TradeManager:
 
     def close_on_signal_loss(self, trade_id: str, price: float, reason: str) -> Optional[dict]:
         """Close a trade early because the fresh scan no longer supports it —
-        i.e. the pair's signal flipped or its confidence dropped below the
-        minimum-to-trade threshold. Distinct from an SL/TP hit (check_exits)
-        and from a manual close (force_close) so it's clearly labelled in
-        trade history."""
+        i.e. the pair's signal flipped or its trend structure broke. Distinct
+        from an SL/TP hit (check_exits) and from a manual close (force_close) so
+        it's clearly labelled in trade history. Returns None (trade stays open,
+        retried next scan) if a LIVE exchange close is not confirmed."""
         with self._lock:
             for t in list(self.open_trades):
                 if t["id"] == trade_id:
                     px  = price if price is not None else t["entry"]
+                    confirmed, fill_px, note = self._live_close(t, "SIGNAL_EXIT")
+                    if not confirmed:
+                        return None
+                    if fill_px:
+                        px = fill_px
                     pnl = ((px - t["entry"]) if t["side"]=="BUY"
                            else (t["entry"] - px)) * t["size"]
                     t.update({"pnl":pnl, "status":"SIGNAL_EXIT",
                                "close_time":datetime.utcnow().isoformat(),
                                "close_price":px, "unrealised_pnl":0.0,
                                "close_reason":reason})
-                    if not CONFIG["paper_trading"] and CONFIG.get("live_trading_enabled", False):
-                        m = (t.get("market") or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
-                        live_acc = CONFIG.get("live_accounts", {}).get(m, {})
-                        close_side = "SELL" if t["side"] == "BUY" else "BUY"
-                        if live_acc.get("connected"):
-                            live_result = execute_live_order(t["symbol"], close_side, t["size"], market=m)
-                            if live_result.get("ok"):
-                                t["exchange_order_id"] = live_result.get("order", {}).get("id")
-                                t["execution_mode"] = "LIVE"
-                            else:
-                                t["execution_error"] = live_result.get("error", "unknown")
-                                _elog(f"Live close failed for {t['symbol']}: {t['execution_error']}", "WARN")
-                        else:
-                            t["execution_mode"] = "PAPER"
-                            t["execution_error"] = "Live account disconnected"
                     self.balance += pnl
                     self.open_trades.remove(t)
                     self._remember_failed_setup(t)
                     self.closed_trades.append(t)
                     if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
                         del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
-                    msg = f"SIGNAL EXIT {t['symbol']} | {reason} | PnL=${pnl:.2f}"
+                    msg = f"SIGNAL EXIT {t['symbol']} | {reason} | PnL=${pnl:.2f}{note}"
                     c = Fore.GREEN if pnl > 0 else Fore.RED
                     print(c + f"  ↩️  {msg}" + Style.RESET_ALL)
                     _elog(msg, "WARN")
@@ -3087,63 +3261,36 @@ class TradeManager:
         return None
 
     def close_live_position_for_data_safety(self, trade_id: str, reason: str) -> Optional[dict]:
-        """Emergency-close a live position when OHLCV data is stale/unavailable.
+        """Emergency-close a LIVE position when OHLCV data is stale/unavailable.
 
-        This path deliberately uses an exchange MARKET order and never uses an
-        old candle close as an execution price.  If the exchange cannot close
-        the position, the internal trade remains OPEN so the bot does not claim
-        that a real position was closed when it was not.
-        """
+        Uses an exchange MARKET (reduce-only) order and never an old candle close
+        as an execution price. If the exchange cannot close the position, the
+        internal trade stays OPEN so the bot never claims a real position was
+        closed when it was not. PAPER trades (incl. paper fallbacks) are not
+        touched — there is no exchange position to close."""
         with self._lock:
             trade = next((t for t in self.open_trades if t["id"] == trade_id), None)
             if trade is None:
                 return None
-
-            m = (trade.get("market") or CONFIG.get("market_mode") or "CRYPTO").strip().upper()
-            live_acc = CONFIG.get("live_accounts", {}).get(m, {})
-            if not live_acc.get("connected"):
-                _elog(f"Live data-safety close refused for {trade['symbol']}: live account disconnected", "ERROR")
+            if trade.get("execution_mode") != "LIVE":
                 return None
-
-            close_side = "SELL" if trade["side"] == "BUY" else "BUY"
-            try:
-                live_result = execute_live_order(trade["symbol"], close_side, trade["size"], market=m)
-            except Exception as exc:
-                _elog(f"Live data-safety close exception for {trade['symbol']}: {exc}", "ERROR")
+            confirmed, fill_px, note = self._live_close(trade, "DATA_SAFETY")
+            if not confirmed:
                 return None
-
-            if not live_result.get("ok"):
-                err = live_result.get("error", "unknown live close error")
-                trade["execution_error"] = err
-                _elog(f"Live data-safety close FAILED for {trade['symbol']}: {err} — keeping internal trade OPEN", "ERROR")
-                return None
-
-            order = live_result.get("order") or {}
-            fill_px = order.get("average") or order.get("price")
-            try:
-                fill_px = float(fill_px) if fill_px is not None else None
-            except (TypeError, ValueError):
-                fill_px = None
-
-            # A successful exchange close is authoritative.  If the exchange
-            # did not return a usable fill price, retain entry only for internal
-            # PnL bookkeeping; we never used it as the execution price.
-            accounting_px = fill_px if fill_px is not None and fill_px > 0 else trade["entry"]
+            accounting_px = fill_px if fill_px is not None else trade["entry"]
             pnl = ((accounting_px - trade["entry"]) if trade["side"] == "BUY"
                    else (trade["entry"] - accounting_px)) * trade["size"]
             trade.update({"pnl": pnl, "status": "DATA_SAFETY_EXIT",
                           "close_time": datetime.utcnow().isoformat(),
                           "close_price": fill_px, "unrealised_pnl": 0.0,
-                          "close_reason": reason, "execution_mode": "LIVE",
-                          "exchange_close_id": order.get("id", "")})
+                          "close_reason": reason, "execution_mode": "LIVE"})
             self.balance += pnl
             self.open_trades.remove(trade)
             self.closed_trades.append(trade)
             if len(self.closed_trades) > CONFIG.get("max_closed_trades_memory", 500):
                 del self.closed_trades[:-CONFIG.get("max_closed_trades_memory", 500)]
-            msg = (f"DATA SAFETY EXIT {trade['symbol']} | {reason} | "
-                   f"Fill=${fill_px:.6f}" if fill_px is not None else
-                   f"DATA SAFETY EXIT {trade['symbol']} | {reason} | Fill=exchange-confirmed")
+            fill_txt = f"Fill=${fill_px:.6f}" if fill_px is not None else "Fill=exchange-confirmed"
+            msg = f"DATA SAFETY EXIT {trade['symbol']} | {reason} | {fill_txt}{note}"
             _elog(msg, "ERROR")
             record_admin_activity("admin", "trade", msg, details={"trade": trade})
             return trade
@@ -3172,17 +3319,18 @@ class TradeManager:
 
                 # ── Fast wrong-way invalidation ──────────────────────────
                 # This runs on the fast price-monitor cadence and NEVER waits for
-                # signal_exit_confirmations.  Before a trade proves itself, a
-                # -0.10R move against entry is enough to invalidate it quickly.
+                # signal_exit_confirmations.  Before a trade proves itself (best
+                # R < proven_trade_r), a move of fast_wrong_way_exit_r (-0.30R)
+                # against entry invalidates it quickly.
                 adverse_exit = False
                 if (CONFIG.get("fast_wrong_way_exit_enabled", True)
                         and not t.get("proven_trade")
                         and age >= float(CONFIG.get("early_adverse_grace_seconds", 15))):
-                    adverse_r = abs(float(CONFIG.get("fast_wrong_way_exit_r", 0.10)))
+                    adverse_r = abs(float(CONFIG.get("fast_wrong_way_exit_r", 0.30)))
                     adverse_exit = r_multiple <= -adverse_r
 
                 # Backwards-compatible failed-entry guard. It can only make the
-                # exit stricter/earlier; it cannot disable the -0.10R fast exit.
+                # exit stricter/earlier; it cannot disable the fast wrong-way exit.
                 if (not adverse_exit and CONFIG.get("early_adverse_exit_enabled", True)
                         and not t.get("proven_trade")):
                     adverse_r = abs(float(CONFIG.get("early_adverse_exit_r", 0.30)))
@@ -3261,48 +3409,25 @@ class TradeManager:
                 else:
                     hit_sl = px >= t["sl"]; hit_tp = px <= t["tp"] or fast_target_hit
                 if hit_tp or hit_sl or adverse_exit:
-                    pnl = t["unrealised_pnl"]
                     lbl = "EARLY_EXIT" if adverse_exit and not hit_sl and not hit_tp else ("TP" if hit_tp else "SL")
                     if fast_target_hit and not hit_sl:
                         lbl = "TP"
-                    # CRITICAL: define msg BEFORE using it below
-                    msg = (f"Trade {lbl}: {t['symbol']} | PnL=${pnl:.2f} | "
-                           f"R={r_multiple:.2f} bestR={best_r:.2f} lockedR={t.get('locked_profit_r')}")
                     # Live positions are not removed from internal state until the
-                    # exchange confirms the counter-order. PAPER positions (including
-                    # a live-entry failure that fell back to paper) never send a live
-                    # close merely because the global live toggle is enabled.
-                    close_confirmed = True
-                    if t.get("execution_mode") == "LIVE":
-                        close_confirmed = False
-                        m = (t.get("market") or CONFIG.get("market_mode") or "CRYPTO").upper()
-                        live_acc = CONFIG.get("live_accounts", {}).get(m, {})
-                        if not (CONFIG.get("live_trading_enabled") and live_acc.get("api_key") and live_acc.get("api_secret")):
-                            t["execution_error"] = "Live close required but live account/credentials unavailable"
-                            _elog(f"Live close blocked {t['symbol']}: {t['execution_error']} — keeping trade OPEN internally", "ERROR")
-                        else:
-                            close_side = "SELL" if t["side"] == "BUY" else "BUY"
-                            try:
-                                live_result = execute_live_order(t["symbol"], close_side, t["size"], market=m)
-                                if live_result.get("ok"):
-                                    close_confirmed = True
-                                    t["exchange_close_id"] = (live_result.get("order") or {}).get("id", "")
-                                    live_acc["balance"] = live_result.get("balance", live_acc.get("balance", 0))
-                                    msg += " | LIVE close confirmed"
-                                else:
-                                    t["execution_error"] = live_result.get("error", "unknown live close error")
-                                    _elog(f"Live close failed {t['symbol']}: {t['execution_error']} — keeping trade OPEN internally", "ERROR")
-                            except Exception as exc:
-                                t["execution_error"] = str(exc)
-                                _elog(f"Live close exception {t['symbol']}: {exc} — keeping trade OPEN internally", "ERROR")
+                    # exchange confirms the reduce-only close (or reports the position
+                    # already flat). PAPER positions — including a live-entry failure
+                    # that fell back to paper — never send a live close.
+                    close_confirmed, fill_px, close_note = self._live_close(t, lbl)
                     if not close_confirmed:
                         # Do not create a phantom closed trade when the exchange
                         # still has the real position open. Retry next fast cycle.
                         continue
-
+                    close_px = fill_px if fill_px else px
+                    pnl = ((close_px - t["entry"]) if t["side"] == "BUY" else (t["entry"] - close_px)) * t["size"]
+                    msg = (f"Trade {lbl}: {t['symbol']} | PnL=${pnl:.2f} | "
+                           f"R={r_multiple:.2f} bestR={best_r:.2f} lockedR={t.get('locked_profit_r')}{close_note}")
                     t.update({"pnl":pnl,"status":lbl,
                                "close_time":datetime.utcnow().isoformat(),
-                               "close_price":px,"unrealised_pnl":0.0,
+                               "close_price":close_px,"unrealised_pnl":0.0,
                                "close_reason": ("FAST_WRONG_WAY_EXIT" if lbl == "EARLY_EXIT" else
                                                 ("FAST_TARGET" if fast_target_hit and not hit_sl else ("TP" if hit_tp else "SL")))})
                     self.balance += pnl
@@ -3926,7 +4051,7 @@ class TradingBot:
         #  1) Full scan (self.scan_interval_seconds, below) — looks for new
         #     entries AND re-checks every open position's signal on its own
         #     timeframe (self.tf), closing it early if it's no longer valid.
-        #  2) Fast position-risk check (monitor_every) — SL/TP, -0.10R wrong-way
+        #  2) Fast position-risk check (monitor_every) — SL/TP, -0.30R wrong-way
         #     invalidation, progressive profit locks and trailing; runs more often than the full scan for capital
         #     protection, independent of both the scan interval and the
         #     trade timeframe.
@@ -4108,8 +4233,8 @@ def api_predictions():
         {"key":"ema_bullish",    "label":"EMA21 > EMA50 Uptrend",        "pts":15, "dir":"buy"},
         {"key":"ema_bearish",    "label":"EMA21 < EMA50 Downtrend",      "pts":15, "dir":"sell"},
         {"key":"vol_surge",      "label":"Volume Surge Confirmation",    "pts":10, "dir":"both"},
-        {"key":"momentum_pos",   "label":"Positive Momentum 2-bar",      "pts":10, "dir":"buy"},
-        {"key":"momentum_neg",   "label":"Negative Momentum 3-bar",      "pts":10, "dir":"sell"},
+        {"key":"momentum_pos",   "label":"Positive Momentum (3-bar trigger, 5-bar confirms)",      "pts":10, "dir":"buy"},
+        {"key":"momentum_neg",   "label":"Negative Momentum (3-bar trigger, 5-bar confirms)",      "pts":10, "dir":"sell"},
         {"key":"rsi24_bullish",  "label":f"RSI({ta.confirm}) Confirms Bullish Bias", "pts":10, "dir":"buy"},
         {"key":"rsi24_bearish",  "label":f"RSI({ta.confirm}) Confirms Bearish Bias", "pts":10, "dir":"sell"},
     ]
@@ -4163,8 +4288,10 @@ def api_predictions():
                 rsi_confirm = sf(last.get(f"rsi_{ta.confirm}"))
                 ema_trend = int(last.get("ema_trend", -1))
                 vs        = bool(last.get("vol_surge", False))
-                mom5      = sf(last.get("mom5"))
+                mom3      = sf(last.get("mom3"))   # fast trigger — the value signal() actually uses
+                mom5      = sf(last.get("mom5"))   # slower direction confirmation
                 atr       = sf(last.get("atr")) or (px * sl_floor)
+                _mg_trig, _mg_pb, _mg_atr = _momentum_gates(px, atr)
                 last_sh   = sf(last.get("last_sh"))
                 last_sl_s = sf(last.get("last_sl"))
                 thr       = CONFIG["rsi_signal_threshold"]
@@ -4183,8 +4310,8 @@ def api_predictions():
                     "ema_bullish"   : ema_trend == 1,
                     "ema_bearish"   : ema_trend != 1,
                     "vol_surge"     : vs,
-                    "momentum_pos"  : bool(mom5 and mom5 > 0.5),
-                    "momentum_neg"  : bool(mom5 and mom5 < -0.5),
+                    "momentum_pos"  : bool(mom3 is not None and mom3 > _mg_pb),
+                    "momentum_neg"  : bool(mom3 is not None and mom3 < -_mg_pb),
                     # Must match signal()'s >52/<48 thresholds exactly (not
                     # >50/<50) — a value sitting right at the midline shouldn't
                     # flip which side gets the point on tiny noise, same
@@ -4359,7 +4486,9 @@ def api_predictions():
                     "rsi_confirm_period": ta.confirm,
                     "ema_trend"        : "Bullish" if ema_trend == 1 else "Bearish",
                     "vol_surge"        : vs,
-                    "momentum"         : round(mom5, 2) if mom5 else None,
+                    "momentum"         : round(mom3, 2) if mom3 is not None else None,
+                    "momentum_3bar"    : round(mom3, 2) if mom3 is not None else None,
+                    "momentum_5bar"    : round(mom5, 2) if mom5 is not None else None,
                     "atr_pct"          : round(float(last.get("atr_pct",0) or 0)*100, 2),
                     "pattern"          : pattern,
                     "last_sh"          : round(last_sh, 4) if last_sh else None,
@@ -4800,8 +4929,10 @@ def api_analysis():
                 ema_200   = sf(last.get("ema_200"))
                 atr       = sf(last.get("atr"))
                 atr_pct   = sf(last.get("atr_pct"))
+                _mg_trig, _mg_pb, _mg_atr = _momentum_gates(px, atr)
                 vol_surge = bool(last.get("vol_surge", False))
-                mom5      = sf(last.get("mom5"))
+                mom3      = sf(last.get("mom3"))   # fast trigger — the value signal() actually uses
+                mom5      = sf(last.get("mom5"))   # slower direction confirmation
                 last_sh   = sf(last.get("last_sh"))
                 last_sl   = sf(last.get("last_sl"))
                 obv_now   = sf(last.get("obv"))
@@ -4829,7 +4960,7 @@ def api_analysis():
                 score_breakdown["ema_bullish"] = 15 if last.get("ema_trend", -1) == 1 else 0
                 score_breakdown["ema_bearish"] = 15 if last.get("ema_trend", -1) == -1 else 0
                 score_breakdown["vol_surge"] = 10 if vol_surge else 0
-                score_breakdown["momentum"] = 10 if (mom5 is not None and abs(mom5) > 0.5) else 0
+                score_breakdown["momentum"] = 10 if (mom3 is not None and abs(mom3) > _mg_pb) else 0
                 score_breakdown["rsi24_bullish"] = 10 if (rsi_confirm is not None and rsi_confirm > 52) else 0
                 score_breakdown["rsi24_bearish"] = 10 if (rsi_confirm is not None and rsi_confirm < 48) else 0
 
@@ -4893,7 +5024,9 @@ def api_analysis():
                     "atr"          : round(atr, 4) if atr else None,
                     "atr_pct"      : round(atr_pct * 100, 2) if atr_pct else None,
                     "vol_surge"    : vol_surge,
-                    "momentum"     : round(mom5, 2) if mom5 else None,
+                    "momentum"     : round(mom3, 2) if mom3 is not None else None,
+                    "momentum_3bar": round(mom3, 2) if mom3 is not None else None,
+                    "momentum_5bar": round(mom5, 2) if mom5 is not None else None,
                     "obv_trend"    : obv_trending,
                     "last_sh"      : round(last_sh, 4) if last_sh else None,
                     "last_sl"      : round(last_sl, 4) if last_sl else None,
@@ -5011,6 +5144,8 @@ def api_config():
                "take_profit_pct","min_confidence_to_trade",
                "trend_continuation_enabled","trend_continuation_min_confidence",
                "trend_continuation_min_efficiency_ratio","trend_continuation_min_momentum_pct",
+               "momentum_gate_mode","momentum_trigger_atr_mult","momentum_pullback_atr_mult",
+               "momentum_gate_floor_pct","momentum_pullback_threshold_pct",
                "trend_continuation_max_extension_atr","trend_continuation_min_rsi_fast",
                "trend_continuation_max_rsi_fast",
                "max_risk_per_trade","max_open_trades","account_balance",
@@ -5041,6 +5176,10 @@ def api_config():
         "trend_continuation_min_confidence": (70, 99, "70 – 99"),
         "trend_continuation_min_efficiency_ratio": (0.05, 1.0, "0.05 – 1.0"),
         "trend_continuation_min_momentum_pct": (0.05, 10.0, "0.05% – 10%"),
+        "momentum_trigger_atr_mult":  (0.25, 4.0, "0.25 – 4.0 ATR"),
+        "momentum_pullback_atr_mult": (0.25, 6.0, "0.25 – 6.0 ATR"),
+        "momentum_gate_floor_pct":    (0.01, 1.0,  "0.01% – 1%"),
+        "momentum_pullback_threshold_pct": (0.05, 10.0, "0.05% – 10%"),
         "trend_continuation_max_extension_atr": (0.25, 5.0, "0.25 – 5 ATR"),
         "trend_continuation_min_rsi_fast": (40.0, 65.0, "40 – 65"),
         "trend_continuation_max_rsi_fast": (60.0, 90.0, "60 – 90"),
@@ -5071,6 +5210,8 @@ def api_config():
         "futures_leverage":          (1, 50, "1 – 50x"),
     }
     errors = []
+    if "momentum_gate_mode" in data and str(data["momentum_gate_mode"]).lower() not in ("atr", "pct"):
+        errors.append("momentum_gate_mode: must be \"atr\" or \"pct\"")
     for k, (lo, hi, hint) in NUMERIC_BOUNDS.items():
         if k in data:
             try:
@@ -5158,6 +5299,9 @@ def api_close_trade(trade_id):
     if not _TM:
         return jsonify({"ok":False,"error":"No trade manager"}), 400
     t = _TM.force_close(trade_id, _PRICE_CACHE)
+    if t and t.get("_close_failed"):
+        return jsonify({"ok":False,"error":"Exchange close failed — trade left OPEN: "
+                        + str(t.get("error", "unknown"))}), 502
     if t:
         return jsonify({"ok":True,"trade":_clean_trade(t)})
     return jsonify({"ok":False,"error":"Trade not found"}), 404
@@ -5692,4 +5836,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
