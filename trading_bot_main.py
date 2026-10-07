@@ -1,4 +1,4 @@
-"""
+"""""
 =============================================================
   AI TRADING BOT  — Crypto & Stock Market
   RSI(6-12) + Market Swing + Tight SL/TP + Claude AI
@@ -133,11 +133,11 @@ CONFIG = {
     "account_balance"        : 10000.0,
     "anthropic_api_key"      : os.environ.get("ANTHROPIC_API_KEY", ""),
     "ai_model"               : "claude-sonnet-4-6",
-    "ai_confirmation_required": True,
+    "ai_confirmation_required": False,
     "scan_interval_seconds"  : 30,
     "max_execution_slippage_pct": 0.003,  # 0.3% — refuse to execute if price moved more than this since signal detection
     "signal_exit_confirmations": 2,  # consecutive scans required before closing a trade on confidence/direction loss (SL/TP unaffected — always instant)
-    "hold_requires_entry_confidence": False, # entry probability is NOT a hold condition; open trades use trend structure
+    "hold_requires_entry_confidence": True, # entry probability is NOT a hold condition; open trades use trend structure
     "trend_hold_min_score"      : 60,    # directional structure required to keep an un-locked trade alive
     "probability_prior_strength": 4,     # neutral Beta(2,2) prior; raw indicator score NEVER becomes a fake probability prior
     "probability_bucket_width" : 5,     # completed trades within +/- this raw-score range calibrate probability
@@ -145,7 +145,7 @@ CONFIG = {
     "provisional_probability_cap": 84,  # uncalibrated setups can never masquerade as an 85-99% win-probability trade
     "reentry_reset_required"   : True,  # losing autonomous setup cannot recycle until its setup fingerprint changes
     "early_adverse_exit_enabled": True, # fast monitor cuts entries that fail immediately instead of donating the entire 1R stop
-    "early_adverse_exit_r"     : 0.10,  # fast hard invalidation: cut at -0.10R instead of waiting for two full scans
+    "early_adverse_exit_r"     : 0.30,  # noise-tolerant fast invalidation: cut at -0.30R before the full 1R stop
     "early_adverse_min_favorable_r": 0.25, # +0.25R marks a proven trade and hands management to the profit-lock ladder
     "early_adverse_grace_seconds": 15, # allow execution noise/spread to settle before adverse-entry invalidation
     "progressive_profit_lock_enabled": True,
@@ -153,7 +153,7 @@ CONFIG = {
     "progressive_profit_lock_ladder": [(0.25, 0.02), (0.35, 0.05), (0.50, 0.15), (0.80, 0.35), (1.00, 0.50)],
     "proven_trade_r": 0.25,
     "fast_wrong_way_exit_enabled": True,
-    "fast_wrong_way_exit_r": 0.10,
+    "fast_wrong_way_exit_r": 0.15,
     # Ride-winners mechanism: lets a trade that's genuinely working keep
     # running toward its take-profit target instead of getting cut short
     # by the same strict confidence checks that (correctly) protect a
@@ -163,7 +163,7 @@ CONFIG = {
     "profit_lock_r_multiple"    : 1.0,    # legacy fallback; progressive ladder now starts protecting from +0.25R
     "relax_exit_after_profit_lock": True, # once breakeven-locked, only a genuine signal reversal can trigger an exit — not routine confidence wobble
     "trailing_stop_enabled"     : True,   # keep trailing the stop behind price once profit-locked and still running
-    "trailing_stop_activation_r": 1.5,    # start trailing once profit reaches this many R
+    "trailing_stop_activation_r": 0.25,   # begin evaluating the dynamic trail as soon as the trade proves itself at +0.25R
     "trailing_stop_distance_r"  : 0.75,   # trail this many R behind the best price seen
     # Chop filter: refuses NEW entries when the market hasn't been moving
     # efficiently (lots of back-and-forth, little net progress) — see the
@@ -3185,7 +3185,7 @@ class TradeManager:
                 # exit stricter/earlier; it cannot disable the -0.10R fast exit.
                 if (not adverse_exit and CONFIG.get("early_adverse_exit_enabled", True)
                         and not t.get("proven_trade")):
-                    adverse_r = abs(float(CONFIG.get("early_adverse_exit_r", 0.10)))
+                    adverse_r = abs(float(CONFIG.get("early_adverse_exit_r", 0.30)))
                     adverse_exit = (age >= float(CONFIG.get("early_adverse_grace_seconds", 15))
                                     and r_multiple <= -adverse_r)
 
@@ -5692,3 +5692,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
