@@ -145,16 +145,22 @@ CONFIG = {
     "provisional_probability_cap": 84,  # uncalibrated setups can never masquerade as an 85-99% win-probability trade
     "reentry_reset_required"   : True,  # losing autonomous setup cannot recycle until its setup fingerprint changes
     "early_adverse_exit_enabled": True, # fast monitor cuts entries that fail immediately instead of donating the entire 1R stop
-    "early_adverse_exit_r"     : 0.55,  # cut near -0.55R if the trade has never shown meaningful favorable progress
-    "early_adverse_min_favorable_r": 0.20, # once trade has first achieved +0.20R, ordinary SL/structure management resumes
+    "early_adverse_exit_r"     : 0.10,  # fast hard invalidation: cut at -0.10R instead of waiting for two full scans
+    "early_adverse_min_favorable_r": 0.25, # +0.25R marks a proven trade and hands management to the profit-lock ladder
     "early_adverse_grace_seconds": 15, # allow execution noise/spread to settle before adverse-entry invalidation
+    "progressive_profit_lock_enabled": True,
+    # (best-R trigger, minimum locked-R). Uses BEST favorable excursion, so protection never resets on retracement.
+    "progressive_profit_lock_ladder": [(0.25, 0.02), (0.35, 0.05), (0.50, 0.15), (0.80, 0.35), (1.00, 0.50)],
+    "proven_trade_r": 0.25,
+    "fast_wrong_way_exit_enabled": True,
+    "fast_wrong_way_exit_r": 0.10,
     # Ride-winners mechanism: lets a trade that's genuinely working keep
     # running toward its take-profit target instead of getting cut short
     # by the same strict confidence checks that (correctly) protect a
     # fresh, unproven trade. See TradeManager.check_exits() and the
     # confidence re-check in scan_once().
     "profit_lock_enabled"       : True,   # move SL to breakeven once a trade earns profit_lock_r_multiple of its own risk
-    "profit_lock_r_multiple"    : 1.0,    # e.g. 1.0 = once up by as much as it originally risked (1R)
+    "profit_lock_r_multiple"    : 1.0,    # legacy fallback; progressive ladder now starts protecting from +0.25R
     "relax_exit_after_profit_lock": True, # once breakeven-locked, only a genuine signal reversal can trigger an exit — not routine confidence wobble
     "trailing_stop_enabled"     : True,   # keep trailing the stop behind price once profit-locked and still running
     "trailing_stop_activation_r": 1.5,    # start trailing once profit reaches this many R
@@ -2161,6 +2167,9 @@ class TechnicalAnalysis:
         return df
 
     def _mom(self, df):
+        # 3-bar momentum is the fast continuation trigger; 5-bar remains the
+        # slower confirmation so quicker entries do not become single-burst chasing.
+        df["mom3"]  = df["close"].pct_change(3)  * 100
         df["mom5"]  = df["close"].pct_change(5)  * 100
         df["mom10"] = df["close"].pct_change(10) * 100
         return df
@@ -2176,7 +2185,11 @@ class TechnicalAnalysis:
         rd  = float(last["rsi_div"]); rpd = float(prev["rsi_div"])
         et  = int(last["ema_trend"])
         vs  = bool(last["vol_surge"])
-        mom = float(last["mom5"])
+        mom3 = float(last["mom3"])
+        mom5 = float(last["mom5"])
+        # Keep `mom` as the fast directional trigger throughout signal management.
+        # mom5 is retained below as the slower trend confirmation.
+        mom = mom3
         atr = float(last["atr"])
         sh  = float(last["last_sh"]) if not np.isnan(last["last_sh"]) else px
         sl  = float(last["last_sl"]) if not np.isnan(last["last_sl"]) else px
@@ -2380,7 +2393,9 @@ class TechnicalAnalysis:
             # of confidence.  Volume is only a small confirmation bonus.
             er_quality = max(0.0, min(1.0, efficiency_ratio / max(min_er * 2.0, 0.60)))
             sep_quality = max(0.0, min(1.0, trend_strength))
-            mom_quality = max(0.0, min(1.0, abs(mom) / max(min_mom * 3.0, 0.75)))
+            fast_mom_quality = max(0.0, min(1.0, abs(mom3) / max(min_mom * 2.0, 0.50)))
+            slow_mom_quality = max(0.0, min(1.0, abs(mom5) / max(min_mom * 3.0, 0.75)))
+            mom_quality = (0.70 * fast_mom_quality) + (0.30 * slow_mom_quality)
             extension_quality = max(0.0, min(1.0, 1.0 - max(0.0, extension_atr - 0.35) / max(max_ext - 0.35, 0.25)))
 
             # BUY continuation: 100-point quality model.
@@ -2396,9 +2411,9 @@ class TechnicalAnalysis:
             if buy_rsi_directional:
                 continuation_buy += 8
                 continuation_buy_reasons.append(f"RSI6>RSI12 ({rf:.1f}>{rs:.1f})")
-            if mom > 0:
+            if mom3 > 0 and mom5 >= 0:
                 continuation_buy += 12 * mom_quality
-                continuation_buy_reasons.append(f"Positive momentum +{mom:.2f}%")
+                continuation_buy_reasons.append(f"Momentum trigger/confirm +{mom3:.2f}% (3-bar), +{mom5:.2f}% (5-bar)")
             if efficiency_ratio >= min_er:
                 continuation_buy += 12 * er_quality
                 continuation_buy_reasons.append(f"Efficient directional movement ER={efficiency_ratio:.2f}")
@@ -2431,9 +2446,9 @@ class TechnicalAnalysis:
             if sell_rsi_directional:
                 continuation_sell += 8
                 continuation_sell_reasons.append(f"RSI6<RSI12 ({rf:.1f}<{rs:.1f})")
-            if mom < 0:
+            if mom3 < 0 and mom5 <= 0:
                 continuation_sell += 12 * mom_quality
-                continuation_sell_reasons.append(f"Negative momentum {mom:.2f}%")
+                continuation_sell_reasons.append(f"Momentum trigger/confirm {mom3:.2f}% (3-bar), {mom5:.2f}% (5-bar)")
             if efficiency_ratio >= min_er:
                 continuation_sell += 12 * er_quality
                 continuation_sell_reasons.append(f"Efficient directional movement ER={efficiency_ratio:.2f}")
@@ -2479,7 +2494,7 @@ class TechnicalAnalysis:
                 and continuation_buy > continuation_sell
                 and efficiency_ratio >= min_er
                 and rf >= min_rsi and rf <= max_rsi + 2.0
-                and mom > min_mom
+                and mom3 > min_mom and mom5 >= 0
                 and px > ema21
                 and ema21_slope_up
                 and extension_atr <= max_ext
@@ -2491,7 +2506,7 @@ class TechnicalAnalysis:
                 and continuation_sell > continuation_buy
                 and efficiency_ratio >= min_er
                 and rf <= (100.0 - min_rsi) and rf >= (100.0 - max_rsi) - 2.0
-                and mom < -min_mom
+                and mom3 < -min_mom and mom5 <= 0
                 and px < ema21
                 and ema21_slope_down
                 and extension_atr <= max_ext
@@ -2943,6 +2958,10 @@ class TradeManager:
                 "initial_risk" : abs(px - sig["sl"]),
                 "best_price"   : px,
                 "best_r_multiple": 0.0,
+                "current_r_multiple": 0.0,
+                "proven_trade": False,
+                "profit_lock_stage_r": 0.0,
+                "locked_profit_r": None,
                 "opened_monotonic": time.monotonic(),
                 "trade_mode"   : sig.get("trade_mode", "RIDE"),
                 "rr_target"    : float(sig.get("rr_target", CONFIG.get("confirmed_trade_min_rr", 4.0))),
@@ -3146,56 +3165,79 @@ class TradeManager:
                     r_multiple = (t["entry"] - px) / initial_risk
                     t["best_price"] = min(t.get("best_price", t["entry"]), px)
 
+                t["current_r_multiple"] = float(r_multiple)
                 t["best_r_multiple"] = max(float(t.get("best_r_multiple", 0.0) or 0.0), float(r_multiple))
+                best_r = float(t.get("best_r_multiple", 0.0) or 0.0)
+                age = max(0.0, time.monotonic() - float(t.get("opened_monotonic", time.monotonic())))
 
-                # ── Fast failed-entry invalidation ───────────────────────
-                # The full strategy scan may only run every ~60s, while price
-                # monitoring runs much faster. If a fresh entry immediately
-                # travels > half of its initial risk against us without first
-                # proving itself with meaningful favorable excursion, the entry
-                # thesis failed in real time. Cut it before the full 1R SL.
+                # ── Fast wrong-way invalidation ──────────────────────────
+                # This runs on the fast price-monitor cadence and NEVER waits for
+                # signal_exit_confirmations.  Before a trade proves itself, a
+                # -0.10R move against entry is enough to invalidate it quickly.
                 adverse_exit = False
-                if (CONFIG.get("early_adverse_exit_enabled", True)
-                        and not t.get("profit_locked")):
-                    age = max(0.0, time.monotonic() - float(t.get("opened_monotonic", time.monotonic())))
-                    adverse_r = abs(float(CONFIG.get("early_adverse_exit_r", 0.55)))
-                    favorable_needed = float(CONFIG.get("early_adverse_min_favorable_r", 0.20))
-                    adverse_exit = (age >= float(CONFIG.get("early_adverse_grace_seconds", 15))
-                                    and r_multiple <= -adverse_r
-                                    and float(t.get("best_r_multiple", 0.0) or 0.0) < favorable_needed)
+                if (CONFIG.get("fast_wrong_way_exit_enabled", True)
+                        and not t.get("proven_trade")
+                        and age >= float(CONFIG.get("early_adverse_grace_seconds", 15))):
+                    adverse_r = abs(float(CONFIG.get("fast_wrong_way_exit_r", 0.10)))
+                    adverse_exit = r_multiple <= -adverse_r
 
-                # ── Ride-winners mechanism, part 1: breakeven lock ──
-                # Once a trade has moved in its favor by profit_lock_r_multiple
-                # (default 1R — i.e. it's now up by as much as it originally
-                # risked), move the stop to breakeven. This is what lets the
-                # confidence re-check (in scan_once) safely stop treating
-                # routine indicator wobble as exit-worthy from this point on
-                # — the trade is now structurally incapable of becoming a
-                # loss, so there's nothing left to protect against by
-                # cutting it early on a soft signal.
-                if (CONFIG["profit_lock_enabled"] and not t.get("profit_locked")
-                        and r_multiple >= CONFIG["profit_lock_r_multiple"]):
+                # Backwards-compatible failed-entry guard. It can only make the
+                # exit stricter/earlier; it cannot disable the -0.10R fast exit.
+                if (not adverse_exit and CONFIG.get("early_adverse_exit_enabled", True)
+                        and not t.get("proven_trade")):
+                    adverse_r = abs(float(CONFIG.get("early_adverse_exit_r", 0.10)))
+                    adverse_exit = (age >= float(CONFIG.get("early_adverse_grace_seconds", 15))
+                                    and r_multiple <= -adverse_r)
+
+                # ── Progressive profit preservation (+0.25R → +1.5R) ───
+                # Protection is keyed to BEST R, not current R. Once a stage is
+                # earned it can never be lost on retracement. At +1.5R the normal
+                # dynamic trailing stop takes over.
+                proven_r = float(CONFIG.get("proven_trade_r", 0.25))
+                if best_r >= proven_r:
+                    t["proven_trade"] = True
+
+                if CONFIG.get("progressive_profit_lock_enabled", True):
+                    ladder = CONFIG.get("progressive_profit_lock_ladder", []) or []
+                    earned_trigger = float(t.get("profit_lock_stage_r", 0.0) or 0.0)
+                    for trigger_r, lock_r in sorted(ladder, key=lambda x: float(x[0])):
+                        trigger_r = float(trigger_r); lock_r = float(lock_r)
+                        if best_r < trigger_r or trigger_r <= earned_trigger:
+                            continue
+                        if t["side"] == "BUY":
+                            candidate_sl = t["entry"] + (initial_risk * lock_r)
+                            improves = candidate_sl > t["sl"]
+                        else:
+                            candidate_sl = t["entry"] - (initial_risk * lock_r)
+                            improves = candidate_sl < t["sl"]
+                        if improves:
+                            old_sl = t["sl"]
+                            t["sl"] = round(candidate_sl, 6)
+                            t["profit_locked"] = True
+                            t["locked_profit_r"] = lock_r
+                            _elog(f"🔒 {t['symbol']}: progressive profit lock +{trigger_r:.2f}R earned — "
+                                  f"SL ${old_sl:.4f} → ${t['sl']:.4f}, protecting +{lock_r:.2f}R "
+                                  f"(best={best_r:.2f}R, current={r_multiple:.2f}R)", "INFO")
+                        t["profit_lock_stage_r"] = max(float(t.get("profit_lock_stage_r", 0.0) or 0.0), trigger_r)
+                        earned_trigger = trigger_r
+
+                # Legacy 1R breakeven fallback for configurations that disable
+                # the progressive ladder.
+                if (CONFIG.get("profit_lock_enabled", True)
+                        and not CONFIG.get("progressive_profit_lock_enabled", True)
+                        and not t.get("profit_locked")
+                        and best_r >= float(CONFIG.get("profit_lock_r_multiple", 1.0))):
                     new_sl = t["entry"]
-                    improves = (t["side"]=="BUY" and new_sl > t["sl"]) or (t["side"]=="SELL" and new_sl < t["sl"])
+                    improves = (t["side"] == "BUY" and new_sl > t["sl"]) or (t["side"] == "SELL" and new_sl < t["sl"])
                     if improves:
-                        old_sl = t["sl"]
                         t["sl"] = round(new_sl, 6)
                         t["profit_locked"] = True
-                        _elog(f"🔒 {t['symbol']}: breakeven lock — SL ${old_sl:.4f} → ${t['sl']:.4f} "
-                              f"after reaching {r_multiple:.2f}R profit ({CONFIG['profit_lock_r_multiple']}R trigger). "
-                              f"Confidence-based early exit is now relaxed for this trade — only a full signal "
-                              f"reversal, TP, or this stop can close it from here.", "INFO")
 
-                # ── Ride-winners mechanism, part 2: trail the stop ──
-                # Beyond profit-lock, once favorable movement reaches
-                # trailing_stop_activation_r, keep the stop
-                # trailing_stop_distance_r behind the best price seen —
-                # this locks in progressively more of the move while still
-                # leaving real room for price to reach TP, rather than an
-                # all-or-nothing breakeven-or-target outcome.
-                if (CONFIG["trailing_stop_enabled"] and t.get("profit_locked")
-                        and r_multiple >= CONFIG["trailing_stop_activation_r"]):
-                    trail_dist = CONFIG["trailing_stop_distance_r"] * initial_risk
+                # At +1.5R, dynamic trailing takes over. Trigger from BEST R so a
+                # fast retracement cannot deactivate trailing after it was earned.
+                if (CONFIG.get("trailing_stop_enabled", True) and t.get("profit_locked")
+                        and best_r >= float(CONFIG.get("trailing_stop_activation_r", 1.5))):
+                    trail_dist = float(CONFIG.get("trailing_stop_distance_r", 0.75)) * initial_risk
                     if t["side"] == "BUY":
                         trail_sl = round(t["best_price"] - trail_dist, 6)
                         if trail_sl > t["sl"]:
@@ -3224,30 +3266,45 @@ class TradeManager:
                     if fast_target_hit and not hit_sl:
                         lbl = "TP"
                     # CRITICAL: define msg BEFORE using it below
-                    msg = f"Trade {lbl}: {t['symbol']} | PnL=${pnl:.2f}"
-                    t.update({"pnl":pnl,"status":lbl,
-                               "close_time":datetime.utcnow().isoformat(),
-                               "close_price":px,"unrealised_pnl":0.0,
-                               "close_reason": ("EARLY_ADVERSE_INVALIDATION" if lbl == "EARLY_EXIT" else
-                                                ("FAST_TARGET" if fast_target_hit and not hit_sl else ("TP" if hit_tp else "SL")))})
-                    # Place live counter-order on exchange when running live
-                    if not CONFIG.get("paper_trading", True) and CONFIG.get("live_trading_enabled"):
+                    msg = (f"Trade {lbl}: {t['symbol']} | PnL=${pnl:.2f} | "
+                           f"R={r_multiple:.2f} bestR={best_r:.2f} lockedR={t.get('locked_profit_r')}")
+                    # Live positions are not removed from internal state until the
+                    # exchange confirms the counter-order. PAPER positions (including
+                    # a live-entry failure that fell back to paper) never send a live
+                    # close merely because the global live toggle is enabled.
+                    close_confirmed = True
+                    if t.get("execution_mode") == "LIVE":
+                        close_confirmed = False
                         m = (t.get("market") or CONFIG.get("market_mode") or "CRYPTO").upper()
                         live_acc = CONFIG.get("live_accounts", {}).get(m, {})
-                        if live_acc.get("api_key") and live_acc.get("api_secret"):
+                        if not (CONFIG.get("live_trading_enabled") and live_acc.get("api_key") and live_acc.get("api_secret")):
+                            t["execution_error"] = "Live close required but live account/credentials unavailable"
+                            _elog(f"Live close blocked {t['symbol']}: {t['execution_error']} — keeping trade OPEN internally", "ERROR")
+                        else:
                             close_side = "SELL" if t["side"] == "BUY" else "BUY"
                             try:
                                 live_result = execute_live_order(t["symbol"], close_side, t["size"], market=m)
                                 if live_result.get("ok"):
-                                    t["execution_mode"]    = "LIVE"
-                                    t["exchange_close_id"] = (live_result.get("order") or {}).get("id","")
-                                    live_acc["balance"]    = live_result.get("balance", live_acc.get("balance",0))
-                                    msg += f" | LIVE order placed"
+                                    close_confirmed = True
+                                    t["exchange_close_id"] = (live_result.get("order") or {}).get("id", "")
+                                    live_acc["balance"] = live_result.get("balance", live_acc.get("balance", 0))
+                                    msg += " | LIVE close confirmed"
                                 else:
-                                    t["execution_error"] = live_result.get("error","")
-                                    _elog(f"Live close failed {t['symbol']}: {t['execution_error']}", "ERROR")
+                                    t["execution_error"] = live_result.get("error", "unknown live close error")
+                                    _elog(f"Live close failed {t['symbol']}: {t['execution_error']} — keeping trade OPEN internally", "ERROR")
                             except Exception as exc:
-                                _elog(f"Live close exception {t['symbol']}: {exc}", "ERROR")
+                                t["execution_error"] = str(exc)
+                                _elog(f"Live close exception {t['symbol']}: {exc} — keeping trade OPEN internally", "ERROR")
+                    if not close_confirmed:
+                        # Do not create a phantom closed trade when the exchange
+                        # still has the real position open. Retry next fast cycle.
+                        continue
+
+                    t.update({"pnl":pnl,"status":lbl,
+                               "close_time":datetime.utcnow().isoformat(),
+                               "close_price":px,"unrealised_pnl":0.0,
+                               "close_reason": ("FAST_WRONG_WAY_EXIT" if lbl == "EARLY_EXIT" else
+                                                ("FAST_TARGET" if fast_target_hit and not hit_sl else ("TP" if hit_tp else "SL")))})
                     self.balance += pnl
                     self.open_trades.remove(t)
                     self._remember_failed_setup(t)
@@ -3869,8 +3926,8 @@ class TradingBot:
         #  1) Full scan (self.scan_interval_seconds, below) — looks for new
         #     entries AND re-checks every open position's signal on its own
         #     timeframe (self.tf), closing it early if it's no longer valid.
-        #  2) Fast SL/TP price check (monitor_every) — pure stop/target hit
-        #     detection, runs more often than the full scan for capital
+        #  2) Fast position-risk check (monitor_every) — SL/TP, -0.10R wrong-way
+        #     invalidation, progressive profit locks and trailing; runs more often than the full scan for capital
         #     protection, independent of both the scan interval and the
         #     trade timeframe.
         monitor_every = min(30, max(5, self.scan_interval_seconds // 6))
