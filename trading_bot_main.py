@@ -2593,22 +2593,36 @@ class TechnicalAnalysis:
                 continuation_sell += 4
                 continuation_sell_reasons.append("Volume confirms continuation")
 
-            # Exhaustion is an entry-quality penalty, not a denial that the
-            # underlying trend exists.  This prevents a very strong but already
-            # stretched move from receiving 95 merely because every trend
-            # indicator points the same way.
+            # Exhaustion is a GRADUAL entry-quality penalty, not a denial that
+            # the trend exists.  Start penalising BEFORE the hard RSI/extension
+            # boundary so an already-spent move cannot stay at 80-95 merely
+            # because direction/persistence are strong. Healthy early trends
+            # (roughly RSI6 32-68 and <=1 ATR from EMA21) keep their full score.
             buy_exhaustion = 0.0
             sell_exhaustion = 0.0
-            if rf > max_rsi:
-                buy_exhaustion += min(12.0, (rf - max_rsi) * 1.5)
-            if rf < (100.0 - max_rsi):
-                sell_exhaustion += min(12.0, ((100.0 - max_rsi) - rf) * 1.5)
-            if extension_atr > max_ext:
-                ext_penalty = min(15.0, (extension_atr - max_ext) * 10.0)
+            buy_exhaustion_start = max(60.0, max_rsi - 7.0)          # default 68
+            sell_exhaustion_start = min(40.0, 100.0 - max_rsi + 7.0) # default 32
+            if rf > buy_exhaustion_start:
+                buy_exhaustion += min(18.0, (rf - buy_exhaustion_start) * 1.8)
+            if rf < sell_exhaustion_start:
+                sell_exhaustion += min(18.0, (sell_exhaustion_start - rf) * 1.8)
+
+            # Location starts degrading beyond 1 ATR even though the hard
+            # continuation ceiling remains max_ext (default 1.5 ATR). This
+            # preserves early entries while making late/chased entries earn
+            # their threshold with genuinely stronger evidence.
+            soft_ext = min(1.0, max_ext)
+            if extension_atr > soft_ext:
+                ext_penalty = min(18.0, (extension_atr - soft_ext) * 18.0)
                 buy_exhaustion += ext_penalty
                 sell_exhaustion += ext_penalty
+
             continuation_buy = max(0.0, min(100.0, continuation_buy - buy_exhaustion))
             continuation_sell = max(0.0, min(100.0, continuation_sell - sell_exhaustion))
+            if buy_exhaustion > 0:
+                continuation_buy_reasons.append(f"Entry exhaustion/location penalty -{buy_exhaustion:.1f}")
+            if sell_exhaustion > 0:
+                continuation_sell_reasons.append(f"Entry exhaustion/location penalty -{sell_exhaustion:.1f}")
 
             # Safety gates remain hard.  The score can be high only when the
             # trend is real, but execution also requires a non-exhausted entry
@@ -2638,12 +2652,60 @@ class TechnicalAnalysis:
                 and trend_strength >= 0.50
             )
 
-        # UNIFIED ENTRY SCORING: one final directional confidence and one
-        # min_confidence_to_trade threshold for pullbacks and continuations.
-        # Strategy-specific component scores are diagnostic evidence, never
-        # independent entry thresholds. A continuation cannot contribute an
-        # entry-level score unless its directional/extension safety gates pass.
-        pullback_buy, pullback_sell = buy, sell
+        # ── Pullback entry-location protection ───────────────────────────
+        # The legacy pullback score contains useful evidence, but it must not
+        # be able to bypass continuation exhaustion protection simply by
+        # accumulating swing/cross/volume points.  A genuine pullback needs
+        # actual retracement character; otherwise it is treated as a late
+        # directional chase and progressively discounted.  This does NOT make
+        # pullbacks more valuable: continuation remains independently eligible
+        # and can win the unified score as soon as a healthy trend is confirmed.
+        raw_pullback_buy, raw_pullback_sell = float(buy), float(sell)
+        pullback_buy_penalty = 0.0
+        pullback_sell_penalty = 0.0
+
+        near_swing_low = abs(px - sl) / px < 0.012 if px else False
+        near_swing_high = abs(px - sh) / px < 0.012 if px else False
+        buy_cross = rd > thr and rpd <= thr
+        sell_cross = rd < -thr and rpd >= -thr
+        buy_pullback_character = bool(rf < CONFIG["rsi_oversold"] or near_swing_low or buy_cross)
+        sell_pullback_character = bool(rf > CONFIG["rsi_overbought"] or near_swing_high or sell_cross)
+
+        # Directional RSI exhaustion: a BUY called "pullback" while RSI is
+        # already high, or a SELL while RSI is already deeply low, is usually
+        # chase-location rather than a fresh retracement entry.
+        if rf > 65.0:
+            pullback_buy_penalty += min(22.0, (rf - 65.0) * 2.0)
+        if rf < 35.0:
+            pullback_sell_penalty += min(22.0, (35.0 - rf) * 2.0)
+
+        # Penalise poor EMA location smoothly.  The continuation path has its
+        # own stronger location model; this closes the loophole where the old
+        # pullback score could still win via max(pullback, continuation).
+        if 'extension_atr' in locals() and extension_atr > 1.0:
+            pb_ext_penalty = min(18.0, (extension_atr - 1.0) * 18.0)
+            pullback_buy_penalty += pb_ext_penalty
+            pullback_sell_penalty += pb_ext_penalty
+
+        # No actual retracement evidence = generic directional confluence, not
+        # a pullback.  Discount it rather than hard-blocking it so threshold
+        # changes (e.g. 80 vs 85) remain user-controlled.
+        if not buy_pullback_character:
+            pullback_buy_penalty += 12.0
+        if not sell_pullback_character:
+            pullback_sell_penalty += 12.0
+
+        pullback_buy = max(0.0, raw_pullback_buy - pullback_buy_penalty)
+        pullback_sell = max(0.0, raw_pullback_sell - pullback_sell_penalty)
+        if pullback_buy_penalty > 0:
+            reasons_buy.append(f"Entry location/exhaustion penalty -{pullback_buy_penalty:.1f} (pullback quality)")
+        if pullback_sell_penalty > 0:
+            reasons_sell.append(f"Entry location/exhaustion penalty -{pullback_sell_penalty:.1f} (pullback quality)")
+
+        # UNIFIED ENTRY SCORING: both setup families compete AFTER their own
+        # entry-location/exhaustion protection. Continuation is not forced to
+        # wait for a pullback, and a pullback can no longer override a warning
+        # that the move is already spent.
         eligible_cont_buy = continuation_buy if continuation_buy_ready else min(continuation_buy, min_conf - 1)
         eligible_cont_sell = continuation_sell if continuation_sell_ready else min(continuation_sell, min_conf - 1)
         buy = max(pullback_buy, eligible_cont_buy)
@@ -2695,13 +2757,19 @@ class TechnicalAnalysis:
         diagnostics = {
             "pullback_buy_score": round(pullback_buy, 1),
             "pullback_sell_score": round(pullback_sell, 1),
+            "pullback_buy_raw_score": round(raw_pullback_buy, 1),
+            "pullback_sell_raw_score": round(raw_pullback_sell, 1),
+            "pullback_buy_location_penalty": round(pullback_buy_penalty, 1),
+            "pullback_sell_location_penalty": round(pullback_sell_penalty, 1),
+            "pullback_buy_character": bool(buy_pullback_character),
+            "pullback_sell_character": bool(sell_pullback_character),
             "continuation_buy_score": round(continuation_buy, 1),
             "continuation_sell_score": round(continuation_sell, 1),
             "continuation_buy_ready": bool(continuation_buy_ready),
             "continuation_sell_ready": bool(continuation_sell_ready),
             "continuation_enabled": bool(CONFIG.get("trend_continuation_enabled", True)),
             "continuation_min_conf": float(min_conf),
-            "continuation_score_model": "direction+persistence+entry_quality-exhaustion",
+            "continuation_score_model": "direction+persistence+early_entry_location-progressive_exhaustion",
             "entry_threshold": float(min_conf),
             "unified_buy_score": round(buy, 1),
             "unified_sell_score": round(sell, 1),
