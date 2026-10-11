@@ -197,30 +197,36 @@ function symbolCard(r){
   /* Confidence fill colour */
   const confColor = meetsThresh?'#00ff88':r.confidence>=r.min_conf*0.7?'#ffd32a':'#ff4757';
 
-  /* Score breakdown */
+  /* Score diagnostics: final confidence comes from adjusted backend scores. */
   const bd=r.score_breakdown||{};
-  const bdItems=[
-    {k:'rsi_oversold',  l:`RSI<${r.rsi_fast_period||6} Oversold`, pts:20, dir:'buy'},
-    {k:'rsi_overbought',l:`RSI<${r.rsi_fast_period||6} Overbought`,pts:20, dir:'sell'},
-    {k:'rsi_cross_buy', l:'RSI Fast Cross ↑', pts:15, dir:'buy'},
-    {k:'rsi_cross_sell',l:'RSI Fast Cross ↓', pts:15, dir:'sell'},
-    {k:'swing_low',     l:'Near Swing Low',   pts:20, dir:'buy'},
-    {k:'swing_high',    l:'Near Swing High',  pts:20, dir:'sell'},
-    {k:'ema_bullish',   l:'EMA Uptrend',      pts:15, dir:'buy'},
-    {k:'ema_bearish',   l:'EMA Downtrend',    pts:15, dir:'sell'},
-    {k:'vol_surge',     l:'Volume Surge',     pts:10, dir:'both'},
-    {k:'momentum',      l:'Momentum',         pts:10, dir:'both'},
-    {k:'rsi24_bullish',l:'RSI24 Bullish',pts:10,dir:'buy'},
-    {k:'rsi24_bearish',l:'RSI24 Bearish',pts:10,dir:'sell'},
-  ].filter(x=>bd[x.k]>0||x.dir===r.signal.toLowerCase()||x.dir==='both');
-
-  const bdHtml=bdItems.slice(0,6).map(x=>{
-    const hit=bd[x.k]>0;
-    return `<div class="bd-item">
-      <span class="bd-lbl">${x.l}</span>
-      <span class="bd-pts ${hit?'bd-hit':'bd-miss'}">${hit?'+'+bd[x.k]:'—'}</span>
-    </div>`;
-  }).join('');
+  const side=(r.signal==='SELL')?'SELL':'BUY';
+  const sk=side.toLowerCase();
+  const selectedPath=(r.entry_path||'WATCH').toUpperCase();
+  const fmtScore=v=>Number.isFinite(Number(v))?Number(v).toFixed(1):'—';
+  const pullRaw=r[`pullback_${sk}_raw_score`]??r[`raw_pullback_${sk}_score`]??r[`pullback_${sk}_score_raw`];
+  const pullAdj=r[`pullback_${sk}_score`];
+  const pullLoc=r[`pullback_${sk}_location_penalty`]??r[`pullback_${sk}_entry_location_penalty`]??r[`pullback_${sk}_penalty`];
+  const pullEx=r[`pullback_${sk}_exhaustion_penalty`];
+  const contRaw=r[`continuation_${sk}_raw_score`]??r[`raw_continuation_${sk}_score`];
+  const contAdj=r[`continuation_${sk}_score`];
+  const contLoc=r[`continuation_${sk}_location_penalty`]??r[`continuation_${sk}_entry_location_penalty`];
+  const contEx=r[`continuation_${sk}_exhaustion_penalty`]??r[`${sk}_exhaustion_penalty`];
+  const rows=[];
+  const row=(label,value,penalty=false)=>{if(value==null||value==='')return;const n=Number(value);const shown=Number.isFinite(n)?n.toFixed(1):String(value);rows.push(`<div class="bd-item"><span class="bd-lbl">${escHtml(label)}</span><span class="bd-pts ${penalty?'bd-miss':'bd-hit'}">${penalty&&Number.isFinite(n)&&n>0?'-':''}${escHtml(shown)}</span></div>`)};
+  if(pullRaw!=null)row(`${side} pullback raw`,pullRaw); if(pullLoc!=null)row('Pullback location penalty',pullLoc,true); if(pullEx!=null)row('Pullback exhaustion penalty',pullEx,true); row(`${side} pullback adjusted`,pullAdj);
+  if(contRaw!=null)row(`${side} continuation raw`,contRaw); if(contLoc!=null)row('Continuation location penalty',contLoc,true); if(contEx!=null)row('Continuation exhaustion penalty',contEx,true); row(`${side} continuation adjusted`,contAdj);
+  let bdHtml=rows.join('');
+  if(!bdHtml){
+    const evidence=[
+      {k:'rsi_oversold',l:`RSI(${r.rsi_fast_period||6}) oversold`,d:'buy'},{k:'rsi_overbought',l:`RSI(${r.rsi_fast_period||6}) overbought`,d:'sell'},
+      {k:'rsi_cross_buy',l:'RSI fast cross ↑',d:'buy'},{k:'rsi_cross_sell',l:'RSI fast cross ↓',d:'sell'},
+      {k:'swing_low',l:'Near swing low',d:'buy'},{k:'swing_high',l:'Near swing high',d:'sell'},
+      {k:'ema_bullish',l:'EMA uptrend',d:'buy'},{k:'ema_bearish',l:'EMA downtrend',d:'sell'},
+      {k:'vol_surge',l:'Volume surge',d:'both'},{k:'momentum',l:'Momentum',d:'both'},
+      {k:'rsi24_bullish',l:'RSI24 bullish',d:'buy'},{k:'rsi24_bearish',l:'RSI24 bearish',d:'sell'}
+    ].filter(x=>(x.d===sk||x.d==='both')&&Number(bd[x.k])>0);
+    bdHtml=evidence.map(x=>`<div class="bd-item"><span class="bd-lbl">Raw evidence · ${x.l}</span><span class="bd-pts bd-hit">+${escHtml(String(bd[x.k]))}</span></div>`).join('');
+  }
 
   /* Indicators */
   const emaClass=r.ema_trend==='Bullish'?'ind-bull':'ind-bear';
@@ -276,10 +282,10 @@ function symbolCard(r){
     <div class="conf-track">
       <div class="conf-fill" style="width:${Math.min(r.confidence,100)}%;background:${confColor}"></div>
     </div>
-    <div class="conf-threshold">Threshold: ${r.min_conf}% · ${meetsThresh?'Signal ready (subject to execution checks)':'Waiting for entry gates'}</div>
-    <div style="font-size:12px;color:var(--m);margin:9px 0">Pullback BUY/SELL: ${r.pullback_buy_score??'—'}/${r.pullback_sell_score??'—'} · Continuation BUY/SELL: ${r.continuation_buy_score??0}/${r.continuation_sell_score??0} (min ${r.continuation_threshold??85})</div>
-    <div style="font-size:11px;color:var(--m)">Continuation gates: ${r.continuation_buy_ready?'BUY confirmed':r.continuation_sell_ready?'SELL confirmed':'pending'} · ER ${r.efficiency_ratio??'—'} · EMA extension ${r.extension_atr??'—'} ATR · BE ${r.profit_lock_r??1}R · trail ${r.trailing_activation_r??1.5}R</div>
-    ${bdHtml?`<div class="breakdown-grid" style="margin-top:10px">${bdHtml}</div>`:''}
+    <div class="conf-threshold">Threshold: ${r.min_conf} pts · ${meetsThresh?'Signal ready (subject to execution checks)':'Waiting for entry gates'}</div>
+    <div style="font-size:12px;color:var(--m);margin:9px 0">Adjusted scores — Pullback BUY/SELL: ${r.pullback_buy_score??'—'}/${r.pullback_sell_score??'—'} · Continuation BUY/SELL: ${r.continuation_buy_score??'—'}/${r.continuation_sell_score??'—'} (min ${r.continuation_threshold??r.min_conf})</div>
+    <div style="font-size:11px;color:var(--m)">Selected path: ${escHtml(selectedPath)} · Final ${side} quality: ${fmtScore(r.confidence)} pts · Continuation gates: ${r.continuation_buy_ready?'BUY confirmed':r.continuation_sell_ready?'SELL confirmed':'pending'} · ER ${r.efficiency_ratio??'—'} · EMA extension ${r.extension_atr??'—'} ATR · lock ${r.profit_lock_r??0.25}R · trail ${r.trailing_activation_r??0.25}R</div>
+    ${bdHtml?`<div style="font-size:10px;color:var(--m2);margin-top:10px">Score construction / relevant raw evidence</div><div class="breakdown-grid" style="margin-top:6px">${bdHtml}</div>`:''}
   </div>
 
   <div class="ind-section">
